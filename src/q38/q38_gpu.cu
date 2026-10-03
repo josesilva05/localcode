@@ -1194,7 +1194,7 @@ static int pool_open(q38_model *m, Gpu *g)
     g->pend = (char *)calloc((size_t)nkeys, 1);
     for (int i = 0; i < nkeys; i++) g->vslot[i] = -1;
     const char *sw = getenv("Q38_VRAM_SWAPS");
-    g->swaps = sw ? atoi(sw) : 8;
+    g->swaps = sw ? atoi(sw) : 32;   /* 2: 17.1 tok/s, 8: 20.8, 32: 20.8 warm and a faster warm-up (2026-10-03) */
     g->n_up = 32;
     g->n_exp_ = c->n_exp; g->ff_exp_ = c->ff_exp; g->n_embd_ = c->n_embd;
     for (int il = 0; il < c->n_layer; il++) {
