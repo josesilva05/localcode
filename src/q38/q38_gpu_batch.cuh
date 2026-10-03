@@ -1,3 +1,5 @@
+#include <cublas_v2.h>
+#include <algorithm>
 /* q38_gpu_batch.cuh - the forward pass for N consecutive tokens at once (included by
  * q38_gpu.cu, after its kernels and helpers).
  *
@@ -16,6 +18,10 @@
 
 #define TB 8                        /* tokens per weight load in the matrix products */
 
+/* experts in tiles of up to XT tokens (k_ext_*) */
+#define XT 8
+typedef struct { const uint8_t *g, *u, *d; int p0, n; } ExTile;
+
 typedef struct {
     int    nb;                      /* capacity in tokens */
     int    maxp;                    /* capacity in (token, expert) pairs */
@@ -33,8 +39,10 @@ typedef struct {
     int   *h_tp, *d_tp;             /* [nb][K]: each token's pair indices, -1 after the last */
     float *h_tw, *d_tw;             /* [nb][K]: their weights */
     float *egu, *eh, *edn;
+    ExTile *h_tiles, *d_tiles;
     /* experts on the second device */
     ExDesc *h_pairs2, *d_pairs2;
+    ExTile *h_tiles2, *d_tiles2;
     int   *h_np2, *d_np2, *h_tp2, *d_tp2;
     float *h_tw2, *d_tw2, *x2, *egu2, *eh2, *edn2, *y2, *h_y2;
     /* pinned host */
@@ -495,6 +503,154 @@ __global__ void k_exb_down(const ExDesc *ex, const int *pn, int td, int F, int E
     if (threadIdx.x == 0) dn[(int64_t)k * E + i] = s;
 }
 
+/* ------------------------------------------------ experts in tiles of tokens -- */
+/* The pairs of one expert in tiles of up to XT tokens: a warp decodes a weight row's chunk
+ * once and applies it to every token of the tile. Each token's sum is formed exactly as in
+ * lane_dot_rp (same chunks per lane, same order), so the results do not change. */
+
+__device__ __forceinline__ void lane_dot_rp_t(int type, const uint8_t *base, int rows, int r, const float *X,
+                                              const int *xoff, int n, int ne0, int lane, float *acc)
+{
+#pragma unroll
+    for (int t = 0; t < XT; t++) acc[t] = 0.0f;
+    if (type == Q38_Q4_K || type == Q38_Q5_K) {
+        const int nsb = ne0 / 256, five = type == Q38_Q5_K;
+        const uint8_t *qs = base + (int64_t)r * (ne0 / 2);
+        const uint8_t *qh = base + (int64_t)rows * (ne0 / 2) + (int64_t)r * nsb * 32;
+        const uint8_t *hd = base + (int64_t)rows * (ne0 / 2) + (five ? (int64_t)rows * nsb * 32 : 0) + (int64_t)r * nsb * 16;
+        for (int c = lane; c < nsb * 8; c += 32) {
+            const int sb = c >> 3, bo = (c & 7) * 16, j = bo >> 5, p = bo & 31;
+            const uint8_t *h = hd + sb * 16;
+            const float2 dd = __half22float2(*(const __half2 *)(const void *)h);
+            float s1, m1, s2, m2;
+            kscales(h, j, &s1, &m1, &s2, &m2);
+            const int4 q4 = *(const int4 *)(const void *)(qs + sb * 128 + bo);
+            int4 h4 = make_int4(0, 0, 0, 0);
+            if (five) h4 = *(const int4 *)(const void *)(qh + sb * 32 + p);
+            const uint32_t qw[4] = { (uint32_t)q4.x, (uint32_t)q4.y, (uint32_t)q4.z, (uint32_t)q4.w };
+            const uint32_t hw[4] = { (uint32_t)h4.x, (uint32_t)h4.y, (uint32_t)h4.z, (uint32_t)h4.w };
+            float lo[16], hi[16];
+#pragma unroll
+            for (int u = 0; u < 16; u++) {
+                const int qb = (qw[u >> 2] >> (8 * (u & 3))) & 0xFF;
+                const int hb = (hw[u >> 2] >> (8 * (u & 3))) & 0xFF;
+                lo[u] = (float)((qb & 15) + (five ? (((hb >> (2 * j)) & 1) << 4) : 0));
+                hi[u] = (float)((qb >> 4) + (five ? (((hb >> (2 * j + 1)) & 1) << 4) : 0));
+            }
+#pragma unroll
+            for (int t = 0; t < XT; t++) {
+                if (t >= n) break;
+                const float4 *xl4 = (const float4 *)(X + xoff[t] + sb * 256 + 64 * j + p), *xh4 = xl4 + 8;
+                float sl = 0.0f, sh = 0.0f, xsl = 0.0f, xsh = 0.0f;
+#pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const float4 a = __ldg(xl4 + v), b2 = __ldg(xh4 + v);
+                    const float xl[4] = { a.x, a.y, a.z, a.w }, xh[4] = { b2.x, b2.y, b2.z, b2.w };
+#pragma unroll
+                    for (int k = 0; k < 4; k++) {
+                        sl += lo[4 * v + k] * xl[k]; sh += hi[4 * v + k] * xh[k]; xsl += xl[k]; xsh += xh[k];
+                    }
+                }
+                acc[t] += dd.x * s1 * sl - dd.y * m1 * xsl + dd.x * s2 * sh - dd.y * m2 * xsh;
+            }
+        }
+    } else if (type == Q38_Q5_1) {
+        const int nb = ne0 / 32;
+        const uint8_t *qs = base + (int64_t)r * (ne0 / 2);
+        const uint32_t *qh = (const uint32_t *)(const void *)(base + (int64_t)rows * (ne0 / 2)) + (int64_t)r * nb;
+        const __half2 *dm = (const __half2 *)(const void *)(base + (int64_t)rows * (ne0 / 2) + (int64_t)rows * nb * 4) + (int64_t)r * nb;
+        for (int b = lane; b < nb; b += 32) {
+            const int4 q4 = *(const int4 *)(const void *)(qs + b * 16);
+            const uint32_t h = qh[b];
+            const float2 f = __half22float2(dm[b]);
+            const uint32_t qw[4] = { (uint32_t)q4.x, (uint32_t)q4.y, (uint32_t)q4.z, (uint32_t)q4.w };
+            float v0[16], v1[16];
+#pragma unroll
+            for (int u = 0; u < 16; u++) {
+                const int qb = (qw[u >> 2] >> (8 * (u & 3))) & 0xFF;
+                v0[u] = (float)((qb & 15) | (((h >> u) & 1) << 4));
+                v1[u] = (float)((qb >> 4) | (((h >> (u + 16)) & 1) << 4));
+            }
+#pragma unroll
+            for (int t = 0; t < XT; t++) {
+                if (t >= n) break;
+                const float4 *x4 = (const float4 *)(X + xoff[t] + b * 32);
+                float x[32];
+#pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const float4 a = __ldg(x4 + v);
+                    x[4 * v] = a.x; x[4 * v + 1] = a.y; x[4 * v + 2] = a.z; x[4 * v + 3] = a.w;
+                }
+                float s = 0.0f, xsum = 0.0f;
+#pragma unroll
+                for (int u = 0; u < 16; u++) {
+                    s += v0[u] * x[u] + v1[u] * x[u + 16];
+                    xsum += x[u] + x[u + 16];
+                }
+                acc[t] += f.x * s + f.y * xsum;
+            }
+        }
+    } else if (type == Q38_Q8_0) {
+        const int nb = ne0 / 32;
+        const int8_t *qs = (const int8_t *)(base + (int64_t)r * ne0);
+        const __half *d = (const __half *)(const void *)(base + (int64_t)rows * ne0) + (int64_t)r * nb;
+        for (int c = lane; c < nb * 2; c += 32) {
+            const int4 q4 = *(const int4 *)(const void *)(qs + c * 16);
+            const int8_t *q = (const int8_t *)&q4;
+            const float dc = __half2float(d[c >> 1]);
+#pragma unroll
+            for (int t = 0; t < XT; t++) {
+                if (t >= n) break;
+                const float4 *x4 = (const float4 *)(X + xoff[t] + c * 16);
+                float s = 0.0f;
+#pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const float4 a = __ldg(x4 + v);
+                    s += (float)q[4 * v] * a.x + (float)q[4 * v + 1] * a.y + (float)q[4 * v + 2] * a.z + (float)q[4 * v + 3] * a.w;
+                }
+                acc[t] += dc * s;
+            }
+        }
+    }
+}
+
+/* gate and up: blockIdx.y = tile, a warp per row; token of pair p is ex[p].pad */
+__global__ void k_ext_gu(const ExTile *tl, const ExDesc *ex, int tg, int tu, int E, int F, const float *__restrict__ X, float *gu)
+{
+    const ExTile T = tl[blockIdx.y];
+    const int j = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (j >= 2 * F) return;
+    int xoff[XT];
+#pragma unroll
+    for (int t = 0; t < XT; t++) xoff[t] = t < T.n ? ex[T.p0 + t].pad * E : 0;
+    float acc[XT];
+    if (j < F) lane_dot_rp_t(tg, T.g, F, j, X, xoff, T.n, E, threadIdx.x, acc);
+    else lane_dot_rp_t(tu, T.u, F, j - F, X, xoff, T.n, E, threadIdx.x, acc);
+#pragma unroll
+    for (int t = 0; t < XT; t++) {
+        const float s = warp_sum(acc[t]);
+        if (threadIdx.x == 0 && t < T.n) gu[(int64_t)(T.p0 + t) * 2 * F + j] = s;
+    }
+}
+
+/* down: the tile's pairs are consecutive, so their h rows are too */
+__global__ void k_ext_down(const ExTile *tl, int td, int F, int E, const float *__restrict__ h, float *dn)
+{
+    const ExTile T = tl[blockIdx.y];
+    const int i = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (i >= E) return;
+    int xoff[XT];
+#pragma unroll
+    for (int t = 0; t < XT; t++) xoff[t] = (T.p0 + (t < T.n ? t : 0)) * F;
+    float acc[XT];
+    lane_dot_rp_t(td, T.d, E, i, h, xoff, T.n, F, threadIdx.x, acc);
+#pragma unroll
+    for (int t = 0; t < XT; t++) {
+        const float s = warp_sum(acc[t]);
+        if (threadIdx.x == 0 && t < T.n) dn[(int64_t)(T.p0 + t) * E + i] = s;
+    }
+}
+
 /* each token's routed sum over its pairs, in the order the host listed them */
 __global__ void k_exb_reduce(const int *tp, const float *tw, int KT, const float *dn, int E, float *y, int N)
 {   /* accumulates: y is cleared once per layer, then each group of pairs adds its share */
@@ -529,9 +685,60 @@ __global__ void k_moe_final_b(float *y, const float *routed, const float *ygpu, 
 /* --------------------------------------------------------------------- host -- */
 static inline int nblocks(int64_t n, int b) { return (int)((n + b - 1) / b); }
 
+/* Many tokens at once: the matrix is expanded to fp32 in a scratch buffer and multiplied by
+ * cuBLAS (fp32 SGEMM, no reduced precision unless Q38_TF32=1); few tokens use k_mm_*. */
+static cublasHandle_t g_blas;
+static float  *g_wscr;
+static int64_t g_wscr_n;
+static int     g_blas_min = 1 << 30;
+
+__global__ void k_deq_q8r(const int8_t *__restrict__ Q, const float *__restrict__ D, int64_t n, float *__restrict__ W)
+{
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x)
+        W[i] = (float)Q[i] * D[i >> 5];
+}
+
+static int blas_open(q38_model *m)
+{
+    const char *e = getenv("Q38_BLAS_MIN");
+    const int mn = e ? atoi(e) : 32;
+    if (mn <= 0) return 0;                                /* Q38_BLAS_MIN=0: never */
+    int64_t mx = 0;
+    for (int il = 0; il < m->c.n_layer; il++)
+        for (int i = 0; i < NMAT; i++) {
+            const DMat *w = &G->L[il][i];
+            if (w->type == Q38_Q8R && w->rows * w->ne0 > mx) mx = w->rows * w->ne0;
+        }
+    if (cublasCreate(&g_blas) != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "q38_gpu: cuBLAS unavailable\n"); return 0; }
+    const char *t = getenv("Q38_TF32");
+    if (t && atoi(t)) cublasSetMathMode(g_blas, CUBLAS_TF32_TENSOR_OP_MATH);
+    if (mx > 0 && cudaMalloc(&g_wscr, (size_t)mx * sizeof(float)) != cudaSuccess) { cudaGetLastError(); mx = 0; g_wscr = NULL; }
+    g_wscr_n = mx;
+    G->bytes += mx * (int64_t)sizeof(float);
+    g_blas_min = mn;
+    return 0;
+}
+
 /* Y[N][rows] = W . X[N] */
 static int mm(const DMat *w, const float *X, int ldx, float *Y, int ldy, int N, cudaStream_t st)
 {
+    if (N >= g_blas_min && (w->type == Q38_F32 || (w->type == Q38_Q8R && w->rows * w->ne0 <= g_wscr_n))) {
+        /* row-major Y[N][rows] = X[N][ne0] W^T is column-major Y^T = W^T' X^T' with W read as
+         * the ne0 x rows column-major matrix it is in memory */
+        const float *W = (const float *)w->d;
+        if (w->type == Q38_Q8R) {
+            k_deq_q8r<<<1024, 256, 0, st>>>((const int8_t *)w->d, w->scale, w->rows * w->ne0, g_wscr);
+            W = g_wscr;
+        }
+        const float one = 1.0f, zero = 0.0f;
+        cublasSetStream(g_blas, st);
+        if (cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, (int)w->rows, N, (int)w->ne0, &one, W, (int)w->ne0, X, ldx, &zero,
+                        Y, ldy) != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "q38_gpu: cublasSgemm failed\n");
+            return -1;
+        }
+        return 0;
+    }
     const dim3 blk(32, ROWS_PER_BLOCK), grid(nblocks(w->rows, ROWS_PER_BLOCK), nblocks(N, TB));
     if (w->type == Q38_Q8R) k_mm_q8r<<<grid, blk, 0, st>>>((const int8_t *)w->d, w->scale, (int)w->ne0, (int)w->rows, X, ldx, Y, ldy, N);
     else if (w->type == Q38_F32) k_mm_f32<<<grid, blk, 0, st>>>((const float *)w->d, (int)w->ne0, (int)w->rows, X, ldx, Y, ldy, N);
@@ -548,6 +755,7 @@ static int bat_open(q38_model *m, int nb)
         if (nb < 1) nb = 1;
         if (nb > 1024) nb = 1024;
     }
+    if (blas_open(m)) return -1;
     Bat *b = (Bat *)calloc(1, sizeof(Bat));
     if (!b) return -1;
     {   /* the staging area for experts streamed from RAM during a prompt pass */
@@ -564,7 +772,22 @@ static int bat_open(q38_model *m, int nb)
         if (G->pst_n > 0) {
             CK(cudaSetDevice(G->dev));
             CK(cudaMalloc(&G->pstage, (size_t)G->pst_n * (size_t)G->pst_slot));
-            for (int i = 0; i < 4; i++) CK(cudaMalloc(&G->praw[i], (size_t)G->pst_slot));
+            /* a ring of pinned bounce buffers: CPU threads copy experts into one half while the
+             * other half's bytes go over the bus (Q38_PREFILL_PINNED=0: pageable copies) */
+            const char *ep = getenv("Q38_PREFILL_PINNED");
+            G->pring = ep && !atoi(ep) ? 0 : 16;
+            for (int i = 0; i < 16; i++) CK(cudaMalloc(&G->praw[i], (size_t)G->pst_slot));
+            for (int i = 0; i < G->pring; i++) {
+                if (cudaHostAlloc((void **)&G->phost[i], (size_t)G->pst_slot, cudaHostAllocDefault) != cudaSuccess) {
+                    G->pring = 0;
+                    break;
+                }
+                CK(cudaEventCreateWithFlags(&G->pev[i], cudaEventDisableTiming));
+            }
+            CK(cudaStreamCreateWithFlags(&G->st_cp, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&G->ev_stage, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&G->ev_pairs, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&G->ev_pup, cudaEventDisableTiming));
             G->bytes += (int64_t)G->pst_n * G->pst_slot;
         }
     }
@@ -601,6 +824,8 @@ static int bat_open(q38_model *m, int nb)
     }
     CK(cudaMallocHost(&b->h_pairs, (size_t)b->maxp * sizeof(ExDesc)));
     CK(cudaMalloc(&b->d_pairs, (size_t)b->maxp * sizeof(ExDesc)));
+    CK(cudaMallocHost(&b->h_tiles, (size_t)b->maxp * sizeof(ExTile)));
+    CK(cudaMalloc(&b->d_tiles, (size_t)b->maxp * sizeof(ExTile)));
     CK(cudaMallocHost(&b->h_np, sizeof(int)));
     CK(cudaMalloc(&b->d_np, sizeof(int)));
     CK(cudaMallocHost(&b->h_tp, (size_t)nb * K * sizeof(int)));
@@ -628,6 +853,8 @@ static int bat_open_aux(q38_model *m)
     if (G->npd == 2 && b) {
         CK(cudaSetDevice(G->pdev[1]));
         CK(cudaMalloc(&b->d_pairs2, (size_t)b->maxp * sizeof(ExDesc)));
+        CK(cudaMalloc(&b->d_tiles2, (size_t)b->maxp * sizeof(ExTile)));
+        CK(cudaMallocHost(&b->h_tiles2, (size_t)b->maxp * sizeof(ExTile)));
         CK(cudaMalloc(&b->d_np2, sizeof(int)));
         CK(cudaMalloc(&b->d_tp2, (size_t)nb * K * sizeof(int)));
         CK(cudaMalloc(&b->d_tw2, (size_t)nb * K * sizeof(float)));
@@ -675,15 +902,75 @@ static int run_pairs(q38_model *m, int il, int dev2, int np, const float *X, flo
     int *htp = dev2 ? b->h_tp2 : b->h_tp, *dtp = dev2 ? b->d_tp2 : b->d_tp;
     float *htw = dev2 ? b->h_tw2 : b->h_tw, *dtw = dev2 ? b->d_tw2 : b->d_tw;
     float *egu = dev2 ? b->egu2 : b->egu, *eh = dev2 ? b->eh2 : b->eh, *edn = dev2 ? b->edn2 : b->edn;
+    ExTile *ht = dev2 ? b->h_tiles2 : b->h_tiles, *dt = dev2 ? b->d_tiles2 : b->d_tiles;
+    static int tiled = -1;
+    if (tiled < 0) tiled = !(getenv("Q38_EXPERT_TILES") && !atoi(getenv("Q38_EXPERT_TILES")));
+    int nt = 0;
+    if (tiled) {
+        /* pairs grouped by expert (stable), the per-token lists renamed to match, then tiles of
+         * up to XT consecutive pairs of one expert */
+        static int ord[16384], inv[16384];
+        static ExDesc tmp[16384];
+        if (np > 16384) return -1;
+        for (int i = 0; i < np; i++) ord[i] = i;
+        std::stable_sort(ord, ord + np, [hp](int a, int c) { return hp[a].g < hp[c].g; });
+        for (int i = 0; i < np; i++) { tmp[i] = hp[ord[i]]; inv[ord[i]] = i; }
+        memcpy(hp, tmp, (size_t)np * sizeof(ExDesc));
+        for (int t = 0; t < N; t++)
+            for (int j = 0; j < K; j++) {
+                const int pp = htp[t * K + j];
+                if (pp < 0) break;
+                htp[t * K + j] = inv[pp];
+            }
+        for (int i = 0; i < np;) {
+            int k = i + 1;
+            while (k < np && k - i < XT && hp[k].g == hp[i].g) k++;
+            ExTile *T = &ht[nt++];
+            T->g = hp[i].g; T->u = hp[i].u; T->d = hp[i].d; T->p0 = i; T->n = k - i;
+            i = k;
+        }
+        CK(cudaMemcpyAsync(dt, ht, (size_t)nt * sizeof(ExTile), cudaMemcpyHostToDevice, st));
+    }
     *hn = np;
     CK(cudaMemcpyAsync(dn, hn, sizeof(int), cudaMemcpyHostToDevice, st));
     CK(cudaMemcpyAsync(dp, hp, (size_t)np * sizeof(ExDesc), cudaMemcpyHostToDevice, st));
     CK(cudaMemcpyAsync(dtp, htp, (size_t)N * K * sizeof(int), cudaMemcpyHostToDevice, st));
     CK(cudaMemcpyAsync(dtw, htw, (size_t)N * K * sizeof(float), cudaMemcpyHostToDevice, st));
+    if (!dev2 && G->ev_pup) CK(cudaEventRecord(G->ev_pup, st));   /* the host may rewrite its lists after this */
     const dim3 blk(32, ROWS_PER_BLOCK);
-    k_exb_gu<<<dim3(nblocks(2 * F, ROWS_PER_BLOCK), np), blk, 0, st>>>(dp, dn, L->ex_gate.type, L->ex_up.type, E, F, X, egu);
-    k_exb_swiglu<<<nblocks((int64_t)np * F, 256), 256, 0, st>>>(dn, egu, eh, F, np);
-    k_exb_down<<<dim3(nblocks(E, ROWS_PER_BLOCK), np), blk, 0, st>>>(dp, dn, L->ex_down.type, F, E, eh, edn);
+    if (tiled) {
+        k_ext_gu<<<dim3(nblocks(2 * F, ROWS_PER_BLOCK), nt), blk, 0, st>>>(dt, dp, L->ex_gate.type, L->ex_up.type, E, F, X, egu);
+        k_exb_swiglu<<<nblocks((int64_t)np * F, 256), 256, 0, st>>>(dn, egu, eh, F, np);
+        k_ext_down<<<dim3(nblocks(E, ROWS_PER_BLOCK), nt), blk, 0, st>>>(dt, L->ex_down.type, F, E, eh, edn);
+        static int chk = -1;
+        if (chk < 0) chk = getenv("Q38_TILE_CHECK") ? atoi(getenv("Q38_TILE_CHECK")) : 0;
+        if (chk && !dev2) {           /* the per-pair kernels on the same inputs: must match bit for bit */
+            static float *cg, *cd, *hg, *hc;
+            static size_t cap;
+            const size_t ng = (size_t)np * 2 * F, nd = (size_t)np * E;
+            if (ng + nd > cap) {
+                cudaFree(cg); cudaFree(cd); free(hg); free(hc);
+                cap = (ng + nd) * 2;
+                CK(cudaMalloc(&cg, cap * sizeof(float))); CK(cudaMalloc(&cd, cap * sizeof(float)));
+                hg = (float *)malloc(cap * sizeof(float)); hc = (float *)malloc(cap * sizeof(float));
+            }
+            k_exb_gu<<<dim3(nblocks(2 * F, ROWS_PER_BLOCK), np), blk, 0, st>>>(dp, dn, L->ex_gate.type, L->ex_up.type, E, F, X, cg);
+            k_exb_down<<<dim3(nblocks(E, ROWS_PER_BLOCK), np), blk, 0, st>>>(dp, dn, L->ex_down.type, F, E, eh, cd);
+            CK(cudaStreamSynchronize(st));
+            int64_t bad = 0;
+            CK(cudaMemcpy(hg, cg, ng * sizeof(float), cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hc, egu, ng * sizeof(float), cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < ng; i++) bad += memcmp(&hg[i], &hc[i], 4) != 0;
+            const int64_t badg = bad;
+            CK(cudaMemcpy(hg, cd, nd * sizeof(float), cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hc, edn, nd * sizeof(float), cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < nd; i++) bad += memcmp(&hg[i], &hc[i], 4) != 0;
+            fprintf(stderr, "q38: tile check layer %d: %d pairs in %d tiles, %lld gate/up and %lld down values differ (types %d %d %d)\n",
+                    il, np, nt, (long long)badg, (long long)(bad - badg), L->ex_gate.type, L->ex_up.type, L->ex_down.type);
+        }
+    } else {
+        k_exb_gu<<<dim3(nblocks(2 * F, ROWS_PER_BLOCK), np), blk, 0, st>>>(dp, dn, L->ex_gate.type, L->ex_up.type, E, F, X, egu);
+        k_exb_swiglu<<<nblocks((int64_t)np * F, 256), 256, 0, st>>>(dn, egu, eh, F, np);
+        k_exb_down<<<dim3(nblocks(E, ROWS_PER_BLOCK), np), blk, 0, st>>>(dp, dn, L->ex_down.type, F, E, eh, edn);
+    }
     k_exb_reduce<<<nblocks((int64_t)N * E, 256), 256, 0, st>>>(dtp, dtw, K, edn, E, Y, N);
     return 0;
 }
@@ -698,34 +985,56 @@ static int stream_experts(q38_model *m, int il, int N, const int *ptok, const in
     const q38_cfg *c = &m->c;
     const int E = c->n_embd, F = c->ff_exp, K = c->n_exp_used, NE = c->n_exp;
     Bat *b = GB;
-    cudaStream_t st = G->st;
+    cudaStream_t st = G->st, sc = G->st_cp;
     if (!npc) return 0;
     static int ue[1024], slot_of[1024];
     static const uint8_t *data[1024];
     int nu = 0;
     for (int e = 0; e < NE; e++) slot_of[e] = -1;
     for (int p = 0; p < npc; p++) if (slot_of[pexp[p]] < 0) { slot_of[pexp[p]] = nu; ue[nu++] = pexp[p]; }
-    const double tr = now_s();
     if (q38_model_experts_resident(m, il, ue, nu, data)) return -1;
-    (void)tr;
     const q38_layer *L = &m->L[il];
     const int64_t bg = (int64_t)F * L->ex_gate.row_bytes, bu = (int64_t)F * L->ex_up.row_bytes;
     const int64_t eb = bg + bu + (int64_t)E * L->ex_down.row_bytes;
     const int *ty = G->ex_types[il];
-    const int nb_g = ty[0] == Q38_Q4_K || ty[0] == Q38_Q5_K ? E / 256 : E / 32;
-    const int nb_d = ty[2] == Q38_Q4_K || ty[2] == Q38_Q5_K ? F / 256 : F / 32;
+    static int prof = -1;
+    if (prof < 0) prof = getenv("Q38_STREAM_PROF") ? atoi(getenv("Q38_STREAM_PROF")) : 0;
     for (int r0 = 0; r0 < nu; r0 += G->pst_n) {
         const int r1 = nu - r0 < G->pst_n ? nu : r0 + G->pst_n;
-        CK(cudaStreamSynchronize(st));          /* the previous round's buffers are free */
+        /* the copy stream: the stage is free once the pairs that last read it are done */
+        CK(cudaStreamWaitEvent(sc, G->ev_pairs, 0));
         const double ts = now_s();
-        for (int i = r0; i < r1; i++) {
-            uint8_t *raw = G->praw[i & 3], *dst = G->pstage + (int64_t)(i - r0) * G->pst_slot;
-            CK(cudaMemcpyAsync(raw, data[i], (size_t)eb, cudaMemcpyHostToDevice, st));
-            k_repack<<<(F * nb_g + 255) / 256, 256, 0, st>>>(raw, dst, ty[0], F, E);
-            k_repack<<<(F * nb_g + 255) / 256, 256, 0, st>>>(raw + bg, dst + bg, ty[1], F, E);
-            k_repack<<<(E * nb_d + 255) / 256, 256, 0, st>>>(raw + bg + bu, dst + bg + bu, ty[2], E, F);
+        if (G->pring) {
+            /* groups of half the ring: fill a group's pinned buffers in parallel (after their
+             * previous bytes were consumed), then queue its copies and rearrangements */
+            const int half = G->pring / 2;
+            for (int g0 = r0, grp = 0; g0 < r1; g0 += half, grp ^= 1) {
+                const int g1 = r1 - g0 < half ? r1 : g0 + half;
+                for (int i = g0; i < g1; i++) CK(cudaEventSynchronize(G->pev[grp * half + (i - g0)]));
+                int i;
+#pragma omp parallel for schedule(static, 1) num_threads(8)
+                for (i = g0; i < g1; i++) memcpy(G->phost[grp * half + (i - g0)], data[i], (size_t)eb);
+                for (i = g0; i < g1; i++) {
+                    const int k = grp * half + (i - g0);
+                    uint8_t *raw = G->praw[k], *dst = G->pstage + (int64_t)(i - r0) * G->pst_slot;
+                    CK(cudaMemcpyAsync(raw, G->phost[k], (size_t)eb, cudaMemcpyHostToDevice, sc));
+                    repack_expert(raw, dst, ty, F, E, bg, bu, sc);
+                    CK(cudaEventRecord(G->pev[k], sc));
+                }
+            }
+        } else {
+            for (int i = r0; i < r1; i++) {
+                uint8_t *raw = G->praw[i & 15], *dst = G->pstage + (int64_t)(i - r0) * G->pst_slot;
+                CK(cudaMemcpyAsync(raw, data[i], (size_t)eb, cudaMemcpyHostToDevice, sc));
+                repack_expert(raw, dst, ty, F, E, bg, bu, sc);
+            }
         }
+        CK(cudaEventRecord(G->ev_stage, sc));
+        G->stream_bytes += (int64_t)(r1 - r0) * eb;
+        if (prof) { CK(cudaStreamSynchronize(sc)); G->t_sp_copy += now_s() - ts; }
         G->t_stream += now_s() - ts;
+        /* the pair lists are rewritten in place: the last upload of them must have happened */
+        CK(cudaEventSynchronize(G->ev_pup));
         int np = 0;
         for (int t = 0; t < N; t++) b->h_tp[t * K] = -1;
         static int cnt[1024];
@@ -743,7 +1052,11 @@ static int stream_experts(q38_model *m, int il, int N, const int *ptok, const in
             if (cnt[t] < K) b->h_tp[t * K + cnt[t]] = -1;
             np++;
         }
+        CK(cudaStreamWaitEvent(st, G->ev_stage, 0));
+        const double tq = now_s();
         if (np && run_pairs(m, il, 0, np, b->mixed, b->ygpu, N)) return -1;
+        CK(cudaEventRecord(G->ev_pairs, st));
+        if (prof) { CK(cudaStreamSynchronize(st)); G->t_sp_pairs += now_s() - tq; }
     }
     return 0;
 }
@@ -941,7 +1254,12 @@ extern "C" int q38_gpu_forward_batch(void *model, const int *toks, int n)
     G->warm_want = 1;
     for (int i = 0; i < n; i += GB->nb) {
         const int k = n - i < GB->nb ? n - i : GB->nb;
+        const double t0 = now_s(), r0 = m->t_read;
+        const int64_t b0 = m->expert_bytes_read;
         if (forward_batch_chunk(m, toks + i, k, i + k == n)) return -1;
+        if (getenv("Q38_BATCH_VERBOSE"))
+            fprintf(stderr, "q38: batch of %d tokens at %d: %.1f s, %.2f GB read in %.1f s\n", k, m->n_past - k,
+                    now_s() - t0, (m->expert_bytes_read - b0) / 1e9, m->t_read - r0);
     }
     return 0;
 }

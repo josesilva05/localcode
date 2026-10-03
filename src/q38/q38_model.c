@@ -775,9 +775,14 @@ static int slot_read(q38_model *m, int il, int e, q38_slot *s)
     const q38_layer *l = &m->L[il];
     const int64_t F = m->c.ff_exp, E = m->c.n_embd;
     const int64_t bg = F * l->ex_gate.row_bytes, bu = F * l->ex_up.row_bytes, bd = E * l->ex_down.row_bytes;
-    if (q38_gguf_pread(&m->g, l->ex_gate.t, (int64_t)e * bg, s->data, bg)) return -1;
-    if (q38_gguf_pread(&m->g, l->ex_up.t, (int64_t)e * bu, s->data + bg, bu)) return -1;
-    if (q38_gguf_pread(&m->g, l->ex_down.t, (int64_t)e * bd, s->data + bg + bu, bd)) return -1;
+    /* past the OS file cache by default: the expert cache holds most of the RAM, and the file
+     * cache would only copy each read once more (Q38_DIRECT_IO=0: through it) */
+    static int direct = -1;
+    if (direct < 0) direct = !(getenv("Q38_DIRECT_IO") && !atoi(getenv("Q38_DIRECT_IO")));
+    int (*rd)(q38_gguf *, const q38_tensor *, int64_t, void *, int64_t) = direct ? q38_gguf_pread_direct : q38_gguf_pread;
+    if (rd(&m->g, l->ex_gate.t, (int64_t)e * bg, s->data, bg)) return -1;
+    if (rd(&m->g, l->ex_up.t, (int64_t)e * bu, s->data + bg, bu)) return -1;
+    if (rd(&m->g, l->ex_down.t, (int64_t)e * bd, s->data + bg + bu, bd)) return -1;
     return 0;
 }
 
@@ -1060,7 +1065,11 @@ int q38_model_experts_resident(q38_model *m, int il, const int *ids, int n, cons
     if (!rc && nmiss) {
         const double t0 = now_s();
         int bad = 0, i;
-#pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad)
+        /* threads mostly wait on the disk: more of them keep more reads in flight */
+        static int nth = -1;
+        if (nth < 0) nth = getenv("Q38_READ_THREADS") ? atoi(getenv("Q38_READ_THREADS")) : 0;
+        const int nt = nth > 0 ? nth : omp_get_max_threads();
+#pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad) num_threads(nt)
         for (i = 0; i < nmiss; i++) bad += slot_read(m, il, ids[miss[i]], sl[miss[i]]) != 0;
         m->t_read += now_s() - t0;
         for (i = 0; i < nmiss; i++) m->expert_bytes_read += sl[miss[i]]->bytes;

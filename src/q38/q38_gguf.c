@@ -319,6 +319,9 @@ int q38_gguf_open(q38_gguf *g, const char *path)
                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, NULL);
         if (h == INVALID_HANDLE_VALUE) { fprintf(stderr, "q38_gguf: cannot open %s\n", g->paths[s]); q38_gguf_close(g); return -1; }
         g->fh[s] = (intptr_t)h;
+        HANDLE hd = CreateFileA(g->paths[s], GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, NULL);
+        g->fhd[s] = hd == INVALID_HANDLE_VALUE ? 0 : (intptr_t)hd;
 #else
         int fd = open(g->paths[s], O_RDONLY);
         if (fd < 0) { fprintf(stderr, "q38_gguf: cannot open %s\n", g->paths[s]); q38_gguf_close(g); return -1; }
@@ -345,6 +348,7 @@ void q38_gguf_close(q38_gguf *g)
         if (g->fp[s]) fclose((FILE *)g->fp[s]);
 #ifdef _WIN32
         if (g->fh[s]) CloseHandle((HANDLE)g->fh[s]);
+        if (g->fhd[s]) CloseHandle((HANDLE)g->fhd[s]);
 #else
         if (g->fh[s]) close((int)g->fh[s] - 1);
 #endif
@@ -393,6 +397,47 @@ int q38_gguf_read(const q38_gguf *g, const q38_tensor *t, int64_t off, void *dst
     FILE *f = (FILE *)g->fp[t->shard];
     if (q38_fseek(f, t->offset + off, SEEK_SET)) return -1;
     return fread(dst, 1, (size_t)nbytes, f) == (size_t)nbytes ? 0 : -1;
+}
+
+#ifdef _WIN32
+static __declspec(thread) uint8_t *tl_dbuf;
+static __declspec(thread) int64_t tl_dcap;
+#endif
+
+int q38_gguf_pread_direct(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes)
+{
+#ifdef _WIN32
+    if (off < 0 || nbytes < 0 || off + nbytes > t->nbytes) return -1;
+    const HANDLE h = (HANDLE)g->fhd[t->shard];
+    if (!h || nbytes > ((int64_t)1 << 30)) return q38_gguf_pread(g, t, off, dst, nbytes);
+    const int64_t SEC = 4096, pos = t->offset + off;
+    const int64_t a0 = pos & ~(SEC - 1), a1 = (pos + nbytes + SEC - 1) & ~(SEC - 1), len = a1 - a0;
+    if (len > tl_dcap) {
+        if (tl_dbuf) VirtualFree(tl_dbuf, 0, MEM_RELEASE);
+        tl_dcap = len + ((int64_t)1 << 20);
+        tl_dbuf = (uint8_t *)VirtualAlloc(NULL, (SIZE_T)tl_dcap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!tl_dbuf) { tl_dcap = 0; return q38_gguf_pread(g, t, off, dst, nbytes); }
+    }
+    int64_t done = 0;
+    while (done < len) {
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof ov);
+        ov.Offset = (DWORD)(uint64_t)(a0 + done);
+        ov.OffsetHigh = (DWORD)((uint64_t)(a0 + done) >> 32);
+        DWORD got = 0;
+        if (!ReadFile(h, tl_dbuf + done, (DWORD)(len - done), &got, &ov) || got == 0) {
+            if (a0 + done >= pos + nbytes) break;        /* only the tail past the data is missing */
+            return q38_gguf_pread(g, t, off, dst, nbytes);
+        }
+        done += (int64_t)got;
+        if (got % SEC) break;                               /* end of file */
+    }
+    if (done < pos + nbytes - a0) return q38_gguf_pread(g, t, off, dst, nbytes);
+    memcpy(dst, tl_dbuf + (pos - a0), (size_t)nbytes);
+    return 0;
+#else
+    return q38_gguf_pread(g, t, off, dst, nbytes);
+#endif
 }
 
 int q38_gguf_pread(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes)

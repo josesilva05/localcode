@@ -76,6 +76,7 @@ typedef struct {
     char       *paths[Q38_MAX_SHARDS];
     void       *fp[Q38_MAX_SHARDS];   /* FILE *, kept open for q38_gguf_read */
     intptr_t    fh[Q38_MAX_SHARDS];   /* positioned-read handles (HANDLE / fd), 0 = not open */
+    intptr_t    fhd[Q38_MAX_SHARDS];  /* the same without the OS file cache (Windows), 0 = none */
     int         n_kv;
     q38_kv     *kv;
     int         n_tensors;
@@ -102,6 +103,9 @@ int  q38_gguf_read(const q38_gguf *g, const q38_tensor *t, int64_t off, void *ds
 
 /* The same as a positioned read (pread / ReadFile with an offset): safe to call from any
  * number of threads at once. Opens its own handles on first use. */
+/* q38_gguf_pread past the OS file cache when the shard could be opened that way (sector-aligned
+ * reads into a per-thread buffer, then copied); otherwise the same as q38_gguf_pread. */
+int  q38_gguf_pread_direct(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes);
 int  q38_gguf_pread(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes);
 
 #endif

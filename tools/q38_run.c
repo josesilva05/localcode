@@ -7,6 +7,7 @@
  * the layout tools/q38_compare.py reads. --gen N then continues greedily for N tokens.
  */
 #include "q38_model.h"
+#include "q38_tok.h"
 #ifdef Q38_CUDA
 #include "q38_gpu.h"
 #endif
@@ -74,7 +75,7 @@ int main(int argc, char **argv)
     double cache_gb = 0;
     int gpu = -1;
     const char *logits_dir = NULL;
-    int from = 0, quiet = 0, batch = 0;
+    int from = 0, quiet = 0, batch = 0, text = 0;
     double preload = 0;               /* GB of experts read at start from localcode's usage profile */  /* --batch: the prompt in one batched pass */     /* logits only, without taps (taps force plain GPU launches) */
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--dump") && i + 1 < argc) g_dump = argv[++i];
@@ -85,17 +86,38 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--from") && i + 1 < argc) from = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
         else if (!strcmp(argv[i], "--batch")) batch = 1;
+        else if (!strcmp(argv[i], "--text")) text = 1;
         else if (!strcmp(argv[i], "--preload") && i + 1 < argc) preload = atof(argv[++i]);
         else if (!strcmp(argv[i], "--names") && i + 1 < argc) g_names = argv[++i];
     }
-    FILE *f = fopen(argv[2], "r");
-    if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-    int toks[8192], n = 0;
-    while (n < 8192 && fscanf(f, "%d", &toks[n]) == 1) n++;
-    fclose(f);
+    static int toks[8192];
+    int n = 0;
+    if (!text) {
+        FILE *f = fopen(argv[2], "r");
+        if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
+        while (n < 8192 && fscanf(f, "%d", &toks[n]) == 1) n++;
+        fclose(f);
+    }
 
     static q38_model m;
-    if (q38_model_open(&m, argv[1], 4096)) return 1;
+    if (q38_model_open(&m, argv[1], text || n + gen > 4000 ? 8192 : 4096)) return 1;
+    if (text) {                       /* tokens.txt is plain text: encode it, up to 8000 tokens */
+        FILE *f = fopen(argv[2], "rb");
+        if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
+        fseek(f, 0, SEEK_END);
+        const long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *buf = (char *)malloc((size_t)len + 1);
+        if (!buf || fread(buf, 1, (size_t)len, f) != (size_t)len) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
+        fclose(f);
+        buf[len] = 0;
+        q38_tok *tk = q38_tok_load(&m.g);
+        if (!tk) return 1;
+        n = q38_tok_encode(tk, buf, (int)len, toks, 8000 - gen);
+        q38_tok_free(tk);
+        free(buf);
+        fprintf(stderr, "%d tokens from the text\n", n);
+    }
 #ifdef Q38_CUDA
     if (gpu >= 0 && q38_gpu_open(&m, gpu)) return 1;
 #endif

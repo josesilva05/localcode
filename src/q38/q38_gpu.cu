@@ -116,10 +116,13 @@ typedef struct {
 #endif
     double    t_launch, t_route, t_post, t_promote;   /* host time per phase (Q38_PROFILE) */
     /* prompt pass: experts streamed from RAM into a staging area and computed here */
-    uint8_t  *pstage, *praw[4];
-    int       pst_n;
-    int64_t   pst_slot;
-    double    t_stream;
+    uint8_t  *pstage, *praw[16], *phost[16];  /* streamed experts: device raw bytes, pinned bounce */
+    cudaEvent_t pev[16];                  /* slot i's raw bytes consumed */
+    cudaStream_t st_cp;                   /* their copies and rearrangement, beside the compute */
+    cudaEvent_t ev_stage, ev_pairs, ev_pup;   /* a round staged; its pairs done; pair lists uploaded */
+    int       pst_n, pring;
+    int64_t   pst_slot, stream_bytes;
+    double    t_stream, t_sp_copy, t_sp_pairs;
     /* per-token inputs read by the device (graph-stable) */
     int      *d_pos, *h_pos;
     float    *h_emb, *h_logits, *knew, *vnew;
@@ -629,40 +632,65 @@ __device__ float lane_dot(int type, const uint8_t *w, const float *xs, int ne0, 
  *   Q5_K  qs[rows][ne0/2] | qh[rows][nsb][32] | hdr[rows][nsb][16]
  *   Q5_1  qs[rows][ne0/2] | qh[rows][nb] u32 | dm[rows][nb] half2
  *   Q8_0  qs[rows][ne0]   | d[rows][nb] half                                          */
-__global__ void k_repack(const uint8_t *src, uint8_t *dst, int type, int rows, int ne0)
+/* One 32-bit word (Q8_0: 16-bit) per thread, so neighbouring threads read neighbouring words;
+ * the three matrices of an expert in one launch (blockIdx.y). */
+__device__ __forceinline__ void repack_unit(const uint8_t *src, uint8_t *dst, int type, int rows, int ne0, int64_t w)
 {
-    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;   /* (row, block) */
     if (type == Q38_Q4_K || type == Q38_Q5_K) {
-        const int nsb = ne0 / 256, five = type == Q38_Q5_K, bs = five ? 176 : 144;
-        if (i >= (int64_t)rows * nsb) return;
-        const int64_t r = i / nsb, b = i % nsb;
-        const uint8_t *s = src + i * bs;
-        uint8_t *qs = dst + r * (ne0 / 2) + b * 128;
-        uint8_t *qh = dst + (int64_t)rows * (ne0 / 2) + i * 32;
-        uint8_t *hd = dst + (int64_t)rows * (ne0 / 2) + (five ? (int64_t)rows * nsb * 32 : 0) + i * 16;
-        for (int k = 0; k < 16; k++) hd[k] = s[k];
-        if (five) for (int k = 0; k < 32; k++) qh[k] = s[16 + k];
-        for (int k = 0; k < 128; k++) qs[k] = s[(five ? 48 : 16) + k];
+        const int nsb = ne0 / 256, five = type == Q38_Q5_K, wpb = five ? 44 : 36;
+        const int64_t i = w / wpb, r = i / nsb, b = i % nsb;
+        const int k = (int)(w % wpb);
+        const uint32_t v = ((const uint32_t *)(const void *)src)[w];
+        const int64_t qsz = (int64_t)rows * (ne0 / 2);
+        uint8_t *o;
+        if (k < 4) o = dst + qsz + (five ? (int64_t)rows * nsb * 32 : 0) + i * 16 + 4 * k;
+        else if (five && k < 12) o = dst + qsz + i * 32 + 4 * (k - 4);
+        else o = dst + r * (ne0 / 2) + b * 128 + 4 * (k - (five ? 12 : 4));
+        *(uint32_t *)(void *)o = v;
     } else if (type == Q38_Q5_1) {
         const int nb = ne0 / 32;
-        if (i >= (int64_t)rows * nb) return;
-        const int64_t r = i / nb, b = i % nb;
-        const uint8_t *s = src + i * 24;
-        uint8_t *qs = dst + r * (ne0 / 2) + b * 16;
-        uint8_t *qh = dst + (int64_t)rows * (ne0 / 2) + i * 4;
-        uint8_t *dm = dst + (int64_t)rows * (ne0 / 2) + (int64_t)rows * nb * 4 + i * 4;
-        for (int k = 0; k < 4; k++) { dm[k] = s[k]; qh[k] = s[4 + k]; }
-        for (int k = 0; k < 16; k++) qs[k] = s[8 + k];
+        const int64_t i = w / 6, r = i / nb, b = i % nb;
+        const int k = (int)(w % 6);
+        const uint32_t v = ((const uint32_t *)(const void *)src)[w];
+        const int64_t qsz = (int64_t)rows * (ne0 / 2);
+        uint8_t *o;
+        if (k == 0) o = dst + qsz + (int64_t)rows * nb * 4 + i * 4;
+        else if (k == 1) o = dst + qsz + i * 4;
+        else o = dst + r * (ne0 / 2) + b * 16 + 4 * (k - 2);
+        *(uint32_t *)(void *)o = v;
     } else if (type == Q38_Q8_0) {
         const int nb = ne0 / 32;
-        if (i >= (int64_t)rows * nb) return;
-        const int64_t r = i / nb, b = i % nb;
-        const uint8_t *s = src + i * 34;
-        uint8_t *qs = dst + r * ne0 + b * 32;
-        uint8_t *d = dst + (int64_t)rows * ne0 + i * 2;
-        d[0] = s[0]; d[1] = s[1];
-        for (int k = 0; k < 32; k++) qs[k] = s[2 + k];
+        const int64_t i = w / 17, r = i / nb, b = i % nb;
+        const int k = (int)(w % 17);
+        const uint16_t v = ((const uint16_t *)(const void *)src)[w];
+        uint8_t *o = k == 0 ? dst + (int64_t)rows * ne0 + i * 2 : dst + r * ne0 + b * 32 + 2 * (k - 1);
+        *(uint16_t *)(void *)o = v;
     }
+}
+
+__device__ __forceinline__ int64_t repack_units(int type, int rows, int ne0)
+{
+    if (type == Q38_Q4_K) return (int64_t)rows * (ne0 / 256) * 36;
+    if (type == Q38_Q5_K) return (int64_t)rows * (ne0 / 256) * 44;
+    if (type == Q38_Q5_1) return (int64_t)rows * (ne0 / 32) * 6;
+    if (type == Q38_Q8_0) return (int64_t)rows * (ne0 / 32) * 17;
+    return 0;
+}
+
+__global__ void k_repack3(const uint8_t *src, uint8_t *dst, int t0, int t1, int t2, int F, int E, int64_t bg, int64_t bu)
+{
+    const int y = blockIdx.y;
+    const int type = y == 0 ? t0 : (y == 1 ? t1 : t2), rows = y < 2 ? F : E, ne0 = y < 2 ? E : F;
+    const int64_t off = y == 0 ? 0 : (y == 1 ? bg : bg + bu);
+    const int64_t n = repack_units(type, rows, ne0);
+    for (int64_t w = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; w < n; w += (int64_t)gridDim.x * blockDim.x)
+        repack_unit(src + off, dst + off, type, rows, ne0, w);
+}
+
+static void repack_expert(const uint8_t *raw, uint8_t *dst, const int *ty, int F, int E, int64_t bg, int64_t bu,
+                          cudaStream_t st)
+{
+    k_repack3<<<dim3(256, 3), 256, 0, st>>>(raw, dst, ty[0], ty[1], ty[2], F, E, bg, bu);
 }
 
 /* byte i (0..11) of the scales, held in three registers: selects, not an indexed array
@@ -1281,9 +1309,7 @@ static void upload_slot(Gpu *g, int ji, int s, int key, const uint8_t *stage, in
     const int64_t bg = (int64_t)F * g->rb[il][0], bu = (int64_t)F * g->rb[il][1];
     const int nb_g = ty[0] == Q38_Q4_K || ty[0] == Q38_Q5_K ? E / 256 : E / 32;
     const int nb_d = ty[2] == Q38_Q4_K || ty[2] == Q38_Q5_K ? F / 256 : F / 32;
-    k_repack<<<(F * nb_g + 255) / 256, 256, 0, st>>>(ds, g->vs_ptr[s], ty[0], F, E);
-    k_repack<<<(F * nb_g + 255) / 256, 256, 0, st>>>(ds + bg, g->vs_ptr[s] + bg, ty[1], F, E);
-    k_repack<<<(E * nb_d + 255) / 256, 256, 0, st>>>(ds + bg + bu, g->vs_ptr[s] + bg + bu, ty[2], E, F);
+    repack_expert(ds, g->vs_ptr[s], ty, F, E, bg, bu, st);
 }
 
 /* The upload worker: copies a held expert from the RAM cache into a pinned staging buffer,
@@ -1557,6 +1583,7 @@ extern "C" void q38_gpu_warm(void *model, int on)
 }
 
 static int bat_open(q38_model *m, int nb);    /* q38_gpu_batch.cuh */
+
 static int bat_open_aux(q38_model *m);
 
 extern "C" int q38_gpu_open(void *model, int device)
@@ -1719,7 +1746,12 @@ extern "C" void q38_gpu_close(void *model)
         fprintf(stderr, "q38: routed experts on the GPUs %.1f%% (%lld of %lld; %lld on the second), %lld uploaded to VRAM\n",
                 100.0 * G->vram_hits / (double)(G->vram_hits + G->vram_misses), (long long)G->vram_hits,
                 (long long)(G->vram_hits + G->vram_misses), (long long)G->aux_hits, (long long)G->uploads);
-    if (G->t_stream > 0) fprintf(stderr, "q38: prompt passes spent %.1f s copying experts to the device\n", G->t_stream);
+    if (G->t_stream > 0)
+        fprintf(stderr, "q38: prompt passes spent %.1f s copying %.1f GB of experts to the device\n", G->t_stream,
+                G->stream_bytes / 1e9);
+    if (G->t_sp_copy > 0)
+        fprintf(stderr, "q38: streamed experts: copy+repack %.1f s (%.1f GB/s), their pairs %.1f s\n", G->t_sp_copy,
+                G->stream_bytes / 1e9 / G->t_sp_copy, G->t_sp_pairs);
     if (G->tokens_fwd)
         fprintf(stderr, "q38: host per token: launch %.4f s, route %.4f s, promote %.4f s (%s)\n",
                 G->t_launch / G->tokens_fwd, G->t_route / G->tokens_fwd, G->t_promote / G->tokens_fwd,
