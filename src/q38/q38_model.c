@@ -358,6 +358,46 @@ int q38_model_ple_emb(q38_model *m, int tok, float *emb)
     return bad ? -1 : 0;
 }
 
+/* q38_model_ple_emb for n tokens at positions p0.. (their ids already in m->toks): all the
+ * rows of all the tokens read in one parallel loop */
+int q38_model_ple_emb_batch(q38_model *m, int p0, int n, float *emb)
+{
+    const q38_cfg *c = &m->c;
+    const int H = c->ple_heads, pin = H * c->ple_dim;
+    int64_t *rows = (int64_t *)malloc((size_t)n * H * sizeof(int64_t));
+    if (!rows || m->ple_table.row_bytes > 1024) { free(rows); return -1; }
+    for (int t = 0; t < n; t++) {
+        int64_t ctx[8];
+        ctx[0] = m->toks[p0 + t];
+        int cut = 0;
+        for (int s2 = 1; s2 < c->ple_ngram; s2++) {
+            const int64_t idx = (int64_t)p0 + t - s2;
+            const int64_t tk = idx >= 0 ? m->toks[idx] : -1;
+            cut = cut || tk < 0 || tk == c->ple_eos;
+            ctx[s2] = cut ? c->ple_eos : tk;
+        }
+        for (int ng = 2; ng <= c->ple_ngram; ng++) {
+            uint64_t mixed = (uint64_t)ctx[0] * c->ple_mult[0];
+            for (int j = 1; j < ng; j++) mixed ^= (uint64_t)ctx[j] * c->ple_mult[j];
+            const int base = (ng - 2) * c->ple_per_gram;
+            for (int g = 0; g < c->ple_per_gram; g++) {
+                const int h = base + g;
+                rows[(int64_t)t * H + h] = (int64_t)(mixed % (uint64_t)c->ple_voc[h]) + c->ple_off[h];
+            }
+        }
+    }
+    int bad = 0, i;
+    const int total = n * H;
+#pragma omp parallel for schedule(dynamic, 16) reduction(+ : bad) num_threads(32)
+    for (i = 0; i < total; i++) {
+        uint8_t raw[1024];
+        if (q38_gguf_pread(&m->g, m->ple_table.t, rows[i] * m->ple_table.row_bytes, raw, m->ple_table.row_bytes)) bad++;
+        else q38_dequant_row(m->ple_table.type, raw, emb + (int64_t)(i / H) * pin + (int64_t)(i % H) * c->ple_dim, c->ple_dim);
+    }
+    free(rows);
+    return bad ? -1 : 0;
+}
+
 static int ple(q38_model *m, int il, float *res, int tok)
 {
     const q38_cfg *c = &m->c;
@@ -889,6 +929,149 @@ static int moe(q38_model *m, int il, const float *x, float *y)
     return experts_compute(m, il, x, top, w, m->c.n_exp_used, 1, y);
 }
 
+/* Routed experts for many tokens of one layer at once (the batched prompt pass): the pairs
+ * (token, expert, weight) are grouped by expert, each expert is read from the RAM cache once
+ * and applied to all of its tokens (the weight rows stay in the CPU caches across them), and
+ * every token's sum is then formed over its pairs in the order given. y[t] is overwritten
+ * for every t < n_tok (zero for a token without pairs). */
+int q38_model_experts_batch(q38_model *m, int il, const float *X, int n_tok, const int *ptok, const int *pexp,
+                            const float *pw, int npair, float *Y)
+{
+    const q38_cfg *c = &m->c;
+    const q38_layer *l = &m->L[il];
+    const int E = c->n_embd, F = c->ff_exp, NE = c->n_exp;
+    for (int64_t i = 0; i < (int64_t)n_tok * E; i++) Y[i] = 0.0f;
+    if (npair <= 0) return 0;
+    /* protect only this layer's experts from eviction: a whole batch's would not fit */
+    m->token_stamp++;
+
+    /* distinct experts and their pairs */
+    int *first = (int *)malloc((size_t)NE * sizeof(int)), *next = (int *)malloc((size_t)npair * sizeof(int));
+    int *ue = (int *)malloc((size_t)NE * sizeof(int));
+    q38_slot **us = (q38_slot **)malloc((size_t)NE * sizeof(q38_slot *));
+    float *gu = (float *)malloc((size_t)npair * 2 * F * sizeof(float)), *h = (float *)malloc((size_t)npair * F * sizeof(float));
+    float *dn = (float *)malloc((size_t)npair * E * sizeof(float));
+    float *xb = (float *)malloc((size_t)n_tok * (E / 32) * sizeof(float)), *hb = (float *)malloc((size_t)npair * (F / 32) * sizeof(float));
+    q38_xvec *vx = (q38_xvec *)malloc((size_t)n_tok * sizeof(q38_xvec)), *vh = (q38_xvec *)malloc((size_t)npair * sizeof(q38_xvec));
+    int rc = -1;
+    if (!first || !next || !ue || !us || !gu || !h || !dn || !xb || !hb || !vx || !vh) goto out;
+    for (int e = 0; e < NE; e++) first[e] = -1;
+    int nu = 0;
+    for (int p = npair - 1; p >= 0; p--) {             /* lists in pair order */
+        const int e = pexp[p];
+        if (first[e] < 0) ue[nu++] = e;
+        next[p] = first[e];
+        first[e] = p;
+    }
+
+    /* resident in RAM: hits to the front, misses read together */
+    {
+        int miss[1024], nmiss = 0;
+        for (int i = 0; i < nu; i++) {
+            q38_slot *s = m->table[il * NE + ue[i]];
+            if (s) {
+                s->stamp = m->token_stamp;
+                lru_unlink(m, s);
+                lru_front(m, s);
+                m->cache_hits++;
+            } else {
+                s = slot_alloc(m, il, ue[i]);
+                if (!s) goto out;
+                if (nmiss < 1024) miss[nmiss++] = i;
+                m->cache_misses++;
+            }
+            us[i] = s;
+        }
+        if (nmiss) {
+            const double t0 = now_s();
+            int bad = 0, i;
+#pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad)
+            for (i = 0; i < nmiss; i++) bad += slot_read(m, il, ue[miss[i]], us[miss[i]]) != 0;
+            m->t_read += now_s() - t0;
+            for (i = 0; i < nmiss; i++) m->expert_bytes_read += us[miss[i]]->bytes;
+            if (bad) { fprintf(stderr, "q38: reading experts of layer %d failed\n", il); goto out; }
+        }
+    }
+
+    const double t0 = now_s();
+    for (int t = 0; t < n_tok; t++) q38_xprep(&vx[t], X + (int64_t)t * E, E, xb + (int64_t)t * (E / 32));
+    const int64_t bg = (int64_t)F * l->ex_gate.row_bytes, bu = (int64_t)F * l->ex_up.row_bytes;
+    /* gate and up: work item = (expert, row); inner loop over the expert's tokens */
+    {
+        const int items = nu * 2 * F;
+        int it;
+#pragma omp parallel for schedule(static)
+        for (it = 0; it < items; it++) {
+            const int i = it / (2 * F), j = it % (2 * F);
+            const uint8_t *row = j < F ? us[i]->data + (int64_t)j * l->ex_gate.row_bytes
+                                       : us[i]->data + bg + (int64_t)(j - F) * l->ex_up.row_bytes;
+            const int ty = j < F ? l->ex_gate.type : l->ex_up.type;
+            for (int p = first[ue[i]]; p >= 0; p = next[p]) gu[(int64_t)p * 2 * F + j] = q38_dot(ty, row, &vx[ptok[p]]);
+        }
+    }
+    for (int p = 0; p < npair; p++) {
+        for (int j = 0; j < F; j++) h[(int64_t)p * F + j] = siluf_(gu[(int64_t)p * 2 * F + j]) * gu[(int64_t)p * 2 * F + F + j];
+        q38_xprep(&vh[p], h + (int64_t)p * F, F, hb + (int64_t)p * (F / 32));
+    }
+    {
+        const int items = nu * E;
+        int it;
+#pragma omp parallel for schedule(static)
+        for (it = 0; it < items; it++) {
+            const int i = it / E, r = it % E;
+            const uint8_t *row = us[i]->data + bg + bu + (int64_t)r * l->ex_down.row_bytes;
+            for (int p = first[ue[i]]; p >= 0; p = next[p]) dn[(int64_t)p * E + r] = q38_dot(l->ex_down.type, row, &vh[p]);
+        }
+    }
+    for (int p = 0; p < npair; p++) {
+        float *y = Y + (int64_t)ptok[p] * E;
+        const float *d = dn + (int64_t)p * E;
+        for (int r = 0; r < E; r++) y[r] += pw[p] * d[r];
+    }
+    m->t_experts += now_s() - t0;
+    rc = 0;
+out:
+    free(first); free(next); free(ue); free(us); free(gu); free(h); free(dn); free(xb); free(hb); free(vx); free(vh);
+    return rc;
+}
+
+int q38_model_experts_resident(q38_model *m, int il, const int *ids, int n, const uint8_t **data)
+{
+    const int NE = m->c.n_exp;
+    m->token_stamp++;
+    q38_slot **sl = (q38_slot **)malloc((size_t)(n ? n : 1) * sizeof(q38_slot *));
+    int *miss = (int *)malloc((size_t)(n ? n : 1) * sizeof(int)), nmiss = 0, rc = 0;
+    if (!sl || !miss) { free(sl); free(miss); return -1; }
+    for (int i = 0; i < n; i++) {
+        q38_slot *s = m->table[il * NE + ids[i]];
+        if (s) {
+            s->stamp = m->token_stamp;
+            lru_unlink(m, s);
+            lru_front(m, s);
+            m->cache_hits++;
+        } else {
+            s = slot_alloc(m, il, ids[i]);
+            if (!s) { rc = -1; break; }
+            miss[nmiss++] = i;
+            m->cache_misses++;
+        }
+        sl[i] = s;
+    }
+    if (!rc && nmiss) {
+        const double t0 = now_s();
+        int bad = 0, i;
+#pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad)
+        for (i = 0; i < nmiss; i++) bad += slot_read(m, il, ids[miss[i]], sl[miss[i]]) != 0;
+        m->t_read += now_s() - t0;
+        for (i = 0; i < nmiss; i++) m->expert_bytes_read += sl[miss[i]]->bytes;
+        if (bad) rc = -1;
+    }
+    if (!rc) for (int i = 0; i < n; i++) data[i] = sl[i]->data;
+    free(sl);
+    free(miss);
+    return rc;
+}
+
 void q38_model_route(q38_model *m, int il, const float *logits, int *top, float *w) { route(m, il, logits, top, w); }
 
 int q38_model_experts(q38_model *m, int il, const float *x, const int *ids, const float *w, int n, float *y)
@@ -1052,6 +1235,27 @@ const float *q38_model_forward(q38_model *m, int token)
     m->toks[m->n_past++] = token;
     m->t_trunk += now_s() - t0;
     return m->logits;
+}
+
+const float *q38_model_forward_batch(q38_model *m, const int *toks, int n)
+{
+    if (n <= 0) return NULL;
+    if (m->n_past + n > m->max_ctx) {
+        fprintf(stderr, "q38: context full (%d + %d tokens > %d)\n", m->n_past, n, m->max_ctx);
+        return NULL;
+    }
+#ifdef Q38_CUDA
+    if (m->gpu && n > 1 && !m->tap && !(getenv("Q38_NO_BATCH") && atoi(getenv("Q38_NO_BATCH")))) {
+        const double t0 = now_s();
+        m->token_stamp++;
+        if (q38_gpu_forward_batch(m, toks, n)) return NULL;
+        m->t_trunk += now_s() - t0;
+        return m->logits;
+    }
+#endif
+    const float *lg = NULL;
+    for (int i = 0; i < n; i++) if (!(lg = q38_model_forward(m, toks[i]))) return NULL;
+    return lg;
 }
 
 /* ------------------------------------------------------------------- lifetime -- */

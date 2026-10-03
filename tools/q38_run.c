@@ -74,7 +74,8 @@ int main(int argc, char **argv)
     double cache_gb = 0;
     int gpu = -1;
     const char *logits_dir = NULL;
-    int from = 0, quiet = 0;     /* logits only, without taps (taps force plain GPU launches) */
+    int from = 0, quiet = 0, batch = 0;
+    double preload = 0;               /* GB of experts read at start from localcode's usage profile */  /* --batch: the prompt in one batched pass */     /* logits only, without taps (taps force plain GPU launches) */
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--dump") && i + 1 < argc) g_dump = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
@@ -83,6 +84,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--logits") && i + 1 < argc) logits_dir = argv[++i];
         else if (!strcmp(argv[i], "--from") && i + 1 < argc) from = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--batch")) batch = 1;
+        else if (!strcmp(argv[i], "--preload") && i + 1 < argc) preload = atof(argv[++i]);
         else if (!strcmp(argv[i], "--names") && i + 1 < argc) g_names = argv[++i];
     }
     FILE *f = fopen(argv[2], "r");
@@ -98,9 +101,44 @@ int main(int argc, char **argv)
 #endif
     if (cache_gb > 0) q38_model_set_cache(&m, cache_gb);
     if (g_dump) m.tap = tap;
+    if (preload > 0) {
+        char prof[1024];
+        const char *base = getenv("LOCALAPPDATA");
+        snprintf(prof, sizeof prof, "%s/localcode/qwen38_expert_profile.bin", base ? base : ".");
+        const double tp = now_s();
+        if (q38_model_profile_load(&m, prof) == 0) {
+            const int nr = q38_model_preload(&m, preload);
+            int nv = 0;
+#ifdef Q38_CUDA
+            if (gpu >= 0) nv = q38_gpu_prefill(&m);
+#endif
+            fprintf(stderr, "preloaded %d experts into RAM, %d into VRAM in %.1f s\n", nr, nv, now_s() - tp);
+        }
+        m.t_read = 0;
+    }
 
     int next = -1;
-    for (int i = 0; i < n + gen; i++) {
+    int i0 = 0;
+    if (batch && n > 1) {
+        const double tb = now_s();
+        const float *lg = q38_model_forward_batch(&m, toks, n);
+        if (!lg) return 1;
+        printf("batch time: read %.1f s, cpu experts %.1f s, gpu wait %.1f s, ple %.1f s, total %.1f s\n", m.t_read,
+               m.t_experts, m.t_gpu_wait, m.t_ple, now_s() - tb);
+        int t5[5];
+        top5(lg, m.c.n_vocab, t5);
+        next = t5[0];
+        printf("prompt of %d tokens in one batch: %.3fs (%.1f tok/s), top5 %d %d %d %d %d\n", n, now_s() - tb,
+               n / (now_s() - tb), t5[0], t5[1], t5[2], t5[3], t5[4]);
+        if (logits_dir) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s/logits_last.f32", logits_dir);
+            FILE *lf = fopen(path, "wb");
+            if (lf) { fwrite(lg, sizeof(float), (size_t)m.c.n_vocab, lf); fclose(lf); }
+        }
+        i0 = n;
+    }
+    for (int i = i0; i < n + gen; i++) {
         int tok = i < n ? toks[i] : next;
         double t0 = now_s(), r0 = m.t_read, e0 = m.t_experts, w0 = m.t_gpu_wait, p0 = m.t_ple, l0 = m.t_tail;
         g_cur = i;

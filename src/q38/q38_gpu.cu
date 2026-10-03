@@ -115,6 +115,11 @@ typedef struct {
     pthread_t up_thread;
 #endif
     double    t_launch, t_route, t_post, t_promote;   /* host time per phase (Q38_PROFILE) */
+    /* prompt pass: experts streamed from RAM into a staging area and computed here */
+    uint8_t  *pstage, *praw[4];
+    int       pst_n;
+    int64_t   pst_slot;
+    double    t_stream;
     /* per-token inputs read by the device (graph-stable) */
     int      *d_pos, *h_pos;
     float    *h_emb, *h_logits, *knew, *vnew;
@@ -1551,6 +1556,9 @@ extern "C" void q38_gpu_warm(void *model, int on)
     if (G) G->warm_want = on;
 }
 
+static int bat_open(q38_model *m, int nb);    /* q38_gpu_batch.cuh */
+static int bat_open_aux(q38_model *m);
+
 extern "C" int q38_gpu_open(void *model, int device)
 {
     q38_model *m = (q38_model *)model;
@@ -1648,7 +1656,9 @@ extern "C" int q38_gpu_open(void *model, int device)
         const char *eg = getenv("Q38_GRAPH");
         g->use_graphs = !eg || atoi(eg) != 0;
     }
+    if (bat_open(m, 0)) return -1;
     if (pool_open(m, g)) return -1;
+    if (bat_open_aux(m)) return -1;
     if (g->nvs) {
 #ifdef _WIN32
         g->up_thread = CreateThread(NULL, 0, up_main, g, 0, NULL);
@@ -1709,6 +1719,7 @@ extern "C" void q38_gpu_close(void *model)
         fprintf(stderr, "q38: routed experts on the GPUs %.1f%% (%lld of %lld; %lld on the second), %lld uploaded to VRAM\n",
                 100.0 * G->vram_hits / (double)(G->vram_hits + G->vram_misses), (long long)G->vram_hits,
                 (long long)(G->vram_hits + G->vram_misses), (long long)G->aux_hits, (long long)G->uploads);
+    if (G->t_stream > 0) fprintf(stderr, "q38: prompt passes spent %.1f s copying experts to the device\n", G->t_stream);
     if (G->tokens_fwd)
         fprintf(stderr, "q38: host per token: launch %.4f s, route %.4f s, promote %.4f s (%s)\n",
                 G->t_launch / G->tokens_fwd, G->t_route / G->tokens_fwd, G->t_promote / G->tokens_fwd,
@@ -2061,3 +2072,5 @@ extern "C" int q38_gpu_forward(void *model, int token)
     G->tokens_fwd++;
     return 0;
 }
+
+#include "q38_gpu_batch.cuh"

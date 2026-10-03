@@ -51,11 +51,8 @@ static double now_s(void)
 static int qw_forward(Glm53fEngine *e, const int *ids, int n, float *logits)
 {
     QwenEngine *q = (QwenEngine *)e->impl;
-    const float *lg = NULL;
-    for (int i = 0; i < n; i++) {
-        lg = q38_model_forward(q->m, ids[i]);
-        if (!lg) { e->cached = q->m->n_past; return -1; }
-    }
+    const float *lg = q38_model_forward_batch(q->m, ids, n);
+    if (!lg) { e->cached = q->m->n_past; return -1; }
     if (lg) memcpy(logits, lg, (size_t)q->m->c.n_vocab * sizeof(float));
     e->cached = q->m->n_past;
     return 0;

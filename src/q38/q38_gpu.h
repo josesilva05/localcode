@@ -29,6 +29,9 @@ void q38_gpu_warm(void *model, int on);
 /* After q38_model_preload: upload the most used resident experts into the VRAM pool.
  * Returns how many. */
 int  q38_gpu_prefill(void *model);
+/* n consecutive tokens in one pass per layer (prompt reading); the logits of the last one
+ * land in the model's host buffer. Returns 0 or -1. */
+int  q38_gpu_forward_batch(void *model, const int *toks, int n);
 /* One token; the logits land in the model's host buffer. Returns 0 or -1. */
 int  q38_gpu_forward(void *model, int token);
 

@@ -132,6 +132,13 @@ void q38_model_close(q38_model *m);
 void q38_model_route(q38_model *m, int il, const float *logits, int *top, float *w);
 /* y = sum_k w[k] * expert ids[k](x) for n experts of layer il, from the RAM cache */
 int  q38_model_experts(q38_model *m, int il, const float *x, const int *ids, const float *w, int n, float *y);
+/* Make n experts of layer il resident in the RAM cache (misses read in parallel) and return
+ * their bytes; they stay protected from eviction until the next call. 0 or -1. */
+int  q38_model_experts_resident(q38_model *m, int il, const int *ids, int n, const uint8_t **data);
+/* the same for many tokens: pairs (token ptok[p], expert pexp[p], weight pw[p]), each expert
+ * read once for all of its tokens; Y[n_tok][n_embd] gets each token's sum in pair order */
+int  q38_model_experts_batch(q38_model *m, int il, const float *X, int n_tok, const int *ptok, const int *pexp,
+                             const float *pw, int npair, float *Y);
 /* an expert's bytes in the RAM cache (gate | up | down), or -1 when it is not resident */
 int  q38_model_expert_slot(q38_model *m, int il, int e, const uint8_t **data, int64_t *bytes);
 /* The same, holding the expert in RAM until q38_model_expert_release (it may be released
@@ -141,6 +148,8 @@ void  q38_model_expert_release(void *handle);
 int  q38_model_ple(q38_model *m, int il, float *res, int tok);
 /* the PLE layer's input for token tok at position n_past (ple_heads * ple_dim floats) */
 int  q38_model_ple_emb(q38_model *m, int tok, float *emb);
+/* the same for n tokens at positions p0.. whose ids are already in m->toks */
+int  q38_model_ple_emb_batch(q38_model *m, int p0, int n, float *emb);
 /* Expert usage profile: counts of router choices, kept across sessions (a profile file of
  * n_layer * n_exp floats). load adds the file's counts; save writes the current ones. */
 int  q38_model_profile_load(q38_model *m, const char *path);
@@ -155,5 +164,7 @@ void q38_model_reset(q38_model *m);
 /* Feeds one token at position m->n_past and returns the logits (n_vocab floats, owned by
  * the model), or NULL on failure. */
 const float *q38_model_forward(q38_model *m, int token);
+/* n tokens at once (batched on the GPU, one by one on the CPU); logits of the last one. */
+const float *q38_model_forward_batch(q38_model *m, const int *toks, int n);
 
 #endif
