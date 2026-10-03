@@ -581,6 +581,14 @@ static const int *indexer_select(q38_model *m, int il, const float *x, int *T)
     free(score);
     free(order);
     *T = n;
+    if (m->tap) {
+        float *f = (float *)malloc((size_t)n * sizeof(float));
+        char nm[64];
+        for (int i = 0; i < n; i++) f[i] = (float)g_sel[i];
+        snprintf(nm, sizeof nm, "indexer_top_k-%d", il);
+        m->tap(m->tap_ctx, nm, f, n);
+        free(f);
+    }
     return g_sel;
 }
 
@@ -1066,9 +1074,19 @@ void q38_model_reset(q38_model *m)
 int q38_model_open(q38_model *m, const char *path, int max_ctx)
 {
     memset(m, 0, sizeof *m);
+#ifdef _OPENMP
+    /* one thread per physical core: with SMT siblings the CPU experts ran slower (measured
+     * 2026-10-03: 8 threads 21.97 tok/s, 16 threads 20.32 on an 8-core / 16-thread Ryzen) */
+    if (!getenv("OMP_NUM_THREADS") && omp_get_num_procs() >= 4) omp_set_num_threads(omp_get_num_procs() / 2);
+#endif
     if (q38_gguf_open(&m->g, path)) return -1;
     if (read_cfg(&m->c, &m->g)) { q38_model_close(m); return -1; }
     q38_cfg *c = &m->c;
+    if (getenv("Q38_DENSE") && atoi(getenv("Q38_DENSE"))) {
+        /* control for validation: attend every cell at every length (not the model) */
+        c->idx_top_k = 0;
+        c->max_dense_ctx = 1 << 30;
+    }
     if (max_ctx <= 0) max_ctx = 8192;
     if (c->idx_top_k <= 0 && max_ctx > c->max_dense_ctx) max_ctx = c->max_dense_ctx;
     if (max_ctx > (1 << 16)) max_ctx = 1 << 16;

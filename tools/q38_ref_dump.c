@@ -33,6 +33,7 @@ typedef struct {
     int         n_files;
     float      *buf;
     size_t      buf_cap;
+    int         cur, from;            /* token being decoded; tensors are written from `from` on */
 } dump;
 
 static int wanted(const dump *d, const char *name)
@@ -72,6 +73,17 @@ static bool on_tensor(struct ggml_tensor *t, bool ask, void *user)
     dump *d = (dump *)user;
     if (!wanted(d, t->name)) return ask ? false : true;
     if (ask) return true;
+    if (d->cur < d->from) return true;
+    if (t->type == GGML_TYPE_I32 && ggml_is_contiguous(t)) {   /* indices (indexer_top_k): as floats */
+        size_t n = (size_t)ggml_nelements(t);
+        int32_t *iv = (int32_t *)malloc(n * sizeof(int32_t));
+        if (n > d->buf_cap) { d->buf = (float *)realloc(d->buf, n * sizeof(float)); d->buf_cap = n; }
+        ggml_backend_tensor_get(t, iv, 0, n * sizeof(int32_t));
+        for (size_t i = 0; i < n; i++) d->buf[i] = (float)iv[i];
+        free(iv);
+        append(d, t->name, d->buf, (long long)n);
+        return true;
+    }
     if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
         fprintf(stderr, "skipping %s (type %d, contiguous %d)\n", t->name, (int)t->type, (int)ggml_is_contiguous(t));
         return true;
@@ -174,6 +186,8 @@ int main(int argc, char **argv)
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
     for (int i = 0; i < n; i++) {
+        d.cur = i;
+        d.from = from;
         if (llama_decode(ctx, llama_batch_get_one(&toks[i], 1))) { fprintf(stderr, "decode failed at %d\n", i); return 1; }
         if (i >= from) append(&d, "logits", llama_get_logits_ith(ctx, -1), n_vocab);
         fprintf(stderr, "\rtoken %d/%d", i + 1, n);

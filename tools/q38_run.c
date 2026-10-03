@@ -18,9 +18,24 @@
 
 static const char *g_dump;
 
+static const char *g_names;   /* --names: comma-separated prefixes to keep (all when NULL) */
+static int g_cur, g_from;
+
 static void tap(void *ctx, const char *name, const float *x, int64_t n)
 {
     (void)ctx;
+    if (g_cur < g_from) return;
+    if (g_names) {
+        int keep = 0;
+        const char *p = g_names;
+        while (*p && !keep) {
+            const char *e = strchr(p, ',');
+            const size_t l = e ? (size_t)(e - p) : strlen(p);
+            if (!strncmp(name, p, l)) keep = 1;
+            p = e ? e + 1 : p + l;
+        }
+        if (!keep) return;
+    }
     char path[1024];
     snprintf(path, sizeof path, "%s/%s.f32", g_dump, name);
     FILE *f = fopen(path, "ab");
@@ -68,6 +83,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--logits") && i + 1 < argc) logits_dir = argv[++i];
         else if (!strcmp(argv[i], "--from") && i + 1 < argc) from = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--names") && i + 1 < argc) g_names = argv[++i];
     }
     FILE *f = fopen(argv[2], "r");
     if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
@@ -87,6 +103,8 @@ int main(int argc, char **argv)
     for (int i = 0; i < n + gen; i++) {
         int tok = i < n ? toks[i] : next;
         double t0 = now_s(), r0 = m.t_read, e0 = m.t_experts, w0 = m.t_gpu_wait, p0 = m.t_ple, l0 = m.t_tail;
+        g_cur = i;
+        g_from = from;
         const float *lg = q38_model_forward(&m, tok);
         if (!lg) return 1;
         if (logits_dir && i >= from) {

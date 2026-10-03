@@ -212,7 +212,11 @@ int main(int argc, char **argv)
     memset(&q, 0, sizeof q);
     q.m = &m;
     q.tok = tok;
+#ifdef _OPENMP
+    q.threads = omp_get_max_threads();     /* after q38_model_open, which may have lowered it */
+#else
     q.threads = threads;
+#endif
     q.gpu = on_gpu;
     /* the usage profile of earlier sessions: warm the caches before the first question */
     char prof[1024] = "";

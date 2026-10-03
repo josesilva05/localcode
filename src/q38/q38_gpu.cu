@@ -31,6 +31,20 @@ static double now_s(void)
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+#include <immintrin.h>
+/* Wait for an event by polling: the host has nothing else to do, and a blocking wait costs a
+ * thread wake-up (tens of microseconds on Windows) at every one of the ~100 waits per token.
+ * Q38_SPIN=0 goes back to blocking waits. */
+static int g_spin = -1;
+static cudaError_t ev_wait(cudaEvent_t e)
+{
+    if (g_spin < 0) g_spin = !(getenv("Q38_SPIN") && atoi(getenv("Q38_SPIN")) == 0);
+    if (!g_spin) return cudaEventSynchronize(e);
+    cudaError_t r;
+    while ((r = cudaEventQuery(e)) == cudaErrorNotReady) _mm_pause();
+    return r;
+}
+
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "q38_gpu: %s failed: %s (%s:%d)\n", #x, cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 
@@ -63,19 +77,31 @@ typedef struct {
     float    *h_x, *h_router, *h_y, *h_res, *h_tap;
     int64_t   bytes;
     /* routed experts in VRAM (pool_open / pool_promote) */
-    int       n_cls, cls_of_layer[Q38_MAX_LAYERS], cls_layers[8], cls_n[8], cls_first[8];
+    int       n_cls, cls_of_layer[Q38_MAX_LAYERS], cls_layers[8];
     int64_t   cls_bytes[8];
-    uint8_t  *cls_mem[8];
-    int       nvs, *vs_key, *free_n, *free_list, *vslot, *cand, n_cand, swaps;
+    int       npd, pdev[2];               /* pool devices: [0] the trunk's, [1] the other one */
+    int       cls_n[2][8], cls_first[2][8], free_n[2][8];
+    uint8_t  *cls_mem[2][8];
+    int       nvs, *vs_key, *free_list, *vslot, *cand, n_cand, swaps;
+    unsigned char *vs_pd;
     uint8_t **vs_ptr;
+    int64_t   vram_bytes_pd[2];
+    /* the second device's share of a MoE layer */
+    cudaStream_t st2;
+    cudaEvent_t  ev2;
+    LayerDesc *h_ldesc2, *d_ldesc2;
+    float    *x2, *ex_gu2, *ex_h2, *ex_dn2, *routed2, *h_y2;
+    cudaGraphExec_t gexec2[Q38_MAX_LAYERS];
+    int64_t   aux_hits;
     float    *freq;
     ExDesc   *h_desc, *d_desc;
     float    *routed_dev, *ex_gu, *ex_h, *ex_dn;
     int64_t   vram_bytes, uploads, tokens, vram_hits, vram_misses;
     /* background uploads to VRAM: jobs filled by pool_promote, copied by up_main */
-    cudaStream_t st_up;
+    cudaStream_t st_up[2];
     UpJob     up[32];
-    uint8_t  *dstage[32];             /* device staging: raw bytes before k_repack */
+    cudaEvent_t up_ev[2][32];
+    uint8_t  *dstage[2][32];          /* device staging: raw bytes before k_repack */
     int       ex_types[Q38_MAX_LAYERS][3];
     int       ex_rows[3];
     int       n_exp_, ff_exp_, n_embd_;
@@ -106,7 +132,7 @@ typedef struct {
     cudaEvent_t  warm_ev;
     float       *warm_buf, *warm_out;
     volatile int warm_want, warm_stop, warm_on;
-    int          warm_blocks, warm_n4;
+    int          warm_blocks, warm_n4, warm_dev;
 #ifdef _WIN32
     HANDLE       warm_thread;
 #else
@@ -1095,6 +1121,69 @@ static int64_t ex_bytes_layer(const q38_model *m, int il)
     return (int64_t)m->c.ff_exp * (l->ex_gate.row_bytes + l->ex_up.row_bytes) + (int64_t)m->c.n_embd * l->ex_down.row_bytes;
 }
 
+static int pool_open_dev(q38_model *m, Gpu *g, int pd, int64_t budget)
+{
+    const q38_cfg *c = &m->c;
+    int64_t weight = 0;
+    for (int il = 0; il < c->n_layer; il++) weight += ex_bytes_layer(m, il);
+    CK(cudaSetDevice(g->pdev[pd]));
+    for (int k = 0; k < g->n_cls; k++) {
+        const double share = (double)budget * (double)(g->cls_layers[k] * g->cls_bytes[k]) / (double)weight;
+        int n = (int)(share / (double)g->cls_bytes[k]);
+        if (n > g->cls_layers[k] * c->n_exp) n = g->cls_layers[k] * c->n_exp;
+        g->cls_n[pd][k] = n;
+        g->cls_first[pd][k] = g->nvs;
+        g->nvs += n;
+    }
+    return 0;
+}
+
+static int pool_alloc_dev(Gpu *g, int pd)
+{
+    CK(cudaSetDevice(g->pdev[pd]));
+    CK(cudaStreamCreateWithFlags(&g->st_up[pd], cudaStreamNonBlocking));
+    int64_t maxb = 0;
+    for (int k = 0; k < g->n_cls; k++) if (g->cls_bytes[k] > maxb) maxb = g->cls_bytes[k];
+    for (int i = 0; i < g->n_up; i++) CK(cudaMalloc(&g->dstage[pd][i], (size_t)maxb));
+    for (int k = 0; k < g->n_cls; k++) {
+        const int n = g->cls_n[pd][k];
+        if (!n) continue;
+        CK(cudaMalloc(&g->cls_mem[pd][k], (size_t)n * (size_t)g->cls_bytes[k]));
+        g->vram_bytes += (int64_t)n * g->cls_bytes[k];
+        g->vram_bytes_pd[pd] += (int64_t)n * g->cls_bytes[k];
+        for (int i = 0; i < n; i++) {
+            const int s = g->cls_first[pd][k] + i;
+            g->vs_key[s] = -1;
+            g->vs_pd[s] = (unsigned char)pd;
+            g->vs_ptr[s] = g->cls_mem[pd][k] + (size_t)i * (size_t)g->cls_bytes[k];
+            g->free_list[g->cls_first[pd][k] + g->free_n[pd][k]++] = s;
+        }
+    }
+    return 0;
+}
+
+/* The second device (the one without the trunk): its own copy of the expert kernels' inputs
+ * and outputs, a stream, and one graph per layer. */
+static int aux_open(q38_model *m, Gpu *g)
+{
+    const q38_cfg *c = &m->c;
+    const int K = c->n_exp_used, E = c->n_embd, F = c->ff_exp;
+    CK(cudaSetDevice(g->pdev[1]));
+    CK(cudaStreamCreateWithFlags(&g->st2, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&g->ev2, cudaEventDisableTiming | cudaEventBlockingSync));
+    CK(cudaMalloc(&g->d_ldesc2, (size_t)c->n_layer * sizeof(LayerDesc)));
+    CK(cudaMemset(g->d_ldesc2, 0, (size_t)c->n_layer * sizeof(LayerDesc)));
+    CK(cudaMalloc(&g->x2, (size_t)E * sizeof(float)));
+    CK(cudaMalloc(&g->ex_gu2, (size_t)K * 2 * F * sizeof(float)));
+    CK(cudaMalloc(&g->ex_h2, (size_t)K * F * sizeof(float)));
+    CK(cudaMalloc(&g->ex_dn2, (size_t)K * E * sizeof(float)));
+    CK(cudaMalloc(&g->routed2, (size_t)E * sizeof(float)));
+    CK(cudaMallocHost(&g->h_ldesc2, (size_t)c->n_layer * sizeof(LayerDesc)));
+    memset(g->h_ldesc2, 0, (size_t)c->n_layer * sizeof(LayerDesc));
+    CK(cudaMallocHost(&g->h_y2, (size_t)E * sizeof(float)));
+    return 0;
+}
+
 static int pool_open(q38_model *m, Gpu *g)
 {
     const q38_cfg *c = &m->c;
@@ -1102,17 +1191,12 @@ static int pool_open(q38_model *m, Gpu *g)
     g->vslot = (int *)malloc((size_t)nkeys * sizeof(int));
     g->freq = (float *)calloc((size_t)nkeys, sizeof(float));
     g->cand = (int *)malloc((size_t)c->n_layer * 64 * sizeof(int));
+    g->pend = (char *)calloc((size_t)nkeys, 1);
     for (int i = 0; i < nkeys; i++) g->vslot[i] = -1;
-    const char *ev = getenv("Q38_VRAM_GB");
-    size_t fr = 0, tot = 0;
-    cudaMemGetInfo(&fr, &tot);
-    int64_t budget = ev ? (int64_t)(atof(ev) * 1e9) : (int64_t)fr - (int64_t)900e6;
-    if (budget > (int64_t)fr - (int64_t)500e6) budget = (int64_t)fr - (int64_t)500e6;
     const char *sw = getenv("Q38_VRAM_SWAPS");
     g->swaps = sw ? atoi(sw) : 8;
-    if (budget <= 0) return 0;
-    /* classes */
-    int64_t weight = 0;
+    g->n_up = 32;
+    g->n_exp_ = c->n_exp; g->ff_exp_ = c->ff_exp; g->n_embd_ = c->n_embd;
     for (int il = 0; il < c->n_layer; il++) {
         const int64_t b = ex_bytes_layer(m, il);
         int k = 0;
@@ -1120,61 +1204,86 @@ static int pool_open(q38_model *m, Gpu *g)
         if (k == g->n_cls) { if (k == 8) return -1; g->cls_bytes[k] = b; g->n_cls++; }
         g->cls_of_layer[il] = k;
         g->cls_layers[k]++;
-        weight += b;
-    }
-    int total = 0;
-    for (int k = 0; k < g->n_cls; k++) {
-        const double share = (double)budget * (double)(g->cls_layers[k] * g->cls_bytes[k]) / (double)weight;
-        int n = (int)(share / (double)g->cls_bytes[k]);
-        if (n > g->cls_layers[k] * c->n_exp) n = g->cls_layers[k] * c->n_exp;
-        g->cls_n[k] = n;
-        g->cls_first[k] = total;
-        total += n;
-    }
-    g->nvs = total;
-    g->vs_key = (int *)malloc((size_t)(total + 1) * sizeof(int));
-    g->vs_ptr = (uint8_t **)malloc((size_t)(total + 1) * sizeof(uint8_t *));
-    g->free_n = (int *)calloc(8, sizeof(int));
-    g->free_list = (int *)malloc((size_t)(total + 1) * sizeof(int));
-    int64_t maxb = 0;
-    for (int k = 0; k < g->n_cls; k++) if (g->cls_bytes[k] > maxb) maxb = g->cls_bytes[k];
-    g->n_exp_ = c->n_exp; g->ff_exp_ = c->ff_exp; g->n_embd_ = c->n_embd;
-    for (int il = 0; il < c->n_layer; il++) {
         g->rb[il][0] = m->L[il].ex_gate.row_bytes;
         g->rb[il][1] = m->L[il].ex_up.row_bytes;
         g->rb[il][2] = m->L[il].ex_down.row_bytes;
-    }
-    g->pend = (char *)calloc((size_t)nkeys, 1);
-    CK(cudaStreamCreateWithFlags(&g->st_up, cudaStreamNonBlocking));
-    g->n_up = 32;
-    for (int il = 0; il < c->n_layer; il++) {
         g->ex_types[il][0] = m->L[il].ex_gate.type;
         g->ex_types[il][1] = m->L[il].ex_up.type;
         g->ex_types[il][2] = m->L[il].ex_down.type;
     }
+
+    /* budgets: the trunk device keeps a margin for its graphs and buffers; the second device
+     * (Q38_AUX_GPU, default: the other one of two; -1 = none) gives almost all of its memory */
+    size_t fr = 0, tot = 0;
+    cudaSetDevice(g->dev);
+    cudaMemGetInfo(&fr, &tot);
+    const char *ev = getenv("Q38_VRAM_GB");
+    int64_t b0 = ev ? (int64_t)(atof(ev) * 1e9) : (int64_t)fr - (int64_t)900e6;
+    if (b0 > (int64_t)fr - (int64_t)500e6) b0 = (int64_t)fr - (int64_t)500e6;
+    g->npd = 1;
+    g->pdev[0] = g->dev;
+    int n_dev = 0;
+    cudaGetDeviceCount(&n_dev);
+    const char *ea = getenv("Q38_AUX_GPU");
+    int aux = ea ? atoi(ea) : (n_dev == 2 ? 1 - g->dev : -1);
+    int64_t b1 = 0;
+    if (aux >= 0 && aux < n_dev && aux != g->dev) {
+        cudaSetDevice(aux);
+        size_t f1 = 0, t1 = 0;
+        cudaMemGetInfo(&f1, &t1);
+        const char *ev1 = getenv("Q38_VRAM2_GB");
+        b1 = ev1 ? (int64_t)(atof(ev1) * 1e9) : (int64_t)f1 - (int64_t)700e6;
+        if (b1 > (int64_t)f1 - (int64_t)400e6) b1 = (int64_t)f1 - (int64_t)400e6;
+        if (b1 > 0) { g->npd = 2; g->pdev[1] = aux; }
+    }
+    g->nvs = 0;
+    if (b0 > 0) pool_open_dev(m, g, 0, b0);
+    if (g->npd == 2) pool_open_dev(m, g, 1, b1);
+    if (!g->nvs) { cudaSetDevice(g->dev); return 0; }
+    const int total = g->nvs;
+    g->vs_key = (int *)malloc((size_t)(total + 1) * sizeof(int));
+    g->vs_ptr = (uint8_t **)malloc((size_t)(total + 1) * sizeof(uint8_t *));
+    g->vs_pd = (unsigned char *)calloc((size_t)(total + 1), 1);
+    g->free_list = (int *)malloc((size_t)(total + 1) * sizeof(int));
+    int64_t maxb = 0;
+    for (int k = 0; k < g->n_cls; k++) if (g->cls_bytes[k] > maxb) maxb = g->cls_bytes[k];
+    cudaSetDevice(g->dev);
     for (int i = 0; i < g->n_up; i++) {
-        CK(cudaMalloc(&g->dstage[i], (size_t)maxb));
         CK(cudaMallocHost(&g->up[i].stage, (size_t)maxb));
-        CK(cudaEventCreateWithFlags(&g->up[i].ev, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&g->up[i].ev, cudaEventDisableTiming));   /* re-created per device in up_main */
         g->up[i].state = 0;
     }
-    for (int k = 0; k < g->n_cls; k++) {
-        if (!g->cls_n[k]) continue;
-        CK(cudaMalloc(&g->cls_mem[k], (size_t)g->cls_n[k] * (size_t)g->cls_bytes[k]));
-        g->vram_bytes += (int64_t)g->cls_n[k] * g->cls_bytes[k];
-        for (int i = 0; i < g->cls_n[k]; i++) {
-            const int s = g->cls_first[k] + i;
-            g->vs_key[s] = -1;
-            g->vs_ptr[s] = g->cls_mem[k] + (size_t)i * (size_t)g->cls_bytes[k];
-            g->free_list[g->cls_first[k] + g->free_n[k]++] = s;
+    for (int pd = 0; pd < g->npd; pd++) if (pool_alloc_dev(g, pd)) return -1;
+    for (int i = 0; i < g->n_up; i++)
+        for (int pd = 0; pd < g->npd; pd++) {
+            CK(cudaSetDevice(g->pdev[pd]));
+            CK(cudaEventCreateWithFlags(&g->up_ev[pd][i], cudaEventDisableTiming));
         }
-    }
+    if (g->npd == 2 && aux_open(m, g)) return -1;
+    cudaSetDevice(g->dev);
     return 0;
 }
 
+/* Upload the raw expert in stage (pinned) into slot s, rearranged; on the slot's device. */
+static void upload_slot(Gpu *g, int ji, int s, int key, const uint8_t *stage, int64_t bytes)
+{
+    const int pd = g->vs_pd[s];
+    cudaStream_t st = g->st_up[pd];
+    uint8_t *ds = g->dstage[pd][ji];
+    cudaMemcpyAsync(ds, stage, (size_t)bytes, cudaMemcpyHostToDevice, st);
+    const int il = key / g->n_exp_, F = g->ff_exp_, E = g->n_embd_;
+    const int *ty = g->ex_types[il];
+    const int64_t bg = (int64_t)F * g->rb[il][0], bu = (int64_t)F * g->rb[il][1];
+    const int nb_g = ty[0] == Q38_Q4_K || ty[0] == Q38_Q5_K ? E / 256 : E / 32;
+    const int nb_d = ty[2] == Q38_Q4_K || ty[2] == Q38_Q5_K ? F / 256 : F / 32;
+    k_repack<<<(F * nb_g + 255) / 256, 256, 0, st>>>(ds, g->vs_ptr[s], ty[0], F, E);
+    k_repack<<<(F * nb_g + 255) / 256, 256, 0, st>>>(ds + bg, g->vs_ptr[s] + bg, ty[1], F, E);
+    k_repack<<<(E * nb_d + 255) / 256, 256, 0, st>>>(ds + bg + bu, g->vs_ptr[s] + bg + bu, ty[2], E, F);
+}
+
 /* The upload worker: copies a held expert from the RAM cache into a pinned staging buffer,
- * releases it, and queues the DMA on its own stream. pool_promote commits the slot once the
- * DMA's event has fired. */
+ * releases it, and queues the DMA and the rearrangement on the slot's device. pool_promote
+ * commits the slot once the job's event has fired. */
 #ifdef _WIN32
 static DWORD WINAPI up_main(LPVOID arg)
 #else
@@ -1182,7 +1291,6 @@ static void *up_main(void *arg)
 #endif
 {
     Gpu *g = (Gpu *)arg;
-    cudaSetDevice(g->dev);
     while (!g->up_stop) {
         int did = 0;
         for (int i = 0; i < g->n_up; i++) {
@@ -1191,19 +1299,11 @@ static void *up_main(void *arg)
             std::atomic_thread_fence(std::memory_order_acquire);
             memcpy(j->stage, j->data, (size_t)j->bytes);
             q38_model_expert_release(j->hold);
-            cudaMemcpyAsync(g->dstage[i], j->stage, (size_t)j->bytes, cudaMemcpyHostToDevice, g->st_up);
-            {   /* rearrange gate | up | down into the slot (same bytes, device-friendly order) */
-                const int il = j->key / g->n_exp_, F = g->ff_exp_, E = g->n_embd_;
-                const int *ty = g->ex_types[il];
-                const int64_t rbg = g->rb[il][0], rbu = g->rb[il][1];
-                const int64_t bg = (int64_t)F * rbg, bu = (int64_t)F * rbu;
-                const int nb_g = ty[0] == Q38_Q4_K || ty[0] == Q38_Q5_K ? E / 256 : E / 32;
-                const int nb_d = ty[2] == Q38_Q4_K || ty[2] == Q38_Q5_K ? F / 256 : F / 32;
-                k_repack<<<(F * nb_g + 255) / 256, 256, 0, g->st_up>>>(g->dstage[i], g->vs_ptr[j->slot], ty[0], F, E);
-                k_repack<<<(F * nb_g + 255) / 256, 256, 0, g->st_up>>>(g->dstage[i] + bg, g->vs_ptr[j->slot] + bg, ty[1], F, E);
-                k_repack<<<(E * nb_d + 255) / 256, 256, 0, g->st_up>>>(g->dstage[i] + bg + bu, g->vs_ptr[j->slot] + bg + bu, ty[2], E, F);
-            }
-            cudaEventRecord(j->ev, g->st_up);
+            const int pd = g->vs_pd[j->slot];
+            cudaSetDevice(g->pdev[pd]);
+            upload_slot(g, i, j->slot, j->key, j->stage, j->bytes);
+            j->ev = g->up_ev[pd][i];
+            cudaEventRecord(j->ev, g->st_up[pd]);
             std::atomic_thread_fence(std::memory_order_release);
             j->state = 2;
             did = 1;
@@ -1234,6 +1334,21 @@ static void pool_commit(Gpu *g)
     }
 }
 
+/* a free slot of class k on any device (the trunk's first), or -1 */
+static int take_free(Gpu *g, int k)
+{
+    for (int pd = 0; pd < g->npd; pd++)
+        if (g->free_n[pd][k] > 0) return g->free_list[g->cls_first[pd][k] + --g->free_n[pd][k]];
+    return -1;
+}
+
+static void give_back(Gpu *g, int s, int k)
+{
+    const int pd = g->vs_pd[s];
+    g->vs_key[s] = -1;
+    g->free_list[g->cls_first[pd][k] + g->free_n[pd][k]++] = s;
+}
+
 /* After a token: queue uploads for the CPU-computed experts that earned a slot. */
 static void pool_promote(q38_model *m, Gpu *g)
 {
@@ -1247,21 +1362,19 @@ static void pool_promote(q38_model *m, Gpu *g)
         for (int u = 0; u < g->n_up; u++) if (g->up[u].state == 0) { jb = u; break; }
         if (jb < 0) break;
         const int il = key / c->n_exp, e = key % c->n_exp, k = g->cls_of_layer[il];
-        if (!g->cls_n[k]) continue;
         int s = -1;
-        if (g->free_n[k] > 0) {
-            if (filled >= 64) continue;
-            s = g->free_list[g->cls_first[k] + --g->free_n[k]];
+        if (filled < 64 && (s = take_free(g, k)) >= 0) {
             filled++;
         } else {
             if (swapped >= g->swaps) continue;
             int victim = -1;
             float vf = 1e30f;
-            for (int j = g->cls_first[k]; j < g->cls_first[k] + g->cls_n[k]; j++) {
-                if (g->vs_key[j] < 0) continue;              /* pending */
-                const float f = g->freq[g->vs_key[j]];
-                if (f < vf) { vf = f; victim = j; }
-            }
+            for (int pd = 0; pd < g->npd; pd++)
+                for (int j = g->cls_first[pd][k]; j < g->cls_first[pd][k] + g->cls_n[pd][k]; j++) {
+                    if (g->vs_key[j] < 0) continue;              /* free or pending */
+                    const float f = g->freq[g->vs_key[j]];
+                    if (f < vf) { vf = f; victim = j; }
+                }
             if (victim < 0 || !(g->freq[key] > vf + 1.0f)) continue;
             g->vslot[g->vs_key[victim]] = -1;
             s = victim;
@@ -1272,8 +1385,7 @@ static void pool_promote(q38_model *m, Gpu *g)
         void *h = q38_model_expert_hold(m, il, e, &data, &bytes);
         if (!h || bytes != g->cls_bytes[k]) {
             q38_model_expert_release(h);
-            g->vs_key[s] = -1;
-            g->free_list[g->cls_first[k] + g->free_n[k]++] = s;
+            give_back(g, s, k);
             continue;
         }
         g->vs_key[s] = -2;                                   /* pending: not a victim, not usable */
@@ -1282,50 +1394,6 @@ static void pool_promote(q38_model *m, Gpu *g)
         j->slot = s; j->key = key; j->hold = h; j->data = data; j->bytes = bytes;
         std::atomic_thread_fence(std::memory_order_release);
         j->state = 1;
-    }
-    g->n_cand = 0;
-    if (++g->tokens % 128 == 0)
-        for (int i = 0; i < c->n_layer * c->n_exp; i++) g->freq[i] *= 0.5f;
-}
-
-static void pool_promote_sync(q38_model *m, Gpu *g)
-{
-    const q38_cfg *c = &m->c;
-    int filled = 0, swapped = 0;
-    for (int i = 0; i < g->n_cand; i++) {
-        const int key = g->cand[i];
-        if (g->vslot[key] >= 0) continue;
-        const int il = key / c->n_exp, e = key % c->n_exp, k = g->cls_of_layer[il];
-        if (!g->cls_n[k]) continue;
-        int s = -1;
-        if (g->free_n[k] > 0) {
-            if (filled >= 64) continue;
-            s = g->free_list[g->cls_first[k] + --g->free_n[k]];
-            filled++;
-        } else {
-            if (swapped >= g->swaps) continue;
-            int victim = -1;
-            float vf = 1e30f;
-            for (int j = g->cls_first[k]; j < g->cls_first[k] + g->cls_n[k]; j++) {
-                const float f = g->freq[g->vs_key[j]];
-                if (f < vf) { vf = f; victim = j; }
-            }
-            if (victim < 0 || !(g->freq[key] > vf + 1.0f)) continue;
-            g->vslot[g->vs_key[victim]] = -1;
-            g->vs_key[victim] = -1;
-            s = victim;
-            swapped++;
-        }
-        const uint8_t *data = NULL;
-        int64_t bytes = 0;
-        if (q38_model_expert_slot(m, il, e, &data, &bytes) || bytes != g->cls_bytes[k] ||
-            cudaMemcpyAsync(g->vs_ptr[s], data, (size_t)bytes, cudaMemcpyHostToDevice, g->st) != cudaSuccess) {
-            g->free_list[g->cls_first[k] + g->free_n[k]++] = s;   /* give the slot back */
-            continue;
-        }
-        g->vs_key[s] = key;
-        g->vslot[key] = s;
-        g->uploads++;
     }
     g->n_cand = 0;
     if (++g->tokens % 128 == 0)
@@ -1372,7 +1440,7 @@ static void *warm_main(void *arg)
 #endif
 {
     Gpu *g = (Gpu *)arg;
-    cudaSetDevice(g->dev);
+    cudaSetDevice(g->warm_dev);
     while (!g->warm_stop) {
         if (!g->warm_want) {
 #ifdef _WIN32
@@ -1391,8 +1459,14 @@ static void *warm_main(void *arg)
 
 static void warm_start(Gpu *g)
 {
-    const char *e = getenv("Q38_WARM");
-    if (!e || atoi(e) == 0) return;      /* off by default: measured slower (contention), see above */
+    /* the trunk's device: off by default (measured slower, contention). The second expert
+     * device has no trunk to compete with and idles between short bursts (P3/P5 measured):
+     * kept warm by default (Q38_WARM_AUX=0 turns it off). */
+    const char *e = getenv("Q38_WARM"), *ea = getenv("Q38_WARM_AUX");
+    if (g->npd == 2 && !(ea && atoi(ea) == 0)) g->warm_dev = g->pdev[1];
+    else if (e && atoi(e)) g->warm_dev = g->dev;
+    else return;
+    cudaSetDevice(g->warm_dev);
     if (cudaStreamCreateWithFlags(&g->warm_st, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&g->warm_ev, cudaEventDisableTiming | cudaEventBlockingSync) != cudaSuccess ||
         cudaMalloc(&g->warm_buf, (size_t)WARM_FLOATS * sizeof(float)) != cudaSuccess ||
@@ -1410,7 +1484,7 @@ static void warm_start(Gpu *g)
     g->warm_on = g->warm_thread != NULL;
 #else
     g->warm_on = pthread_create(&g->warm_thread, NULL, warm_main, g) == 0;
-#endif
+#endif    cudaSetDevice(g->dev);
 }
 
 static void warm_end(Gpu *g)
@@ -1446,32 +1520,27 @@ extern "C" int q38_gpu_prefill(void *model)
     for (int i = 0; i < n; i++) { ord[i] = i; G->freq[i] = m->use[i]; }
     g_puse = m->use;
     qsort(ord, (size_t)n, sizeof(int), by_puse);
-    cudaSetDevice(G->dev);
     int done = 0;
     for (int i = 0; i < n; i++) {
         const int key = ord[i];
         if (m->use[key] <= 0) break;
         const int il = key / c->n_exp, e = key % c->n_exp, k = G->cls_of_layer[il];
-        if (G->vslot[key] >= 0 || !G->free_n[k]) continue;
+        if (G->vslot[key] >= 0) continue;
         const uint8_t *data = NULL;
         int64_t bytes = 0;
         if (q38_model_expert_slot(m, il, e, &data, &bytes) || bytes != G->cls_bytes[k]) continue;
-        const int sl = G->free_list[G->cls_first[k] + --G->free_n[k]];
+        const int sl = take_free(G, k);
+        if (sl < 0) continue;
         memcpy(G->up[0].stage, data, (size_t)bytes);
-        CK(cudaMemcpyAsync(G->dstage[0], G->up[0].stage, (size_t)bytes, cudaMemcpyHostToDevice, G->st_up));
-        const int F = c->ff_exp, E = c->n_embd;
-        const int *ty = G->ex_types[il];
-        const int64_t bg = (int64_t)F * G->rb[il][0], bu = (int64_t)F * G->rb[il][1];
-        const int nb_g = ty[0] == Q38_Q4_K || ty[0] == Q38_Q5_K ? E / 256 : E / 32;
-        const int nb_d = ty[2] == Q38_Q4_K || ty[2] == Q38_Q5_K ? F / 256 : F / 32;
-        k_repack<<<(F * nb_g + 255) / 256, 256, 0, G->st_up>>>(G->dstage[0], G->vs_ptr[sl], ty[0], F, E);
-        k_repack<<<(F * nb_g + 255) / 256, 256, 0, G->st_up>>>(G->dstage[0] + bg, G->vs_ptr[sl] + bg, ty[1], F, E);
-        k_repack<<<(E * nb_d + 255) / 256, 256, 0, G->st_up>>>(G->dstage[0] + bg + bu, G->vs_ptr[sl] + bg + bu, ty[2], E, F);
-        CK(cudaStreamSynchronize(G->st_up));
+        const int pd = G->vs_pd[sl];
+        cudaSetDevice(G->pdev[pd]);
+        upload_slot(G, 0, sl, key, G->up[0].stage, bytes);
+        CK(cudaStreamSynchronize(G->st_up[pd]));
         G->vs_key[sl] = key;
         G->vslot[key] = sl;
         done++;
     }
+    cudaSetDevice(G->dev);
     free(ord);
     return done;
 }
@@ -1611,8 +1680,10 @@ extern "C" int q38_gpu_open(void *model, int device)
     for (int i = 0; i < 4; i++) { freed += top[i]->row_bytes * top[i]->rows; free(top[i]->data); top[i]->data = NULL; }
     q38_model_set_cache(m, -1);
     fprintf(stderr, "q38: trunk on GPU %d (%s): %.2f GB on the device; %.2f GB of RAM handed to the expert cache"
-            " (now up to %.1f GB); %d expert slots in VRAM (%.2f GB)\n", device, p.name, (g->bytes) / 1e9,
-            freed / 1e9, m->cache_budget / 1e9, g->nvs, g->vram_bytes / 1e9);
+            " (now up to %.1f GB); %d expert slots in VRAM: %.2f GB on GPU %d%s\n", device, p.name, (g->bytes) / 1e9,
+            freed / 1e9, m->cache_budget / 1e9, g->nvs, g->vram_bytes_pd[0] / 1e9, device, "");
+    if (g->npd == 2)
+        fprintf(stderr, "q38: second expert pool on GPU %d: %.2f GB\n", g->pdev[1], g->vram_bytes_pd[1] / 1e9);
     return 0;
 }
 
@@ -1635,9 +1706,9 @@ extern "C" void q38_gpu_close(void *model)
     q38_model *m = (q38_model *)model;
     if (!G) return;
     if (G->vram_hits + G->vram_misses)
-        fprintf(stderr, "q38: routed experts on the GPU %.1f%% (%lld of %lld), %lld uploaded to VRAM\n",
+        fprintf(stderr, "q38: routed experts on the GPUs %.1f%% (%lld of %lld; %lld on the second), %lld uploaded to VRAM\n",
                 100.0 * G->vram_hits / (double)(G->vram_hits + G->vram_misses), (long long)G->vram_hits,
-                (long long)(G->vram_hits + G->vram_misses), (long long)G->uploads);
+                (long long)(G->vram_hits + G->vram_misses), (long long)G->aux_hits, (long long)G->uploads);
     if (G->tokens_fwd)
         fprintf(stderr, "q38: host per token: launch %.4f s, route %.4f s, promote %.4f s (%s)\n",
                 G->t_launch / G->tokens_fwd, G->t_route / G->tokens_fwd, G->t_promote / G->tokens_fwd,
@@ -1727,6 +1798,17 @@ static int seg_front(q38_model *m, int il, int capturing)
             k_norm_rope<<<NH, 256, 0, st>>>(G->iq, DI, (const float *)LM(il, idx_qn).d, DI, c->n_rot, G->d_pos, c->rope_base, c->eps);
             k_idx_score<<<(nblk + 7) / 8, 256, 0, st>>>(G->iq, G->idx_pool[il], G->iscore, G->d_pos, W, R, NH, DI);
             k_idx_select<<<1, 1024, (size_t)2 * G->ins * 4, st>>>(G->iscore, G->isel, G->d_pos, W, R, G->ins);
+            if (m->tap && !capturing && m->n_past + 1 > W) {
+                int *hs = (int *)malloc((size_t)W * sizeof(int));
+                float *fs = (float *)malloc((size_t)W * sizeof(float));
+                CK(cudaStreamSynchronize(st));
+                CK(cudaMemcpy(hs, G->isel, (size_t)W * sizeof(int), cudaMemcpyDeviceToHost));
+                for (int i = 0; i < W; i++) fs[i] = (float)hs[i];
+                snprintf(nm, sizeof nm, "indexer_top_k-%d", il);
+                m->tap(m->tap_ctx, nm, fs, W);
+                free(hs);
+                free(fs);
+            }
         }
         k_attn<<<H, 256, (size_t)(m->max_ctx < W ? m->max_ctx : W) * sizeof(float), st>>>(G->qf, G->kc[il], G->vc[il], G->aout, G->d_pos, H, Hkv, D,
                                                                    G->idx_raw[il] ? G->isel : NULL, W);
@@ -1765,6 +1847,49 @@ static int seg_experts(q38_model *m, int il)
         dd, L->ex_down.type, F, E, G->ex_h, G->ex_dn);
     k_ex_sum<<<(E + 255) / 256, 256, 0, st>>>(dd, G->ex_dn, E, G->routed_dev);
     return 0;
+}
+
+/* the second device's experts of layer il: x in, the weighted sum out to h_y2 */
+static int seg_aux(q38_model *m, int il, int capturing)
+{
+    const q38_cfg *c = &m->c;
+    const q38_layer *L = &m->L[il];
+    const int E = c->n_embd, F = c->ff_exp, K = c->n_exp_used;
+    cudaStream_t st = G->st2;
+    LayerDesc *dd = G->d_ldesc2 + il;
+    CK(cudaMemcpyAsync(G->x2, G->h_x, (size_t)E * sizeof(float), cudaMemcpyHostToDevice, st));
+    CK(cudaMemcpyAsync(dd, G->h_ldesc2 + il, sizeof(LayerDesc), cudaMemcpyHostToDevice, st));
+    const dim3 blk(32, ROWS_PER_BLOCK);
+    k_ex_gu_rp<<<dim3((2 * F + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, K), blk, 0, st>>>(
+        dd, L->ex_gate.type, L->ex_up.type, E, F, G->x2, G->ex_gu2);
+    k_ex_swiglu<<<(K * F + 255) / 256, 256, 0, st>>>(dd, G->ex_gu2, G->ex_h2, F);
+    k_ex_down_rp<<<dim3((E + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, K), blk, 0, st>>>(
+        dd, L->ex_down.type, F, E, G->ex_h2, G->ex_dn2);
+    k_ex_sum<<<(E + 255) / 256, 256, 0, st>>>(dd, G->ex_dn2, E, G->routed2);
+    CK(cudaMemcpyAsync(G->h_y2, G->routed2, (size_t)E * sizeof(float), cudaMemcpyDeviceToHost, st));
+    CK(cudaEventRecordWithFlags(G->ev2, st, capturing ? cudaEventRecordExternal : cudaEventRecordDefault));
+    return 0;
+}
+
+static int run_aux(q38_model *m, int il)
+{
+    CK(cudaSetDevice(G->pdev[1]));
+    int rc = 0;
+    if (!G->use_graphs || m->tap) {
+        rc = seg_aux(m, il, 0);
+    } else {
+        if (!G->gexec2[il]) {
+            cudaGraph_t gr;
+            CK(cudaStreamBeginCapture(G->st2, cudaStreamCaptureModeThreadLocal));
+            rc = seg_aux(m, il, 1);
+            CK(cudaStreamEndCapture(G->st2, &gr));
+            if (!rc) CK(cudaGraphInstantiate(&G->gexec2[il], gr, 0));
+            cudaGraphDestroy(gr);
+        }
+        if (!rc) CK(cudaGraphLaunch(G->gexec2[il], G->st2));
+    }
+    CK(cudaSetDevice(G->dev));
+    return rc;
 }
 
 static int seg_head(q38_model *m, int capturing)
@@ -1875,20 +2000,27 @@ extern "C" int q38_gpu_forward(void *model, int token)
         if (run_segment(m, GF(il))) return -1;
         double tw = now_s();
         G->t_launch += tw - tl0;
-        CK(cudaEventSynchronize(G->ev));
+        CK(ev_wait(G->ev));
         m->t_gpu_wait += now_s() - tw;
         double tr0 = now_s();
-        int top[64], cpu_ids[64], n_gpu = 0, n_cpu = 0;
+        int top[64], cpu_ids[64], n_gpu = 0, n_cpu = 0, n_aux = 0;
         float w[64], cpu_w[64];
         q38_model_route(m, il, G->h_router, top, w);
         LayerDesc *hd = G->h_ldesc + il;
+        LayerDesc *hd2 = G->h_ldesc2 ? G->h_ldesc2 + il : NULL;
         const q38_layer *L = &m->L[il];
         const int64_t bg = (int64_t)F * L->ex_gate.row_bytes, bu = (int64_t)F * L->ex_up.row_bytes;
         for (int k = 0; k < K; k++) {
             const int key = il * c->n_exp + top[k];
             if (G->freq) G->freq[key] += 1.0f;
             const int vs = G->vslot ? G->vslot[key] : -1;
-            if (vs >= 0) {
+            if (vs >= 0 && G->vs_pd[vs] == 1 && hd2) {
+                hd2->e[n_aux].g = G->vs_ptr[vs];
+                hd2->e[n_aux].u = G->vs_ptr[vs] + bg;
+                hd2->e[n_aux].d = G->vs_ptr[vs] + bg + bu;
+                hd2->e[n_aux].w = w[k];
+                n_aux++;
+            } else if (vs >= 0) {
                 hd->e[n_gpu].g = G->vs_ptr[vs];
                 hd->e[n_gpu].u = G->vs_ptr[vs] + bg;
                 hd->e[n_gpu].d = G->vs_ptr[vs] + bg + bu;
@@ -1902,11 +2034,18 @@ extern "C" int q38_gpu_forward(void *model, int token)
             }
         }
         hd->n = n_gpu;
-        G->vram_hits += n_gpu;
+        if (hd2) hd2->n = n_aux;
+        G->vram_hits += n_gpu + n_aux;
+        G->aux_hits += n_aux;
+        if (n_aux && run_aux(m, il)) return -1;
         G->vram_misses += n_cpu;
         if (run_segment(m, GX(il))) return -1;
         G->t_route += now_s() - tr0;
         if (q38_model_experts(m, il, G->h_x, cpu_ids, cpu_w, n_cpu, G->h_y)) return -1;
+        if (n_aux) {
+            CK(ev_wait(G->ev2));
+            for (int i = 0; i < E; i++) G->h_y[i] += G->h_y2[i];
+        }
         tl0 = now_s();
     }
     if (run_segment(m, GT)) return -1;
