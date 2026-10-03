@@ -27,7 +27,6 @@
 #endif
 
 #include "glm53f_chat.h"
-#include "tok.h"
 
 static double now_s(void)
 {
@@ -59,6 +58,23 @@ static char *dup_str(const char *p)
     char *d = (char *)malloc(n);
     if (d) memcpy(d, p, n);
     return d;
+}
+
+/* The whole file, NUL-terminated (NULL if it cannot be read); *n gets its length. */
+static char *read_file(const char *path, long *n)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char *b = NULL;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        const long len = ftell(f);
+        if (len >= 0 && len < (1L << 30) && fseek(f, 0, SEEK_SET) == 0 && (b = (char *)malloc((size_t)len + 1))) {
+            if (fread(b, 1, (size_t)len, f) != (size_t)len) { free(b); b = NULL; }
+            else { b[len] = 0; *n = len; }
+        }
+    }
+    fclose(f);
+    return b;
 }
 
 static char *fmt_str(const char *fmt, const char *a, const char *b)
@@ -94,7 +110,9 @@ static void log_turn(Glm53fChat *s, const char *msg, const char *out, int len, c
 {
     log_str(s, "## Você\n\n");
     log_str(s, msg);
-    log_str(s, "\n\n## " GLM53F_CHAT_MODEL_NAME "\n\n");
+    log_str(s, "\n\n## ");
+    log_str(s, s->e->name);
+    log_str(s, "\n\n");
     const char *close = NULL;
     for (int i = 0; i + 8 <= len; i++)
         if (!memcmp(out + i, "</think>", 8)) { close = out + i; break; }
@@ -120,14 +138,14 @@ static char *save(Glm53fChat *s, const char *arg)
         const time_t now = time(NULL);
         char stamp[32];
         strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
-        snprintf(name, sizeof name, "glm53f-chat-%s.md", stamp);
+        snprintf(name, sizeof name, "localcode-%s.md", stamp);
     }
     if (!s->log_len) return dup_str("nothing to save yet");
     FILE *f = fopen(name, "wb");
     if (!f) { snprintf(msg, sizeof msg, "cannot write %s", name); return dup_str(msg); }
-    fprintf(f, "# Conversa com " GLM53F_CHAT_MODEL_NAME "\n\n<sub>localcode · reasoning %s · %s · kv %s · experts %s</sub>\n\n",
-            s->reasoning, s->on_gpu ? "gpu" : "cpu", s->m->ckv ? "compressed" : "expanded",
-            s->m->cache.i4 ? "int4 (approximate)" : "fp8");
+    char settings[256];
+    s->e->describe(s->e, GLM53F_DESC_SETTINGS, settings, sizeof settings);
+    fprintf(f, "# Conversa com %s\n\n<sub>localcode · reasoning %s · %s</sub>\n\n", s->e->name, s->reasoning, settings);
     const int ok = fwrite(s->log, 1, s->log_len, f) == s->log_len;
     if (fclose(f) != 0 || !ok) { snprintf(msg, sizeof msg, "writing %s failed", name); return dup_str(msg); }
     snprintf(msg, sizeof msg, "saved %s", name);
@@ -138,13 +156,13 @@ static char *save(Glm53fChat *s, const char *arg)
 
 const Glm53fCommand glm53f_commands[] = {
     { "/file",      "PATH [question]", "send a file's text, then the question (a path with spaces in quotes)", 2 },
-    { "/reasoning", "max|high|low",    "Reasoning Effort for the next turns", 2 },
+    { "/reasoning", "LEVEL",           "reasoning effort (set when a conversation opens)", 2 },
     { "/gen",       "N",               "tokens to generate per answer", 2 },
     { "/thinking",  "",                "show or fold the model's reasoning", 0 },
     { "/stats",     "",                "measured speed, disk reads and expert cache of this session", 0 },
     { "/params",    "",                "the settings in force", 0 },
     { "/copy",      "",                "put the last answer on the clipboard", 0 },
-    { "/save",      "[FILE]",          "write the conversation as Markdown (default glm53f-chat-DATE.md)", 1 },
+    { "/save",      "[FILE]",          "write the conversation as Markdown (default localcode-DATE.md)", 1 },
     { "/reset",     "",                "forget the conversation and start a new one", 0 },
     { "/help",      "",                "the commands and keys", 0 },
     { "/quit",      "",                "leave", 0 },
@@ -181,8 +199,8 @@ void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char
     else if (!strcmp(n, "/stats") && s->last_spt > 0.0) snprintf(buf, cap, "%.2f s/token", s->last_spt);
     else if (!strcmp(n, "/copy"))     snprintf(buf, cap, "%s", s->last_answer ? "last answer" : "nothing yet");
     else if (!strcmp(n, "/save") && s->log_len) snprintf(buf, cap, "%.1f KB", (double)s->log_len / 1024.0);
-    else if (!strcmp(n, "/reset"))    snprintf(buf, cap, "%d/%d", s->m->cached, s->m->cap);
-    else if (!strcmp(n, "/file"))     snprintf(buf, cap, "%d left", s->m->cap - s->m->cached);
+    else if (!strcmp(n, "/reset"))    snprintf(buf, cap, "%d/%d", s->e->cached, s->e->cap);
+    else if (!strcmp(n, "/file"))     snprintf(buf, cap, "%d left", s->e->cap - s->e->cached);
 }
 
 /* A bar per answer, higher is slower: how the speed moved as the cache warmed up. */
@@ -204,8 +222,7 @@ static void spark(const Glm53fChat *s, char *buf, size_t cap)
 
 static char *stats_note(const Glm53fChat *s)
 {
-    const Glm53fCache *c = &s->m->cache;
-    char buf[1600], d1[32], d2[32], sp[80];
+    char buf[1600], d1[32], d2[32], sp[80], eng[400];
     int n = 0;
     if (!s->dec_tok) {
         n += snprintf(buf + n, sizeof buf - (size_t)n, "nothing measured yet: the first answer fills this in\n");
@@ -235,10 +252,8 @@ static char *stats_note(const Glm53fChat *s)
                       wait > 0.5 * spt ? "the disk: tokens go as fast as experts arrive; more cache or int4 experts read less"
                                        : "compute: the experts mostly come from RAM");
     }
-    snprintf(buf + n, sizeof buf - (size_t)n,
-             "engine    cache %.1f GB, %d experts %s · prefetch %d · trunk on %s · context %d of %d",
-             s->cache_gb, c->nslot, c->i4 ? "int4 (approximate)" : "fp8 (exact)", s->prefetch,
-             s->on_gpu ? "the gpus" : "the cpu", s->m->cached, s->m->cap);
+    s->e->describe(s->e, GLM53F_DESC_STATS, eng, sizeof eng);
+    snprintf(buf + n, sizeof buf - (size_t)n, "engine    %s · context %d of %d", eng, s->e->cached, s->e->cap);
     return dup_str(buf);
 }
 
@@ -281,12 +296,10 @@ static char *copy_answer(const Glm53fChat *s)
 
 static char *params_note(const Glm53fChat *s)
 {
-    char line[400];
-    snprintf(line, sizeof line, "context %d of %d used · cache %.1f GB · prefetch %d · %s · kv %s · "
-             "experts %s · reasoning %s · thinking %s · gen %d",
-             s->m->cached, s->m->cap, s->cache_gb, s->prefetch, s->on_gpu ? "gpu" : "cpu",
-             s->m->ckv ? "compressed" : "expanded", s->m->cache.i4 ? "int4" : "fp8", s->reasoning,
-             s->show_thinking ? "shown" : "folded", s->gen);
+    char line[600], settings[300];
+    s->e->describe(s->e, GLM53F_DESC_SETTINGS, settings, sizeof settings);
+    snprintf(line, sizeof line, "context %d of %d used · %s · reasoning %s · thinking %s · gen %d",
+             s->e->cached, s->e->cap, settings, s->reasoning, s->show_thinking ? "shown" : "folded", s->gen);
     return dup_str(line);
 }
 
@@ -332,7 +345,7 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
         s->show_thinking = !s->show_thinking;
         in->note = dup_str(s->show_thinking ? "reasoning shown as it is written" : "reasoning folded into one line");
     } else if (!strcmp(line, "/reset") || !strcmp(line, "/clear") || !strcmp(line, "/new")) {
-        glm53f_model_reset(s->m);
+        s->e->reset(s->e);
         s->first = 1;
         s->log_len = 0;                          /* a new conversation, a new transcript */
         in->kind = GLM53F_IN_RESET;
@@ -341,15 +354,25 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
         in->note = save(s, line[5] ? line + 6 : NULL);
     } else if (!strncmp(line, "/gen ", 5)) {
         const int v = atoi(line + 5);
-        if (v > 0 && v <= GLM53F_MAX_GEN) s->gen = v;
+        if (v > 0 && v <= GLM53F_CHAT_MAX_GEN) s->gen = v;
         in->note = params_note(s);
     } else if (!strncmp(line, "/reasoning ", 11)) {
         const char *v = line + 11;
-        if (!strcmp(v, "max") || !strcmp(v, "high") || !strcmp(v, "low")) {
-            s->reasoning = v[0] == 'm' ? "Max" : v[0] == 'h' ? "High" : "Low";
+        int hit = -1;
+        for (int i = 0; i < s->e->n_levels && hit < 0; i++) {
+            const char *a = s->e->levels[i].name, *b = v;
+            while (*a && *b && (*a | 32) == (*b | 32)) { a++; b++; }
+            if (!*a && !*b) hit = i;
+        }
+        if (hit >= 0) {
+            s->reasoning = s->e->levels[hit].name;
             in->note = params_note(s);
         } else {
-            in->note = dup_str("/reasoning takes max, high or low");
+            char msg[200];
+            int k = snprintf(msg, sizeof msg, "/reasoning takes");
+            for (int i = 0; i < s->e->n_levels && k < (int)sizeof msg; i++)
+                k += snprintf(msg + k, sizeof msg - (size_t)k, " %s", s->e->levels[i].name);
+            in->note = dup_str(msg);
         }
     } else if (!strncmp(line, "/file ", 6)) {
         /* /file PATH [question]; a path with spaces goes in quotes */
@@ -369,7 +392,8 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
         } else {
             fclose(f);
             long flen = 0;
-            char *content = tk_read_file(path, &flen);
+            char *content = read_file(path, &flen);
+            if (!content) { in->note = fmt_str("cannot read %s%s", path, ""); free(line); return; }
             const size_t bl = (size_t)flen + strlen(question) + 4;
             in->prompt = (char *)malloc(bl);
             if (in->prompt) {
@@ -390,25 +414,11 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
 
 void glm53f_chat_gauge(const Glm53fChat *s, char *buf, size_t cap)
 {
-    snprintf(buf, cap, "context %d/%d (%d%%)", s->m->cached, s->m->cap,
-             s->m->cap ? (int)(100.0 * s->m->cached / s->m->cap + 0.5) : 0);
+    snprintf(buf, cap, "context %d/%d (%d%%)", s->e->cached, s->e->cap,
+             s->e->cap ? (int)(100.0 * s->e->cached / s->e->cap + 0.5) : 0);
 }
 
 /* ----------------------------------------------------------------------- turn ---- */
-
-/* The expert cache's counters at one moment (they only grow in a session). */
-typedef struct { uint64_t hits, misses, ahead, bytes; double wait; } CacheSnap;
-
-static void cache_snap(Glm53fCache *c, CacheSnap *o)
-{
-    pthread_mutex_lock(&c->mu);
-    o->hits = c->hits;
-    o->misses = c->misses;
-    o->ahead = c->prefetch_reads + c->bg_used;   /* hits that the disk delivered just before */
-    o->bytes = c->bytes_read + c->bg_bytes;
-    o->wait = c->load_seconds;
-    pthread_mutex_unlock(&c->mu);
-}
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -416,26 +426,21 @@ void glm53f_chat_stop(void) { g_stop = 1; }
 
 int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
 {
-    Glm53fModel *m = s->m;
-    const Glm53fCfg *c = &m->cfg;
+    Glm53fEngine *e = s->e;
     char line[320];
 
-    /* chat_template.jinja: the preamble only opens the conversation, every turn after that
+    /* the chat template: the preamble only opens the conversation, every turn after that
      * appends its own user block, and the cache already holds what came before. */
-    const size_t tl = strlen(in->prompt) + 256;
+    const size_t tl = strlen(in->prompt) + 1024;
     char *text = (char *)malloc(tl);
     if (!text) { k->done(k, "out of memory", 2); return 0; }
-    if (s->first)
-        snprintf(text, tl, "[gMASK]<sop><|system|>Reasoning Effort: %s<|user|>%s<|assistant|><think>",
-                 s->reasoning, in->prompt);
-    else
-        snprintf(text, tl, "<|user|>%s<|assistant|><think>", in->prompt);
-    const int n = tok_encode(s->tok, text, (int)strlen(text), s->ids, s->ids_cap);
+    e->turn_text(e, s->first, s->reasoning, in->prompt, text, tl);
+    const int n = e->encode(e, text, (int)strlen(text), s->ids, s->ids_cap);
     free(text);
     if (n <= 0) { k->done(k, "could not tokenise the message (is it longer than the session?)", 2); return 0; }
-    if (m->cached + n + s->gen > m->cap) {
+    if (e->cached + n + s->gen > e->cap) {
         snprintf(line, sizeof line, "the session holds %d positions and this turn needs %d; "
-                 "/reset to start over, or a smaller /gen", m->cap, m->cached + n + s->gen);
+                 "/reset to start over, or a smaller /gen", e->cap, e->cached + n + s->gen);
         k->done(k, line, 2);
         return 0;
     }
@@ -445,7 +450,7 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     snprintf(line, sizeof line, "Reading %d token%s", n, n == 1 ? "" : "s");
     const double t0 = now_s();
     k->status(k, line, t0);
-    if (glm53f_model_forward(m, s->ids, n, s->logits, NULL) != 0) {
+    if (e->forward(e, s->ids, n, s->logits) != 0) {
         k->status(k, NULL, 0.0);
         k->done(k, "the engine failed while reading the message", 2);
         return -1;
@@ -454,18 +459,17 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     k->status(k, NULL, 0.0);
 
     int nout = 0, printed = 0, stopped = 0, in_think = 1, interrupted = 0;
-    CacheSnap c0, c1;
-    cache_snap(&m->cache, &c0);
+    Glm53fCounters c0, c1;
+    memset(&c0, 0, sizeof c0);
+    if (e->counters) e->counters(e, &c0);
     const double td = now_s();
     for (int step = 0; step < s->gen; step++) {
         if (g_stop) { interrupted = 1; break; }
         int best = 0;
-        for (int i = 1; i < c->vocab; i++) if (s->logits[i] > s->logits[best]) best = i;
-        int is_eos = 0;
-        for (int e = 0; e < c->n_eos; e++) if (best == c->eos[e]) is_eos = 1;
-        if (is_eos) { stopped = 1; break; }
+        for (int i = 1; i < e->n_vocab; i++) if (s->logits[i] > s->logits[best]) best = i;
+        if (e->is_eos(e, best)) { stopped = 1; break; }
         s->out[nout++] = best;
-        const int len = tok_decode(s->tok, s->out, nout, s->text, s->text_cap - 1);
+        const int len = e->decode(e, s->out, nout, s->text, s->text_cap - 1);
         s->text[len > 0 ? len : 0] = 0;
         const int ok = utf8_complete(s->text, len);
         if (in_think) {
@@ -489,7 +493,7 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
             k->answer(k, s->text + printed, ok - printed);
             printed = ok;
         }
-        if (step + 1 < s->gen && glm53f_model_forward(m, &best, 1, s->logits, NULL) != 0) {
+        if (step + 1 < s->gen && e->forward(e, &best, 1, s->logits) != 0) {
             k->status(k, NULL, 0.0);
             k->done(k, "the engine failed while writing the answer", 2);
             return -1;
@@ -497,7 +501,8 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     }
     k->status(k, NULL, 0.0);
     const double t_dec = now_s() - td;
-    cache_snap(&m->cache, &c1);
+    c1 = c0;
+    if (e->counters) e->counters(e, &c1);
 
     s->turns++;
     s->pre_tok += n;
@@ -521,7 +526,7 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     snprintf(stats, sizeof stats, "%d tokens · %.2f s/token · %s · read %d in %.1f s%s",
              nout, nout ? t_dec / nout : 0.0, d, n, t_prefill,
              interrupted ? " · interrupted" : stopped ? "" : " · reached /gen");
-    int len = nout ? tok_decode(s->tok, s->out, nout, s->text, s->text_cap - 1) : 0;
+    int len = nout ? e->decode(e, s->out, nout, s->text, s->text_cap - 1) : 0;
     if (len < 0) len = 0;
     s->text[len] = 0;
     log_turn(s, in->shown ? in->shown : in->prompt, s->text, len, stats);
@@ -565,11 +570,13 @@ static void plain_thought(Glm53fTurnSink *k, double sec, int tokens)
     printf("%s  + Thought: %s · %d tokens\n\n", *shown ? "\n\n" : "", d, tokens);
 }
 static void plain_answer(Glm53fTurnSink *k, const char *p, int n) { (void)k; fwrite(p, 1, (size_t)n, stdout); fflush(stdout); }
+static const char *g_name = "";
+
 static void plain_done(Glm53fTurnSink *k, const char *stats, int state)
 {
     (void)k;
     if (state == 2) printf("  %s\n", stats);
-    else            printf("\n\n  ■ localcode · " GLM53F_CHAT_MODEL_NAME " · %s\n", stats);
+    else            printf("\n\n  ■ localcode · %s · %s\n", g_name, stats);
 }
 
 static int read_line(char *buf, int cap)
@@ -599,7 +606,8 @@ static int plain_run(Glm53fChat *s)
     const int cap = 65536;
     char *line = (char *)malloc((size_t)cap);
     if (!line) return 1;
-    printf("localcode · " GLM53F_CHAT_MODEL_NAME " · ready in %.1f s · /help for commands\n", s->load_s);
+    g_name = s->e->name;
+    printf("localcode · %s · ready in %.1f s · /help for commands\n", s->e->name, s->load_s);
     int rc = 0, shown = 0;
     Glm53fTurnSink k = { plain_status, plain_reasoning, plain_thought, plain_answer, plain_done, &shown };
     for (;;) {

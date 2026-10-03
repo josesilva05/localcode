@@ -27,6 +27,7 @@
 #include "json.h"
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
+#include "tok_unicode_m.h"
 
 /* ---------- hash map (binary keys carrying an explicit length) ---------- */
 typedef struct { const char *k; int klen; int v; int used; } ment;
@@ -59,10 +60,12 @@ typedef struct {
     Special *sp; int nsp;                       /* added tokens, sorted by descending length     */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
-    int o200k;           /* pre_tokenizer regex family: 0 = cl100k, 1 = o200k */
+    int o200k;           /* pre_tokenizer regex family: 0 = cl100k, 1 = o200k, 2 = qwen35 */
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
                           * pair whose CONCATENATION has the lowest vocab id, exactly
                           * tiktoken's byte_pair_encode, no recovered merges to diverge */
+    int use_merges_only; /* 1 = ignore_merges false: a piece that is itself a token still goes
+                          * through the merges (Qwen); 0 = it is emitted whole (default) */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -208,7 +211,7 @@ static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, in
     for(int i=a;i<b;i++){ int bb=p[i]; memcpy(s+sl,T->byte2str[bb],T->byte2cp_len[bb]); sl+=T->byte2cp_len[bb]; }
     s[sl]=0;
     /* ignore_merges: if the whole piece is itself a token, emit it directly */
-    int whole=hm_get(&T->vocab,s,sl);
+    int whole=T->use_merges_only ? -1 : hm_get(&T->vocab,s,sl);
     if(whole>=0){ if(*no<max) out[(*no)++]=whole; free(s); return; }
     /* initial symbols = the codepoints of the byte-level string */
     int *soff=malloc((sl+1)*sizeof(int)), *slen=malloc((sl+1)*sizeof(int)); int ns=0;
@@ -398,6 +401,70 @@ static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int
     free(cp); free(off);
 }
 
+/* ---------- pre-tokenizer qwen35 (Qwen3.5 / Qwen3.8 regex) ----------
+ *   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+ *   |[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ |\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+ *   |\s*[\r\n]+ |\s+(?!\S) |\s+
+ * cl100k with three changes: letter runs take combining marks, digits split one by one,
+ * and the punctuation class excludes marks. */
+static void pretok_chunk_qwen35(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+    #define ISNL(c) ((c)=='\r'||(c)=='\n')
+    #define LOW(c) (((c)>='A'&&(c)<='Z')?((c)+32):(c))
+    #define LM(c) (is_L(c)||is_M(c))
+    int i=0;
+    while(i<n){
+        int start=i; uint32_t c=cp[i];
+        /* 1) contractions, either case */
+        if(c=='\'' && i+1<n){
+            uint32_t d=LOW(cp[i+1]);
+            if(i+2<n){ uint32_t d2=LOW(cp[i+2]);
+                if((d=='r'&&d2=='e')||(d=='v'&&d2=='e')||(d=='l'&&d2=='l')){ i+=3; bpe_piece(T,p,off[start],off[i],out,no,max); continue; } }
+            if(d=='s'||d=='t'||d=='m'||d=='d'){ i+=2; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        /* 2) [^\r\n\p{L}\p{N}]? [\p{L}\p{M}]+ : the optional prefix is tried first (greedy) */
+        {
+            int j=-1;
+            if(!is_L(c) && !ISNL(c) && !is_N(c) && i+1<n && LM(cp[i+1])) j=i+1;
+            else if(LM(c)) j=i;
+            if(j>=0){ while(j<n && LM(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        /* 3) \p{N}: one digit */
+        if(is_N(c)){ i++; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* 4) ' ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*' */
+        {
+            int j=i;
+            #define PUN(x) (!is_S(x) && !is_L(x) && !is_M(x) && !is_N(x))
+            if(c==' ' && j+1<n && PUN(cp[j+1])) j++;
+            if(j<n && PUN(cp[j])){
+                while(j<n && PUN(cp[j])) j++;
+                while(j<n && ISNL(cp[j])) j++;
+                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+            #undef PUN
+        }
+        /* 5) \s*[\r\n]+  6) \s+(?!\S)  7) \s+  (as cl100k) */
+        {
+            int r=i; while(r<n && is_S(cp[r])) r++;
+            if(r>i){ int last=-1; for(int j=i;j<r;j++) if(ISNL(cp[j])) last=j;
+                if(last>=0){ i=last+1; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+                int end = (r<n) ? r-1 : r;
+                if(end<=i) end=i+1;
+                i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        i++;
+        bpe_piece(T,p,off[start],off[i],out,no,max);
+    }
+    #undef ISNL
+    #undef LOW
+    #undef LM
+    free(cp); free(off);
+}
+
 /* ---------- encode: text -> ids (split on added tokens, then pre-tokenise + BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
@@ -412,7 +479,8 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->o200k)      pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
+            if(T->o200k==2)   pretok_chunk_qwen35(T,p,i,chunk_end,out,&no,max);
+            else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
             else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }
         if(hitpos<0) break;

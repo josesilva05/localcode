@@ -45,6 +45,109 @@ static double now_s(void)
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 
+/* ---------------------------------------------- localcode: GLM-5.3-Flash as an engine -- */
+typedef struct {
+    Glm53fModel *m;
+    Tok         *tok;
+    int          on_gpu, prefetch, cache_auto, n_mla, n_kda;
+    double       cache_gb;
+} GlmEngine;
+
+static const Glm53fLevel GLM_LEVELS[] = {
+    { "Max",  "reasons the longest before answering (the default)" },
+    { "High", "reasons less" },
+    { "Low",  "the shortest reasoning: the answer starts soonest" },
+};
+
+static int glm_forward(Glm53fEngine *e, const int *ids, int n, float *logits)
+{
+    GlmEngine *g = (GlmEngine *)e->impl;
+    const int rc = glm53f_model_forward(g->m, ids, n, logits, NULL);
+    e->cached = g->m->cached;
+    return rc;
+}
+
+static void glm_reset(Glm53fEngine *e)
+{
+    GlmEngine *g = (GlmEngine *)e->impl;
+    glm53f_model_reset(g->m);
+    e->cached = g->m->cached;
+}
+
+static int glm_encode(Glm53fEngine *e, const char *text, int len, int *out, int max)
+{
+    return tok_encode(((GlmEngine *)e->impl)->tok, text, len, out, max);
+}
+
+static int glm_decode(Glm53fEngine *e, const int *ids, int n, char *out, int max)
+{
+    return tok_decode(((GlmEngine *)e->impl)->tok, ids, n, out, max);
+}
+
+static int glm_is_eos(Glm53fEngine *e, int id)
+{
+    const Glm53fCfg *c = &((GlmEngine *)e->impl)->m->cfg;
+    for (int i = 0; i < c->n_eos; i++) if (id == c->eos[i]) return 1;
+    return 0;
+}
+
+/* chat_template.jinja: the preamble only opens the conversation */
+static void glm_turn_text(Glm53fEngine *e, int first, const char *level, const char *msg, char *out, size_t cap)
+{
+    (void)e;
+    if (first) snprintf(out, cap, "[gMASK]<sop><|system|>Reasoning Effort: %s<|user|>%s<|assistant|><think>", level, msg);
+    else       snprintf(out, cap, "<|user|>%s<|assistant|><think>", msg);
+}
+
+static void glm_describe(Glm53fEngine *e, int what, char *buf, size_t cap)
+{
+    GlmEngine *g = (GlmEngine *)e->impl;
+    const Glm53fCfg *c = &g->m->cfg;
+    const Glm53fCache *k = &g->m->cache;
+    if (what == GLM53F_DESC_BANNER)
+        snprintf(buf, cap, "%d layers · %d MLA + %d KDA · %d experts top-%d", c->n_layers, g->n_mla, g->n_kda,
+                 c->n_experts, c->topk);
+    else if (what == GLM53F_DESC_SETTINGS)
+        snprintf(buf, cap, "cache %.1f GB%s (%d experts) · prefetch %d · %s · kv %s · experts %s", g->cache_gb,
+                 g->cache_auto ? " auto" : "", k->nslot, g->prefetch, g->on_gpu ? "gpu" : "cpu",
+                 g->m->ckv ? "compressed" : "expanded", k->i4 ? "int4" : "fp8");
+    else
+        snprintf(buf, cap, "cache %.1f GB, %d experts %s · prefetch %d · trunk on %s", g->cache_gb, k->nslot,
+                 k->i4 ? "int4 (approximate)" : "fp8 (exact)", g->prefetch, g->on_gpu ? "the gpus" : "the cpu");
+}
+
+static void glm_counters(Glm53fEngine *e, Glm53fCounters *o)
+{
+    Glm53fCache *c = &((GlmEngine *)e->impl)->m->cache;
+    pthread_mutex_lock(&c->mu);
+    o->hits = c->hits;
+    o->misses = c->misses;
+    o->ahead = c->prefetch_reads + c->bg_used;   /* hits that the disk delivered just before */
+    o->bytes = c->bytes_read + c->bg_bytes;
+    o->wait = c->load_seconds;
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void glm_engine_init(Glm53fEngine *e, GlmEngine *g)
+{
+    memset(e, 0, sizeof *e);
+    e->name = "GLM-5.3-Flash";
+    e->levels = GLM_LEVELS;
+    e->n_levels = 3;
+    e->n_vocab = g->m->cfg.vocab;
+    e->cached = g->m->cached;
+    e->cap = g->m->cap;
+    e->impl = g;
+    e->forward = glm_forward;
+    e->reset = glm_reset;
+    e->encode = glm_encode;
+    e->decode = glm_decode;
+    e->is_eos = glm_is_eos;
+    e->turn_text = glm_turn_text;
+    e->describe = glm_describe;
+    e->counters = glm_counters;
+}
+
 static double peak_rss_bytes(void)
 {
 #ifdef _WIN32
@@ -357,16 +460,22 @@ int main(int argc, char **argv)
             on_gpu = glm53f_model_use_gpu(&cm, NULL, 0) == 0;
             if (!on_gpu) printf("NOTE: the GPUs are not usable here; the trunk stays on the CPU.\n\n");
         }
+        GlmEngine ge;
+        memset(&ge, 0, sizeof ge);
+        ge.m = &cm; ge.tok = &ctok; ge.on_gpu = on_gpu; ge.prefetch = prefetch_n;
+        ge.cache_gb = (double)cm.cache.nslot * cm.cache.slot_bytes / 1e9;
+        ge.cache_auto = cache_gb <= 0.0;
+        for (int L = 0; L < cm.cfg.n_layers; L++)
+            if (glm53f_is_mla(&cm.cfg, L)) ge.n_mla++; else ge.n_kda++;
+        Glm53fEngine eng;
+        glm_engine_init(&eng, &ge);
         Glm53fChat s;
         memset(&s, 0, sizeof s);
-        s.m = &cm; s.tok = &ctok; s.dir = dir;
-        s.reasoning = !strcmp(reasoning, "low") ? "Low" : !strcmp(reasoning, "high") ? "High" : "Max";
-        s.gen = gen; s.prefetch = prefetch_n; s.on_gpu = on_gpu; s.cache_gb = (double)cm.cache.nslot * cm.cache.slot_bytes / 1e9;
-        s.cache_auto = cache_gb <= 0.0;
+        s.e = &eng;
+        s.reasoning = GLM_LEVELS[!strcmp(reasoning, "low") ? 2 : !strcmp(reasoning, "high") ? 1 : 0].name;
+        s.gen = gen;
         s.load_s = now_s() - t_load;
         printf("\r%*s\r", 32, "");
-        for (int L = 0; L < cm.cfg.n_layers; L++)
-            if (glm53f_is_mla(&cm.cfg, L)) s.n_mla++; else s.n_kda++;
         s.ids_cap = GLM53F_MAX_PROMPT;
         s.ids = (int *)malloc((size_t)s.ids_cap * sizeof(int));
         s.out = (int *)malloc((size_t)GLM53F_MAX_GEN * sizeof(int));

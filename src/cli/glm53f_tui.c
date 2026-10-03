@@ -35,6 +35,8 @@
 
 #include "glm53f_chat.h"
 
+static Glm53fChat *g_s;   /* the session (set by glm53f_tui_run) */
+
 /* Matrix palette, 24-bit colour */
 #define C_RESET  "\033[0m"
 #define C_BOLD   "\033[1m"
@@ -589,14 +591,11 @@ static void render_splash(Lines *L, const Glm53fChat *s, int W)
         lines_push(L, &b);
     }
     push_text(L, "");
-    const Glm53fCfg *c = &s->m->cfg;
-    char line[300];
-    snprintf(line, sizeof line, GLM53F_CHAT_MODEL_NAME " · %d layers · %d MLA + %d KDA · %d experts top-%d · ready in %.1f s",
-             c->n_layers, s->n_mla, s->n_kda, c->n_experts, c->topk, s->load_s);
+    char line[400], what[300];
+    s->e->describe(s->e, GLM53F_DESC_BANNER, what, sizeof what);
+    snprintf(line, sizeof line, "%s · %s · ready in %.1f s", s->e->name, what, s->load_s);
     centred(L, W, C_GREEN, line);
-    snprintf(line, sizeof line, "cache %.1f GB%s (%d experts) · prefetch %d · %s · kv %s · experts %s",
-             s->cache_gb, s->cache_auto ? " auto" : "", s->m->cache.nslot, s->prefetch,
-             s->on_gpu ? "gpu" : "cpu", s->m->ckv ? "compressed" : "expanded", s->m->cache.i4 ? "int4" : "fp8");
+    s->e->describe(s->e, GLM53F_DESC_SETTINGS, line, sizeof line);
     centred(L, W, C_DIM, line);
 }
 
@@ -657,9 +656,9 @@ static void render_blocks(Lines *L, const Glm53fChat *s, int W)
         }
         case B_ANSWER: render_markdown(L, t, b->text.n, W); break;
         case B_STATS: {
-            char prefix[160];
-            snprintf(prefix, sizeof prefix, "  %s■ %s%slocalcode%s · %s" GLM53F_CHAT_MODEL_NAME "%s · ",
-                     C_BRIGHT, C_BOLD, C_GREEN, C_NOBOLD, C_TEXT, C_DIM);
+            char prefix[200];
+            snprintf(prefix, sizeof prefix, "  %s■ %s%slocalcode%s · %s%s%s · ",
+                     C_BRIGHT, C_BOLD, C_GREEN, C_NOBOLD, C_TEXT, g_s->e->name, C_DIM);
             render_plain(L, t, b->text.n, W, C_DIM, prefix);
             break;
         }
@@ -722,8 +721,6 @@ static int ed_next(int i) { if (i >= (int)E.b.n) return (int)E.b.n; i++; while (
  * commands (by prefix, then by the letters in order), then a command's values - Reasoning
  * Effort, answer lengths with the time they would take at the speed this session measured,
  * the files of a directory with the tokens they would take out of the context left. */
-
-static Glm53fChat *g_s;
 
 #define MENU_MAX  64
 #define MENU_ROWS 8
@@ -792,19 +789,16 @@ static void menu_commands(const char *typed)
 
 static void menu_reasoning(const char *typed)
 {
-    static const char *v[3][2] = {
-        { "max",  "reasons the longest before answering (the default)" },
-        { "high", "reasons less" },
-        { "low",  "the shortest reasoning: the answer starts soonest" },
-    };
-    snprintf(M.title, sizeof M.title, "Reasoning Effort");
-    for (int i = 0; i < 3; i++) {
-        if (!starts_with_ci(v[i][0], typed)) continue;
+    const Glm53fEngine *e = g_s->e;
+    snprintf(M.title, sizeof M.title, "Reasoning effort (applies when a conversation opens)");
+    for (int i = 0; i < e->n_levels; i++) {
+        const char *name = e->levels[i].name;
+        if (!starts_with_ci(name, typed)) continue;
         MenuItem *it = menu_add();
-        snprintf(it->tab, sizeof it->tab, "/reasoning %s", v[i][0]);
-        snprintf(it->label, sizeof it->label, "%s", v[i][0]);
-        snprintf(it->hint, sizeof it->hint, "%s", v[i][1]);
-        if (lower((unsigned char)g_s->reasoning[0]) == v[i][0][0]) snprintf(it->value, sizeof it->value, "now");
+        snprintf(it->tab, sizeof it->tab, "/reasoning %s", name);
+        snprintf(it->label, sizeof it->label, "%s", name);
+        snprintf(it->hint, sizeof it->hint, "%s", e->levels[i].help);
+        if (g_s->reasoning == name) snprintf(it->value, sizeof it->value, "now");
         it->submits = 1;
     }
 }
@@ -812,13 +806,13 @@ static void menu_reasoning(const char *typed)
 static void menu_gen(const char *typed)
 {
     static const int v[] = { 256, 512, 1024, 2048, 4096 };
-    const int left = g_s->m->cap - g_s->m->cached;
+    const int left = g_s->e->cap - g_s->e->cached;
     snprintf(M.title, sizeof M.title, "tokens per answer");
     int numeric = *typed != 0;
     for (const char *p = typed; *p; p++) if (*p < '0' || *p > '9') numeric = 0;
     M.raw_enter = numeric;
     for (int i = 0; i < (int)(sizeof v / sizeof *v); i++) {
-        if (v[i] > GLM53F_MAX_GEN || v[i] > g_s->m->cap) break;
+        if (v[i] > GLM53F_CHAT_MAX_GEN || v[i] > g_s->e->cap) break;
         char num[16];
         snprintf(num, sizeof num, "%d", v[i]);
         if (!starts_with_ci(num, typed)) continue;
@@ -920,7 +914,7 @@ static void menu_files(const char *typed)
     }
     static DirEnt ents[256];
     const int n = list_dir(dir, pre, ents, 256);
-    const int left = g_s->m->cap - g_s->m->cached;
+    const int left = g_s->e->cap - g_s->e->cached;
     snprintf(M.title, sizeof M.title, "files in %s", *dir ? dir : "the working directory");
     snprintf(M.right, sizeof M.right, "%d positions left", left);
     for (int i = 0; i < n; i++) {
@@ -972,7 +966,7 @@ static void menu_build(void)
     if (g_s->last_spt > 0.0)
         snprintf(M.right, sizeof M.right, "last answer %.2f s/token · %.2f tokens/s", g_s->last_spt, 1.0 / g_s->last_spt);
     else
-        snprintf(M.right, sizeof M.right, "local · %s", g_s->on_gpu ? "gpu" : "cpu");
+        snprintf(M.right, sizeof M.right, "local · %s", g_s->e->name);
     const char *sp = strchr(t, ' ');
     if (!sp)                              menu_commands(t);
     else if (!strncmp(t, "/reasoning ", 11)) menu_reasoning(t + 11);
@@ -1285,10 +1279,8 @@ static void draw(Glm53fChat *s)
     }
     {   /* settings row, with the state on the right */
         char left[200], plain[160], right[120];
-        snprintf(plain, sizeof plain, GLM53F_CHAT_MODEL_NAME " · %s · reasoning %s",
-                 s->on_gpu ? "gpu" : "cpu", s->reasoning);
-        snprintf(left, sizeof left, C_BRIGHT GLM53F_CHAT_MODEL_NAME C_DIM " · %s · reasoning %s",
-                 s->on_gpu ? "gpu" : "cpu", s->reasoning);
+        snprintf(plain, sizeof plain, "%s · reasoning %s", s->e->name, s->reasoning);
+        snprintf(left, sizeof left, C_BRIGHT "%s" C_DIM " · reasoning %s", s->e->name, s->reasoning);
         const int lc = cols_of(plain, (int)strlen(plain));
         if (g_busy) snprintf(right, sizeof right, "esc interrupt%s", g_nqueue ? " · queued" : "");
         else        snprintf(right, sizeof right, "%s", g_nqueue ? "queued" : "");

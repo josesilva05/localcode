@@ -1,12 +1,14 @@
 /* glm53f_chat.h - localcode, the interactive session (glm53f_chat.c, glm53f_tui.c).
  *
- * The caller opens the model, loads the tokenizer and hands both over with the settings it
- * chose; the session owns the screen until the user leaves. Nothing here changes what the
- * model computes: a turn feeds the new tokens to the same forward pass a one-shot run uses.
+ * The caller opens a model and hands it over as a Glm53fEngine with the settings it chose;
+ * the session owns the screen until the user leaves. Nothing here changes what the model
+ * computes: a turn feeds the new tokens to the same forward pass a one-shot run uses.
  *
- * glm53f_chat.c holds the session itself (commands, the chat template, a turn, the
- * transcript) and a plain line-by-line front end for pipes; glm53f_tui.c is the full-screen
- * front end used on a terminal. Both drive a turn through the same events.
+ * glm53f_chat.c holds the session itself (commands, a turn, the transcript) and a plain
+ * line-by-line front end for pipes; glm53f_tui.c is the full-screen front end used on a
+ * terminal. Both drive a turn through the same events. The engine supplies everything
+ * model-specific: the forward pass, the tokenizer, the chat template and the reasoning
+ * levels it offers (glm53f_run.c wraps GLM-5.3-Flash, q38_localcode.c Qwen3.8-Flash-Next).
  */
 #ifndef GLM53F_CHAT_H
 #define GLM53F_CHAT_H
@@ -14,24 +16,46 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "glm53f_model.h"
-#include "glm53f_tok.h"
+#define GLM53F_CHAT_MAX_GEN 8192
 
-#define GLM53F_CHAT_MODEL_NAME "GLM-5.3-Flash"
+/* Expert-cache counters (they only grow in a session); zero when the engine has none. */
+typedef struct { uint64_t hits, misses, ahead, bytes; double wait; } Glm53fCounters;
+
+typedef struct { const char *name, *help; } Glm53fLevel;
+
+typedef struct Glm53fEngine {
+    const char *name;                    /* "Qwen3.8-Flash-Next" */
+    const Glm53fLevel *levels;           /* reasoning levels, as /reasoning takes them; the
+                                          * first is the default */
+    int         n_levels;
+    int         n_vocab;
+    int         cached, cap;             /* context positions used / available */
+    void       *impl;
+
+    /* Feed n tokens; logits of the last one. Returns 0, or -1 on failure. */
+    int  (*forward)(struct Glm53fEngine *e, const int *ids, int n, float *logits);
+    void (*reset)(struct Glm53fEngine *e);
+    int  (*encode)(struct Glm53fEngine *e, const char *text, int len, int *out, int max);
+    int  (*decode)(struct Glm53fEngine *e, const int *ids, int n, char *out, int max);
+    int  (*is_eos)(struct Glm53fEngine *e, int id);
+    /* The chat-template text of one user message, ending where the assistant starts
+     * thinking. first: the message opens the conversation; level: one of levels[].name. */
+    void (*turn_text)(struct Glm53fEngine *e, int first, const char *level, const char *msg,
+                      char *out, size_t cap);
+    /* One line about the engine: GLM53F_DESC_BANNER (model shape), _SETTINGS (cache, device,
+     * precision), _STATS (the "engine" line of /stats). */
+    void (*describe)(struct Glm53fEngine *e, int what, char *buf, size_t cap);
+    void (*counters)(struct Glm53fEngine *e, Glm53fCounters *c);
+} Glm53fEngine;
+
+enum { GLM53F_DESC_BANNER, GLM53F_DESC_SETTINGS, GLM53F_DESC_STATS };
 
 typedef struct {
-    Glm53fModel *m;
-    Tok         *tok;
-    const char  *dir;
-    const char  *reasoning;      /* "Max" | "High" | "Low", as the template spells it */
+    Glm53fEngine *e;
+    const char  *reasoning;      /* one of e->levels[].name */
     int          gen;            /* tokens per answer            */
-    int          prefetch;
-    int          on_gpu;
     int          show_thinking;  /* 1: show the reasoning text, 0: fold it into one line */
-    double       cache_gb;       /* the cache actually allocated */
-    int          cache_auto;     /* 1 when it was sized from the free RAM */
     double       load_s;         /* seconds spent opening the model */
-    int          n_mla, n_kda;
 
     int         *ids, ids_cap;   /* scratch owned by the caller */
     int         *out;

@@ -23,6 +23,7 @@ compile_commands.json
 /*.log
 /glm53f_run.json
 /glm53f-chat-*.md
+/localcode-*.md
 /st_index.json
 /st_values.json
 /out/

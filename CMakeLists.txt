@@ -89,6 +89,46 @@ if(OpenMP_C_FOUND)
   target_link_libraries(glm53f PUBLIC OpenMP::OpenMP_C)
 endif()
 
+# ---------------------------------------------------------- Qwen3.8-Flash-Next (q38) --
+add_library(q38 STATIC
+  src/q38/q38_gguf.c
+  src/q38/q38_quant.c
+  src/q38/q38_model.c
+  src/q38/q38_kernels.c
+  src/q38/q38_tok.c)
+target_include_directories(q38 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/q38 ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_link_libraries(q38 PUBLIC glm53f_flags)
+if(OpenMP_C_FOUND)
+  target_link_libraries(q38 PUBLIC OpenMP::OpenMP_C)
+endif()
+if(GLM53F_CUDA)
+  target_sources(q38 PRIVATE src/q38/q38_gpu.cu)
+  target_compile_definitions(q38 PUBLIC Q38_CUDA=1)
+  target_link_libraries(q38 PUBLIC CUDA::cudart)
+endif()
+
+add_executable(q38_gguf_info tools/q38_gguf_info.c)
+target_link_libraries(q38_gguf_info PRIVATE q38)
+add_executable(q38_run tools/q38_run.c)
+target_link_libraries(q38_run PRIVATE q38)
+
+# Routing trace through libllama (reference/diagnostic only; the engine does not use it).
+set(Q38_LLAMA_CPP_DIR "" CACHE PATH "llama.cpp checkout with a build/ directory, for q38_route_trace")
+if(Q38_LLAMA_CPP_DIR)
+  find_library(Q38_LIB_LLAMA llama PATHS ${Q38_LLAMA_CPP_DIR}/build/src NO_DEFAULT_PATH REQUIRED)
+  find_library(Q38_LIB_GGML ggml PATHS ${Q38_LLAMA_CPP_DIR}/build/ggml/src NO_DEFAULT_PATH REQUIRED)
+  find_library(Q38_LIB_GGML_BASE ggml-base PATHS ${Q38_LLAMA_CPP_DIR}/build/ggml/src NO_DEFAULT_PATH REQUIRED)
+  add_executable(q38_route_trace tools/q38_route_trace.c)
+  target_include_directories(q38_route_trace PRIVATE ${Q38_LLAMA_CPP_DIR}/include ${Q38_LLAMA_CPP_DIR}/ggml/include)
+  target_link_libraries(q38_route_trace PRIVATE ${Q38_LIB_LLAMA} ${Q38_LIB_GGML} ${Q38_LIB_GGML_BASE})
+  add_executable(q38_ref_dump tools/q38_ref_dump.c)
+  target_include_directories(q38_ref_dump PRIVATE ${Q38_LLAMA_CPP_DIR}/include ${Q38_LLAMA_CPP_DIR}/ggml/include)
+  target_link_libraries(q38_ref_dump PRIVATE ${Q38_LIB_LLAMA} ${Q38_LIB_GGML} ${Q38_LIB_GGML_BASE})
+  add_executable(q38_tok_check tools/q38_tok_check.c)
+  target_include_directories(q38_tok_check PRIVATE ${Q38_LLAMA_CPP_DIR}/include ${Q38_LLAMA_CPP_DIR}/ggml/include)
+  target_link_libraries(q38_tok_check PRIVATE q38 ${Q38_LIB_LLAMA} ${Q38_LIB_GGML} ${Q38_LIB_GGML_BASE})
+endif()
+
 # ------------------------------------------------------------------------------ cli --
 add_executable(glm53f_cli src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
 set_target_properties(glm53f_cli PROPERTIES OUTPUT_NAME glm53f)
@@ -97,13 +137,17 @@ if(WIN32)
   target_link_libraries(glm53f_cli PRIVATE psapi)
 endif()
 
-# localcode: the same program opening straight into the interactive session.
-add_executable(localcode src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
-target_compile_definitions(localcode PRIVATE GLM53F_LOCALCODE=1)
-target_link_libraries(localcode PRIVATE glm53f)
+# localcode_glm: the GLM program opening straight into the interactive session.
+add_executable(localcode_glm src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
+target_compile_definitions(localcode_glm PRIVATE GLM53F_LOCALCODE=1)
+target_link_libraries(localcode_glm PRIVATE glm53f)
 if(WIN32)
-  target_link_libraries(localcode PRIVATE psapi)
+  target_link_libraries(localcode_glm PRIVATE psapi)
 endif()
+
+# localcode: the interactive session on Qwen3.8-Flash-Next (this repository's model).
+add_executable(localcode src/cli/q38_localcode.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
+target_link_libraries(localcode PRIVATE q38 glm53f)
 
 # ---------------------------------------------------------------------------- tests --
 enable_testing()
