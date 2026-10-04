@@ -93,6 +93,15 @@ typedef struct {
     float    *x2, *ex_gu2, *ex_h2, *ex_dn2, *routed2, *h_y2;
     cudaGraphExec_t gexec2[Q38_MAX_LAYERS];
     int64_t   aux_hits;
+    /* next-layer prediction: layer il+1's router on layer il's MoE input, its top experts
+     * read ahead from the SSD while layer il computes (Q38_PREDICT = how many, 0 = off) */
+    int       predict, pred_ahead;    /* experts per layer; layers ahead (Q38_PREDICT_AHEAD, 1-2) */
+    float    *router_next, *h_router_next;   /* [pred_ahead][n_exp] */
+    DMat      pred_router[Q38_MAX_LAYERS];    /* int8 copies of the routers, for the guesses only */
+    cudaEvent_t ev_pred[Q38_MAX_LAYERS];   /* one per layer: the launcher submits layer il+1 (which
+                                             * records its own) before the host reads layer il's */
+    int       pred_ids[2][64], pred_n[2], pred_layer[2];
+    int64_t   pred_total, pred_hit;
     float    *freq;
     ExDesc   *h_desc, *d_desc;
     float    *routed_dev, *ex_gu, *ex_h, *ex_dn;
@@ -115,6 +124,18 @@ typedef struct {
     pthread_t up_thread;
 #endif
     double    t_launch, t_route, t_post, t_promote;   /* host time per phase (Q38_PROFILE) */
+    double    t_rt, t_auxl, t_gxl, t_pred, t_auxw, t_xcall;  /* inside route; aux wait; experts call */
+    /* the launcher thread (Q38_LAUNCHER, default on with graphs): while the host computes a
+     * layer's experts it submits the second device's experts, this device's experts and the
+     * next layer's graph, whose first kernel waits for h_flag[il] (mapped host memory) to move */
+    int       launcher;
+    volatile long job_seq, done_aux_seq, done_f_seq, launch_stop, launch_err;
+    int       job_il, job_aux, job_last;
+    volatile unsigned *h_flag;
+    unsigned *d_flag, *d_seen;
+#ifdef _WIN32
+    HANDLE    launch_thread;
+#endif
     /* prompt pass: experts streamed from RAM into a staging area and computed here */
     uint8_t  *pstage, *praw[16], *phost[16];  /* streamed experts: device raw bytes, pinned bounce */
     cudaEvent_t pev[16];                  /* slot i's raw bytes consumed */
@@ -1051,6 +1072,30 @@ __global__ void k_warm(const float4 *buf, int n, float *out)
     if (a.x + a.y + a.z + a.w == 12345.678f) out[0] = a.x;   /* never true: keeps the reads */
 }
 
+/* f32 rows -> the repacked Q8 layout (int8 quants row by row, a float scale per 32): one
+ * thread per block of 32 */
+__global__ void k_f32_to_q8r(const float *w, int64_t nblk, int8_t *q, float *d)
+{
+    const int64_t b = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblk) return;
+    const float *x = w + b * 32;
+    float amax = 0.0f;
+    for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(x[i]));
+    const float sc = amax / 127.0f, inv = sc > 0 ? 1.0f / sc : 0.0f;
+    for (int i = 0; i < 32; i++) q[b * 32 + i] = (int8_t)__float2int_rn(x[i] * inv);
+    d[b] = sc;
+}
+
+/* the first node of a pre-submitted layer graph: waits until the host has moved its flag */
+__global__ void k_wait_flag(const volatile unsigned *flag, unsigned *seen)
+{
+    const unsigned s0 = *seen;
+    unsigned f;
+    while ((f = *flag) == s0) __nanosleep(200);
+    *seen = f;
+    __threadfence_system();
+}
+
 /* --------------------------------------------------------------------- host -- */
 static Gpu *G;
 
@@ -1583,6 +1628,8 @@ extern "C" void q38_gpu_warm(void *model, int on)
 }
 
 static int bat_open(q38_model *m, int nb);    /* q38_gpu_batch.cuh */
+static int launcher_start(q38_model *m);
+static void launcher_stop(void);
 
 static int bat_open_aux(q38_model *m);
 
@@ -1632,6 +1679,33 @@ extern "C" int q38_gpu_open(void *model, int device)
     if (!g->logits) { fprintf(stderr, "q38_gpu: out of device memory\n"); return -1; }
     CK(cudaMallocHost(&g->h_x, (size_t)E * sizeof(float)));
     CK(cudaMallocHost(&g->h_router, (size_t)c->n_exp * sizeof(float)));
+    {
+        const char *e = getenv("Q38_PREDICT");
+        g->predict = e ? atoi(e) : 12;
+        if (g->predict > 64) g->predict = 64;
+        const char *a = getenv("Q38_PREDICT_AHEAD");
+        g->pred_ahead = a ? atoi(a) : 2;
+        if (g->pred_ahead < 1) g->pred_ahead = 1;
+        if (g->pred_ahead > 2) g->pred_ahead = 2;
+        if (g->predict > 0) {
+            g->router_next = dalloc((size_t)2 * c->n_exp, g);
+            CK(cudaMallocHost(&g->h_router_next, (size_t)2 * c->n_exp * sizeof(float)));
+            for (int il = 0; il < c->n_layer; il++) {
+                const DMat *r = &g->L[il][offsetof(q38_layer, router) / sizeof(q38_mat)];
+                DMat *p = &g->pred_router[il];
+                memset(p, 0, sizeof *p);
+                if (r->type != Q38_F32 || !r->d || r->ne0 % 32) { g->predict = 0; break; }
+                const int64_t n = r->rows * r->ne0;
+                p->type = Q38_Q8R; p->ne0 = r->ne0; p->rows = r->rows; p->row_bytes = r->ne0;
+                CK(cudaMalloc(&p->d, (size_t)n));
+                CK(cudaMalloc(&p->scale, (size_t)(n / 32) * sizeof(float)));
+                k_f32_to_q8r<<<(int)((n / 32 + 255) / 256), 256>>>((const float *)r->d, n / 32, (int8_t *)p->d, p->scale);
+                g->bytes += n + n / 8;
+            }
+            CK(cudaDeviceSynchronize());
+        }
+        g->pred_layer[0] = g->pred_layer[1] = -1;
+    }
     CK(cudaMallocHost(&g->h_y, (size_t)E * sizeof(float)));
     CK(cudaMallocHost(&g->h_res, (size_t)hcE * sizeof(float)));
     {
@@ -1697,6 +1771,7 @@ extern "C" int q38_gpu_open(void *model, int device)
     cudaDeviceProp p;
     cudaGetDeviceProperties(&p, device);
     m->gpu = g;
+    launcher_start(m);
     /* the host no longer needs what the device computes: give that RAM to the expert cache.
      * Kept: the token embedding (looked up on the host) and the PLE layer (runs on the host). */
     int64_t freed = 0;
@@ -1738,14 +1813,86 @@ extern "C" void q38_gpu_reset(void *model)
     cudaDeviceSynchronize();
 }
 
+/* Times each trunk matrix-vector product of one recurrent and one attention layer on the
+ * device (kept busy, so at full clocks) and the per-token total they add up to. */
+extern "C" int q38_gpu_mvbench(void *model)
+{
+    q38_model *m = (q38_model *)model;
+    const q38_cfg *c = &m->c;
+    static const char *nm[] = { "hc_attn_norm", "hc_attn_down", "hc_attn_up", "hc_attn_inject", "hc_ffn_norm",
+                                "hc_ffn_down", "hc_ffn_up", "hc_ffn_inject", "qkv", "gate", "beta", "alpha", "dt_bias",
+                                "a", "conv", "ssm_norm", "ssm_out", "wq", "wk", "wv", "wo", "q_norm", "k_norm", "idx_q",
+                                "idx_k", "idx_qn", "idx_kn", "ple_key", "ple_value", "ple_norm_key", "ple_norm_query",
+                                "ple_norm_conv", "ple_conv", "router", "shexp_gate_inp", "sh_gate", "sh_up", "sh_down" };
+    cudaSetDevice(G->dev);
+    float *x = NULL, *y = NULL;
+    CK(cudaMalloc(&x, 65536 * sizeof(float)));
+    CK(cudaMalloc(&y, (size_t)c->n_vocab * sizeof(float)));
+    CK(cudaMemset(x, 0, 65536 * sizeof(float)));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    int la = -1;
+    for (int il = 0; il < c->n_layer; il++) if (!m->L[il].recurrent) { la = il; break; }
+    const int layers[2] = { 0, la };
+    double per_token = 0;
+    for (int li = 0; li < 2; li++) {
+        const int il = layers[li];
+        if (il < 0) continue;
+        const int count = m->L[il].recurrent ? 36 : 12;      /* layers of this kind */
+        for (int i = 0; i < NMAT && i < (int)(sizeof nm / sizeof nm[0]); i++) {
+            const DMat *w = &G->L[il][i];
+            if (!w->d || w->rows < 2 || w->ne0 < 2) continue;
+            for (int r = 0; r < 20; r++) if (mv(w, x, y, G->st)) return -1;
+            CK(cudaEventRecord(e0, G->st));
+            const int reps = 300;
+            for (int r = 0; r < reps; r++) if (mv(w, x, y, G->st)) return -1;
+            CK(cudaEventRecord(e1, G->st));
+            CK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            const double us = 1e3 * ms / reps;
+            const double bytes = w->type == Q38_Q8R ? (double)w->rows * w->ne0 * (1.0 + 4.0 / 32) :
+                                 w->type == Q38_F32 ? (double)w->rows * w->ne0 * 4 : (double)w->rows * w->row_bytes;
+            const int shared = i < 8 || i >= 33;                 /* in every layer */
+            per_token += us * (shared ? (li == 0 ? 48 : 0) : count);
+            printf("mv layer %2d %-15s %6lld x %6lld %-5s %8.1f us %6.1f GB/s\n", il, nm[i], (long long)w->ne0,
+                   (long long)w->rows, w->type == Q38_Q8R ? "q8r" : q38_type_name(w->type), us, bytes / us / 1e3);
+        }
+    }
+    {
+        for (int r = 0; r < 5; r++) if (mv(&G->output, x, y, G->st)) return -1;
+        CK(cudaEventRecord(e0, G->st));
+        for (int r = 0; r < 50; r++) if (mv(&G->output, x, y, G->st)) return -1;
+        CK(cudaEventRecord(e1, G->st));
+        CK(cudaEventSynchronize(e1));
+        float ms = 0;
+        CK(cudaEventElapsedTime(&ms, e0, e1));
+        const double us = 1e3 * ms / 50;
+        per_token += us;
+        printf("mv output head %lld x %lld: %.1f us %.1f GB/s\n", (long long)G->output.ne0, (long long)G->output.rows, us,
+               (double)G->output.rows * G->output.ne0 * 1.125 / us / 1e3);
+    }
+    printf("matrix-vector products of one token: %.2f ms\n", per_token / 1e3);
+    cudaFree(x);
+    cudaFree(y);
+    return 0;
+}
+
 extern "C" void q38_gpu_close(void *model)
 {
     q38_model *m = (q38_model *)model;
     if (!G) return;
+    launcher_stop();
     if (G->vram_hits + G->vram_misses)
         fprintf(stderr, "q38: routed experts on the GPUs %.1f%% (%lld of %lld; %lld on the second), %lld uploaded to VRAM\n",
                 100.0 * G->vram_hits / (double)(G->vram_hits + G->vram_misses), (long long)G->vram_hits,
                 (long long)(G->vram_hits + G->vram_misses), (long long)G->aux_hits, (long long)G->uploads);
+    if (G->pred_total)
+        fprintf(stderr, "q38: next-layer prediction (top %d, %d ahead): %.1f%% of the routed experts; %lld experts read ahead, "
+                        "%lld of them used, %lld still being read when needed (%.2f s)\n",
+                G->predict, G->pred_ahead, 100.0 * G->pred_hit / (double)G->pred_total, (long long)m->pf_issued, (long long)m->pf_used,
+                (long long)m->pf_waited, m->t_pf_wait);
     if (G->t_stream > 0)
         fprintf(stderr, "q38: prompt passes spent %.1f s copying %.1f GB of experts to the device\n", G->t_stream,
                 G->stream_bytes / 1e9);
@@ -1756,6 +1903,11 @@ extern "C" void q38_gpu_close(void *model)
         fprintf(stderr, "q38: host per token: launch %.4f s, route %.4f s, promote %.4f s (%s)\n",
                 G->t_launch / G->tokens_fwd, G->t_route / G->tokens_fwd, G->t_promote / G->tokens_fwd,
                 G->use_graphs ? "CUDA graphs" : "plain launches");
+    if (G->tokens_fwd)
+        fprintf(stderr, "q38: host per token: route %.4f, launch aux %.4f, launch experts %.4f, predict %.4f, "
+                        "experts call overhead %.4f, waiting for GPU %d %.4f s\n",
+                G->t_rt / G->tokens_fwd, G->t_auxl / G->tokens_fwd, G->t_gxl / G->tokens_fwd, G->t_pred / G->tokens_fwd,
+                G->t_xcall / G->tokens_fwd, G->npd == 2 ? G->pdev[1] : -1, G->t_auxw / G->tokens_fwd);
     warm_end(G);
     if (G->nvs) {
         G->up_stop = 1;
@@ -1864,6 +2016,13 @@ static int seg_front(q38_model *m, int il, int capturing)
     if (m->tap && !capturing) { snprintf(nm, sizeof nm, "hc_mixed_ffn-%d", il); tap(m, nm, G->mixed, E); }
     /* router on the device; x and the logits to the host; the shared expert meanwhile */
     if (mv(&LM(il, router), G->mixed, G->router, st)) return -1;
+    /* the next layers' routers (int8 copies: guesses only) on this MoE input, for reading ahead */
+    if (G->predict > 0 && il + 1 < c->n_layer) {
+        for (int a = 1; a <= G->pred_ahead && il + a < c->n_layer; a++)
+            if (mv(&G->pred_router[il + a], G->mixed, G->router_next + (size_t)(a - 1) * c->n_exp, st)) return -1;
+        CK(cudaMemcpyAsync(G->h_router_next, G->router_next, (size_t)G->pred_ahead * c->n_exp * sizeof(float),
+                           cudaMemcpyDeviceToHost, st));
+    }
     CK(cudaMemcpyAsync(G->h_x, G->mixed, (size_t)E * sizeof(float), cudaMemcpyDeviceToHost, st));
     CK(cudaMemcpyAsync(G->h_router, G->router, (size_t)c->n_exp * sizeof(float), cudaMemcpyDeviceToHost, st));
     CK(cudaEventRecordWithFlags(G->ev, st, capturing ? cudaEventRecordExternal : cudaEventRecordDefault));
@@ -1931,6 +2090,7 @@ static int run_aux(q38_model *m, int il)
         }
         if (!rc) CK(cudaGraphLaunch(G->gexec2[il], G->st2));
     }
+    cudaStreamQuery(G->st2);                    /* hand it to the device now (WDDM batches) */
     CK(cudaSetDevice(G->dev));
     return rc;
 }
@@ -2001,6 +2161,7 @@ static int build_segment(q38_model *m, int id, int capturing)
     if (id == GP) return (c->ple_layer > 0 && seg_post(m, c->ple_layer - 1, capturing)) || seg_res_out() ? -1 : 0;
     if (id >= GX(0)) return seg_experts(m, id - GX(0));
     const int il = id - GF(0);
+    if (il > 0 && G->launcher) k_wait_flag<<<1, 1, 0, G->st>>>(G->d_flag + (il - 1), G->d_seen + (il - 1));
     if (il > 0 && seg_post(m, il - 1, capturing)) return -1;
     if (il == c->ple_layer && seg_ple(m, il)) return -1;
     return seg_front(m, il, capturing);
@@ -2022,6 +2183,143 @@ static int run_segment(q38_model *m, int id)
     return 0;
 }
 
+/* Host cost of launching the instantiated per-layer graphs, back to back and alternating with
+ * waits, and of switching devices (needs one decoded token first, for the graphs). */
+extern "C" int q38_gpu_launchbench(void *model)
+{
+    q38_model *m = (q38_model *)model;
+    const q38_cfg *c = &m->c;
+    cudaSetDevice(G->dev);
+    const int il = 3, idf = GF(il), idx = GX(il);
+    if (!G->gexec[idf] || !G->gexec[idx]) { printf("launch bench: graphs not built\n"); return 0; }
+    CK(cudaStreamSynchronize(G->st));
+    double t0 = now_s();
+    for (int r = 0; r < 50; r++) CK(cudaGraphLaunch(G->gexec[idf], G->st));
+    const double a = (now_s() - t0) / 50;
+    CK(cudaStreamSynchronize(G->st));
+    double tl = 0, tw = 0;
+    for (int r = 0; r < 50; r++) {
+        double t1 = now_s();
+        CK(cudaGraphLaunch(G->gexec[idf], G->st));
+        double t2 = now_s();
+        CK(ev_wait(G->ev));
+        tl += t2 - t1;
+        tw += now_s() - t2;
+    }
+    CK(cudaStreamSynchronize(G->st));
+    t0 = now_s();
+    for (int r = 0; r < 50; r++) CK(cudaGraphLaunch(G->gexec[idx], G->st));
+    const double b = (now_s() - t0) / 50;
+    CK(cudaStreamSynchronize(G->st));
+    t0 = now_s();
+    for (int r = 0; r < 200; r++) { cudaSetDevice(G->npd == 2 ? G->pdev[1] : G->dev); cudaSetDevice(G->dev); }
+    const double sd = (now_s() - t0) / 200;
+    printf("launch bench: front graph %.1f us back to back, %.1f us after a wait (then %.1f us to its event); "
+           "experts graph %.1f us; cudaSetDevice there and back %.1f us\n",
+           a * 1e6, tl / 50 * 1e6, tw / 50 * 1e6, b * 1e6, sd * 1e6);
+    return 0;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI launch_main(LPVOID arg)
+{
+    q38_model *m = (q38_model *)arg;
+    const q38_cfg *c = &m->c;
+    cudaSetDevice(G->dev);
+    long last = G->job_seq;
+    int idle = 0;
+    while (!G->launch_stop) {
+        const long js = G->job_seq;
+        if (js == last) {
+            if (++idle < 20000) _mm_pause();
+            else { SwitchToThread(); idle = 20000; }
+            continue;
+        }
+        idle = 0;
+        last = js;
+        MemoryBarrier();
+        const int il = G->job_il;
+        int rc = 0;
+        if (G->job_aux) rc = run_aux(m, il);
+        G->done_aux_seq = js;
+        if (!rc) rc = run_segment(m, GX(il));
+        if (!rc && !G->job_last) rc = run_segment(m, GF(il + 1));
+        cudaStreamQuery(G->st);                 /* hand the work to the device now */
+        if (rc) G->launch_err = 1;
+        MemoryBarrier();
+        G->done_f_seq = js;
+    }
+    (void)c;
+    return 0;
+}
+#endif
+
+static int launcher_start(q38_model *m)
+{
+#ifdef _WIN32
+    const char *e = getenv("Q38_LAUNCHER");
+    if (e && !atoi(e)) return 0;
+    if (!G->use_graphs) return 0;
+    unsigned *hf = NULL;
+    cudaSetDevice(G->dev);
+    if (cudaHostAlloc((void **)&hf, (size_t)m->c.n_layer * sizeof(unsigned), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+        return 0;
+    memset(hf, 0, (size_t)m->c.n_layer * sizeof(unsigned));
+    if (cudaHostGetDevicePointer((void **)&G->d_flag, hf, 0) != cudaSuccess) return 0;
+    if (cudaMalloc(&G->d_seen, (size_t)m->c.n_layer * sizeof(unsigned)) != cudaSuccess) return 0;
+    cudaMemset(G->d_seen, 0, (size_t)m->c.n_layer * sizeof(unsigned));
+    G->h_flag = hf;
+    G->launch_thread = CreateThread(NULL, 0, launch_main, m, 0, NULL);
+    if (!G->launch_thread) return 0;
+    G->launcher = 1;
+#else
+    (void)m;
+#endif
+    return 0;
+}
+
+static void launcher_stop(void)
+{
+#ifdef _WIN32
+    if (!G->launcher) return;
+    G->launch_stop = 1;
+    WaitForSingleObject(G->launch_thread, INFINITE);
+    CloseHandle(G->launch_thread);
+    G->launcher = 0;
+#endif
+}
+
+static inline void spin_until(volatile long *v, long want)
+{
+    while (*v != want) _mm_pause();
+    MemoryBarrier();
+}
+
+/* the experts layer il will most likely route to, from its router on the previous layer's
+ * MoE input: those in neither VRAM nor RAM start reading now */
+static void predict_next(q38_model *m, int il, const float *logits, int slot)
+{
+    const int NE = m->c.n_exp, P = G->predict;
+    int n = 0, *ids = G->pred_ids[slot];
+    float tv[64];
+    for (int e = 0; e < NE; e++) {
+        const float v = logits[e];
+        if (n == P && !(v > tv[n - 1])) continue;
+        int j = n < P ? n++ : n - 1;
+        while (j > 0 && tv[j - 1] < v) { tv[j] = tv[j - 1]; ids[j] = ids[j - 1]; j--; }
+        tv[j] = v;
+        ids[j] = e;
+    }
+    G->pred_n[slot] = n;
+    G->pred_layer[slot] = il;
+    for (int i = 0; i < n; i++) {
+        const int e = ids[i], key = il * NE + e;
+        if (G->vslot && G->vslot[key] >= 0) continue;
+        if (q38_model_expert_known(m, il, e)) continue;
+        q38_model_prefetch(m, il, e);
+    }
+}
+
 extern "C" int q38_gpu_forward(void *model, int token)
 {
     q38_model *m = (q38_model *)model;
@@ -2039,8 +2337,14 @@ extern "C" int q38_gpu_forward(void *model, int token)
     }
     double tl0 = now_s();
     if (run_segment(m, 0)) return -1;
+    const int lau = G->launcher && G->use_graphs && !m->tap;
     for (int il = 0; il < c->n_layer; il++) {
-        if (run_segment(m, GF(il))) return -1;
+        if (!lau || il == 0) {
+            if (run_segment(m, GF(il))) return -1;
+        } else {
+            spin_until(&G->done_f_seq, G->job_seq);          /* F(il) submitted by the launcher */
+            if (G->launch_err) return -1;
+        }
         double tw = now_s();
         G->t_launch += tw - tl0;
         CK(ev_wait(G->ev));
@@ -2049,6 +2353,13 @@ extern "C" int q38_gpu_forward(void *model, int token)
         int top[64], cpu_ids[64], n_gpu = 0, n_cpu = 0, n_aux = 0;
         float w[64], cpu_w[64];
         q38_model_route(m, il, G->h_router, top, w);
+        double th = now_s();
+        G->t_rt += th - tr0;
+        if (G->pred_layer[0] == il) {      /* the one-layer-ahead guess for this layer */
+            for (int k = 0; k < K; k++)
+                for (int i = 0; i < G->pred_n[0]; i++) if (G->pred_ids[0][i] == top[k]) { G->pred_hit++; break; }
+            G->pred_total += K;
+        }
         LayerDesc *hd = G->h_ldesc + il;
         LayerDesc *hd2 = G->h_ldesc2 ? G->h_ldesc2 + il : NULL;
         const q38_layer *L = &m->L[il];
@@ -2080,16 +2391,49 @@ extern "C" int q38_gpu_forward(void *model, int token)
         if (hd2) hd2->n = n_aux;
         G->vram_hits += n_gpu + n_aux;
         G->aux_hits += n_aux;
-        if (n_aux && run_aux(m, il)) return -1;
+        double t1 = now_s();
         G->vram_misses += n_cpu;
-        if (run_segment(m, GX(il))) return -1;
-        G->t_route += now_s() - tr0;
-        if (q38_model_experts(m, il, G->h_x, cpu_ids, cpu_w, n_cpu, G->h_y)) return -1;
+        if (lau) {
+            G->job_il = il;
+            G->job_aux = n_aux > 0;
+            G->job_last = il == c->n_layer - 1;
+            MemoryBarrier();
+            G->job_seq++;
+        } else {
+            if (n_aux && run_aux(m, il)) return -1;
+        }
+        double t2 = now_s();
+        G->t_auxl += t2 - t1;
+        if (!lau && run_segment(m, GX(il))) return -1;
+        double t3 = now_s();
+        G->t_gxl += t3 - t2;
+        if (G->predict > 0 && il + 1 < c->n_layer) {
+            predict_next(m, il + 1, G->h_router_next, 0);
+            if (G->pred_ahead > 1 && il + 2 < c->n_layer) predict_next(m, il + 2, G->h_router_next + c->n_exp, 1);
+        }
+        double t4 = now_s();
+        G->t_pred += t4 - t3;
+        G->t_route += t4 - tr0;
+        const double xr = m->t_read, xe = m->t_experts;
+        const int xrc = q38_model_experts(m, il, G->h_x, cpu_ids, cpu_w, n_cpu, G->h_y);
+        double t5 = now_s();
+        G->t_xcall += (t5 - t4) - (m->t_read - xr) - (m->t_experts - xe);
         if (n_aux) {
+            if (lau) spin_until(&G->done_aux_seq, G->job_seq);
             CK(ev_wait(G->ev2));
             for (int i = 0; i < E; i++) G->h_y[i] += G->h_y2[i];
         }
+        if (lau && il + 1 < c->n_layer) {
+            _mm_sfence();
+            G->h_flag[il] = G->h_flag[il] + 1;               /* F(il+1) may combine this layer now */
+        }
+        if (xrc) return -1;
+        G->t_auxw += now_s() - t5;
         tl0 = now_s();
+    }
+    if (lau) {
+        spin_until(&G->done_f_seq, G->job_seq);              /* GX(last) before the tail */
+        if (G->launch_err) return -1;
     }
     if (run_segment(m, GT)) return -1;
     double tt = now_s();

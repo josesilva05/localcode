@@ -4,6 +4,7 @@
 #include "q38_gguf.h"
 #include "q38_quant.h"
 
+#include <math.h>
 #include <string.h>
 
 #if defined(__AVX2__)
@@ -212,6 +213,221 @@ static float dot_q5_K(const uint8_t *row, const q38_xvec *v)
     return hsum8(acc) - macc;
 }
 #endif /* Q38_AVX2 */
+
+/* ------------------------------------------------ 8-bit activations (llama.cpp) -- */
+/* The activation quantised the way ggml's CPU dot products take it (quantize_row_q8_K /
+ * quantize_row_q8_1): q8_K blocks of 256 with 16-sums for the K-quants, q8_1 blocks of 32
+ * with s = d * sum(qs) for Q5_1 and Q8_0. The products are then integer (maddubs/madd) as
+ * in ggml_vec_dot_q4_K_q8_K, ..._q5_K_q8_K, ..._q5_1_q8_1, ..._q8_0_q8_0; the scales stay
+ * float32 here where ggml rounds some to fp16. */
+static inline int nearest_i(float f) { return (int)lrintf(f); }
+
+void q38_xquant(q38_xq *v, const float *x, int64_t n, q38_q8K *kst, q38_q8b *bst)
+{
+    v->n = n;
+    v->k = (kst && n % 256 == 0) ? kst : NULL;
+    v->b = bst;
+    if (v->k) {
+        for (int64_t i = 0; i < n / 256; i++) {
+            const float *xb = x + i * 256;
+            q38_q8K *y = &v->k[i];
+            float amax = 0, mx = 0;
+            for (int j = 0; j < 256; j++) {
+                const float ax = fabsf(xb[j]);
+                if (ax > amax) { amax = ax; mx = xb[j]; }
+            }
+            if (amax == 0) {
+                y->d = 0;
+                memset(y->qs, 0, sizeof y->qs);
+                memset(y->bsums, 0, sizeof y->bsums);
+                continue;
+            }
+            const float iscale = -127.f / mx;
+            for (int j = 0; j < 256; j++) {
+                const int q = nearest_i(iscale * xb[j]);
+                y->qs[j] = (int8_t)(q > 127 ? 127 : q);
+            }
+            for (int j = 0; j < 16; j++) {
+                int s = 0;
+                for (int t = 0; t < 16; t++) s += y->qs[j * 16 + t];
+                y->bsums[j] = (int16_t)s;
+            }
+            y->d = 1.0f / iscale;
+        }
+    }
+    if (v->b) {
+        for (int64_t i = 0; i < n / 32; i++) {
+            const float *xb = x + i * 32;
+            q38_q8b *y = &v->b[i];
+            float amax = 0;
+            for (int j = 0; j < 32; j++) { const float ax = fabsf(xb[j]); if (ax > amax) amax = ax; }
+            const float d = amax / 127.f, id = d != 0 ? 1.0f / d : 0.0f;
+            int s = 0;
+            for (int j = 0; j < 32; j++) {
+                const int q = nearest_i(xb[j] * id);
+                y->qs[j] = (int8_t)q;
+                s += q;
+            }
+            y->d = d;
+            y->s = d * (float)s;
+        }
+    }
+}
+
+int q38_dot8_supported(int type, const q38_xq *v)
+{
+#ifdef Q38_AVX2
+    if (type == Q38_Q4_K || type == Q38_Q5_K) return v->k != NULL;
+    if (type == Q38_Q5_1 || type == Q38_Q8_0) return v->b != NULL;
+#else
+    (void)type; (void)v;
+#endif
+    return 0;
+}
+
+#ifdef Q38_AVX2
+/* the 8 six-bit scales (bytes 0..7) and mins (8..15) of a K-quant block, as in ggml */
+static inline __m256i k_scales_mins(const uint8_t *sc)
+{
+    uint32_t u[4];
+    const uint32_t km1 = 0x3f3f3f3f, km2 = 0x0f0f0f0f, km3 = 0x03030303;
+    memcpy(u, sc, 12);
+    u[3] = ((u[2] >> 4) & km2) | (((u[1] >> 6) & km3) << 4);
+    const uint32_t a = u[1] & km1;
+    u[1] = (u[2] & km2) | (((u[0] >> 6) & km3) << 4);
+    u[2] = a;
+    u[0] &= km1;
+    return _mm256_cvtepu8_epi16(_mm_set_epi32((int)u[3], (int)u[2], (int)u[1], (int)u[0]));
+}
+
+static inline float hsum4(__m128 a)
+{
+    a = _mm_add_ps(a, _mm_movehl_ps(a, a));
+    a = _mm_add_ss(a, _mm_movehdup_ps(a));
+    return _mm_cvtss_f32(a);
+}
+
+static float dot8_q4_K(const uint8_t *row, const q38_xq *v)
+{
+    const int64_t nb = v->n / 256;
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    __m128 accm = _mm_setzero_ps();
+    for (int64_t i = 0; i < nb; i++, row += 144) {
+        const q38_q8K *y = &v->k[i];
+        const float d = y->d * h2f(row), dmin = -y->d * h2f(row + 2);
+        const __m256i ms = k_scales_mins(row + 4);
+        const __m256i q8sums = _mm256_loadu_si256((const __m256i *)y->bsums);
+        const __m128i q8s = _mm_hadd_epi16(_mm256_castsi256_si128(q8sums), _mm256_extracti128_si256(q8sums, 1));
+        const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(ms, 1), q8s);
+        accm = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), accm);
+        int16_t sc[8];
+        _mm_storeu_si128((__m128i *)sc, _mm256_castsi256_si128(ms));
+        const uint8_t *q4 = row + 16;
+        const int8_t *q8 = y->qs;
+        __m256i sumi = _mm256_setzero_si256();
+        for (int j = 0; j < 4; j++) {
+            const __m256i q4b = _mm256_loadu_si256((const __m256i *)(q4 + 32 * j));
+            const __m256i q4l = _mm256_and_si256(q4b, m4), q4h = _mm256_and_si256(_mm256_srli_epi16(q4b, 4), m4);
+            const __m256i p0 = _mm256_madd_epi16(_mm256_set1_epi16(sc[2 * j]), _mm256_maddubs_epi16(q4l, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j))));
+            const __m256i p1 = _mm256_madd_epi16(_mm256_set1_epi16(sc[2 * j + 1]), _mm256_maddubs_epi16(q4h, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j + 32))));
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p1));
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+    return hsum8(acc) + hsum4(accm);
+}
+
+static float dot8_q5_K(const uint8_t *row, const q38_xq *v)
+{
+    const int64_t nb = v->n / 256;
+    const __m256i m4 = _mm256_set1_epi8(0x0F), one = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+    __m128 accm = _mm_setzero_ps();
+    for (int64_t i = 0; i < nb; i++, row += 176) {
+        const q38_q8K *y = &v->k[i];
+        const float d = y->d * h2f(row), dmin = -y->d * h2f(row + 2);
+        const __m256i ms = k_scales_mins(row + 4);
+        const __m256i q8sums = _mm256_loadu_si256((const __m256i *)y->bsums);
+        const __m128i q8s = _mm_hadd_epi16(_mm256_castsi256_si128(q8sums), _mm256_extracti128_si256(q8sums, 1));
+        const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(ms, 1), q8s);
+        accm = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), accm);
+        int16_t sc[8];
+        _mm_storeu_si128((__m128i *)sc, _mm256_castsi256_si128(ms));
+        const __m256i qh = _mm256_loadu_si256((const __m256i *)(row + 16));
+        const uint8_t *q5 = row + 48;
+        const int8_t *q8 = y->qs;
+        __m256i sumi = _mm256_setzero_si256();
+        for (int j = 0; j < 4; j++) {
+            const __m256i q5b = _mm256_loadu_si256((const __m256i *)(q5 + 32 * j));
+            const __m256i h0 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * j), one), 4);
+            const __m256i h1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * j + 1), one), 4);
+            const __m256i lo = _mm256_or_si256(_mm256_and_si256(q5b, m4), h0);
+            const __m256i hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q5b, 4), m4), h1);
+            const __m256i p0 = _mm256_madd_epi16(_mm256_set1_epi16(sc[2 * j]), _mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j))));
+            const __m256i p1 = _mm256_madd_epi16(_mm256_set1_epi16(sc[2 * j + 1]), _mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j + 32))));
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p1));
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+    return hsum8(acc) + hsum4(accm);
+}
+
+/* sum of 32 products u8 x s8, as 8 float lanes */
+static inline __m256 us8_sum(__m256i u, __m256i s)
+{
+    return _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
+}
+
+static float dot8_q5_1(const uint8_t *row, const q38_xq *v)
+{
+    const int64_t nb = v->n / 32;
+    const __m256i m4 = _mm256_set1_epi8(0x0F), m16 = _mm256_set1_epi8(0x10);
+    __m256 acc = _mm256_setzero_ps();
+    float summ = 0;
+    for (int64_t b = 0; b < nb; b++, row += 24) {
+        const q38_q8b *y = &v->b[b];
+        uint32_t qh;
+        memcpy(&qh, row + 4, 4);
+        const __m128i qs = _mm_loadu_si128((const __m128i *)(row + 8));
+        __m256i q = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qs, 4), qs), m4);
+        q = _mm256_or_si256(q, _mm256_and_si256(bits_to_bytes(qh), m16));
+        const __m256 s = us8_sum(q, _mm256_loadu_si256((const __m256i *)y->qs));
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(h2f(row) * y->d), s, acc);
+        summ += h2f(row + 2) * y->s;
+    }
+    return hsum8(acc) + summ;
+}
+
+static float dot8_q8_0(const uint8_t *row, const q38_xq *v)
+{
+    const int64_t nb = v->n / 32;
+    __m256 acc = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; b++, row += 34) {
+        const q38_q8b *y = &v->b[b];
+        const __m256i qx = _mm256_loadu_si256((const __m256i *)(row + 2));
+        const __m256i qy = _mm256_loadu_si256((const __m256i *)y->qs);
+        const __m256 s = us8_sum(_mm256_sign_epi8(qx, qx), _mm256_sign_epi8(qy, qx));
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(h2f(row) * y->d), s, acc);
+    }
+    return hsum8(acc);
+}
+#endif /* Q38_AVX2 */
+
+float q38_dot8(int type, const uint8_t *row, const q38_xq *v)
+{
+#ifdef Q38_AVX2
+    switch (type) {
+    case Q38_Q4_K: return dot8_q4_K(row, v);
+    case Q38_Q5_K: return dot8_q5_K(row, v);
+    case Q38_Q5_1: return dot8_q5_1(row, v);
+    case Q38_Q8_0: return dot8_q8_0(row, v);
+    default: break;
+    }
+#endif
+    (void)type; (void)row; (void)v;
+    return 0.0f;
+}
 
 float q38_dot(int type, const uint8_t *row, const q38_xvec *v)
 {

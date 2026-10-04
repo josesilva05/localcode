@@ -48,10 +48,27 @@ static double now_s(void)
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/* LOCALCODE_TIMES=1: where the time of the generated tokens went, printed at exit */
+static struct { int n; double all, read, experts, gpu, ple, tail; int64_t hits, misses; } g_dec;
+
 static int qw_forward(Glm53fEngine *e, const int *ids, int n, float *logits)
 {
     QwenEngine *q = (QwenEngine *)e->impl;
+    const q38_model *mm = q->m;
+    const double t0 = now_s(), r0 = mm->t_read, x0 = mm->t_experts, w0 = mm->t_gpu_wait, p0 = mm->t_ple, l0 = mm->t_tail;
+    const int64_t h0 = mm->cache_hits, s0 = mm->cache_misses;
     const float *lg = q38_model_forward_batch(q->m, ids, n);
+    if (n == 1) {
+        g_dec.n++;
+        g_dec.all += now_s() - t0;
+        g_dec.read += mm->t_read - r0;
+        g_dec.experts += mm->t_experts - x0;
+        g_dec.gpu += mm->t_gpu_wait - w0;
+        g_dec.ple += mm->t_ple - p0;
+        g_dec.tail += mm->t_tail - l0;
+        g_dec.hits += mm->cache_hits - h0;
+        g_dec.misses += mm->cache_misses - s0;
+    }
     if (!lg) { e->cached = q->m->n_past; return -1; }
     if (lg) memcpy(logits, lg, (size_t)q->m->c.n_vocab * sizeof(float));
     e->cached = q->m->n_past;
@@ -286,6 +303,14 @@ int main(int argc, char **argv)
     free(s.text);
     free(s.logits);
     if (*prof) q38_model_profile_save(&m, prof);
+    if (getenv("LOCALCODE_TIMES") && g_dec.n) {
+        const double k = 1.0 / g_dec.n;
+        fprintf(stderr, "q38: %d generated tokens, %.4f s each: disk %.4f, cpu experts %.4f, gpu wait %.4f, ple %.4f, tail %.4f,"
+                        " other %.4f; cpu experts per token %.1f (%.1f from the disk)\n",
+                g_dec.n, g_dec.all * k, g_dec.read * k, g_dec.experts * k, g_dec.gpu * k, g_dec.ple * k, g_dec.tail * k,
+                (g_dec.all - g_dec.read - g_dec.experts - g_dec.gpu - g_dec.ple - g_dec.tail) * k,
+                (g_dec.hits + g_dec.misses) * k, g_dec.misses * k);
+    }
     q38_tok_free(tok);
     q38_model_close(&m);
     return rc;

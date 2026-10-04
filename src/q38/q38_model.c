@@ -712,18 +712,46 @@ static void lru_front(q38_model *m, q38_slot *s)
     if (!m->lru_tail) m->lru_tail = s;
 }
 
+/* Slot buffers are recycled: an evicted expert's memory waits on a free list of its size for
+ * the next expert of that size. Handing 3 MB blocks back to Windows and taking fresh ones
+ * costs a page fault (and a zeroed page) per 4 KB on the first write, and the release a TLB
+ * shootdown on every core. */
+#define Q38_FB_CAP 16                  /* per size; a few MB, outside the cache budget */
+static uint8_t *slot_buf_get(q38_model *m, int64_t b)
+{
+    for (int k = 0; k < m->n_fb; k++)
+        if (m->fb_size[k] == b && m->fb_n[k] > 0) return m->fb[k][--m->fb_n[k]];
+    return (uint8_t *)malloc((size_t)b);
+}
+
+static void slot_buf_put(q38_model *m, uint8_t *p, int64_t b)
+{
+    int k = 0;
+    while (k < m->n_fb && m->fb_size[k] != b) k++;
+    if (k == m->n_fb) {
+        if (k == 8) { free(p); return; }
+        m->fb[k] = (uint8_t **)malloc(Q38_FB_CAP * sizeof(uint8_t *));
+        if (!m->fb[k]) { free(p); return; }
+        m->fb_size[k] = b;
+        m->fb_n[k] = 0;
+        m->n_fb++;
+    }
+    if (m->fb_n[k] == Q38_FB_CAP) { free(p); return; }
+    m->fb[k][m->fb_n[k]++] = p;
+}
+
 /* Frees least-recently-used experts not used by the current token until need more bytes fit. */
 static void lru_make_room(q38_model *m, int64_t need)
 {
     q38_slot *s = m->lru_tail;
     while (s && m->cache_used + need > m->cache_budget) {
         q38_slot *prev = s->prev;
-        if (s->stamp != m->token_stamp && !s->busy) {
+        if (s->stamp != m->token_stamp && !s->busy && !s->loading) {
             lru_unlink(m, s);
             m->table[s->key] = NULL;
             m->cache_used -= s->bytes;
             m->cache_count--;
-            free(s->data);
+            slot_buf_put(m, s->data, s->bytes);
             free(s);
         }
         s = prev;
@@ -758,7 +786,7 @@ static q38_slot *slot_alloc(q38_model *m, int il, int e)
     lru_make_room(m, b);
     q38_slot *s = (q38_slot *)calloc(1, sizeof *s);
     if (!s) return NULL;
-    s->data = (uint8_t *)malloc((size_t)b);
+    s->data = slot_buf_get(m, b);
     if (!s->data) { free(s); return NULL; }
     s->bytes = b;
     s->key = il * m->c.n_exp + e;
@@ -779,10 +807,129 @@ static int slot_read(q38_model *m, int il, int e, q38_slot *s)
      * cache would only copy each read once more (Q38_DIRECT_IO=0: through it) */
     static int direct = -1;
     if (direct < 0) direct = !(getenv("Q38_DIRECT_IO") && !atoi(getenv("Q38_DIRECT_IO")));
-    int (*rd)(q38_gguf *, const q38_tensor *, int64_t, void *, int64_t) = direct ? q38_gguf_pread_direct : q38_gguf_pread;
-    if (rd(&m->g, l->ex_gate.t, (int64_t)e * bg, s->data, bg)) return -1;
-    if (rd(&m->g, l->ex_up.t, (int64_t)e * bu, s->data + bg, bu)) return -1;
-    if (rd(&m->g, l->ex_down.t, (int64_t)e * bd, s->data + bg + bu, bd)) return -1;
+    if (direct) {                       /* the three matrices in flight together */
+        const q38_tensor *ts[3] = { l->ex_gate.t, l->ex_up.t, l->ex_down.t };
+        const int64_t offs[3] = { (int64_t)e * bg, (int64_t)e * bu, (int64_t)e * bd }, ns[3] = { bg, bu, bd };
+        void *ds[3] = { s->data, s->data + bg, s->data + bg + bu };
+        return q38_gguf_pread_multi(&m->g, 3, ts, offs, ds, ns);
+    }
+    if (q38_gguf_pread(&m->g, l->ex_gate.t, (int64_t)e * bg, s->data, bg)) return -1;
+    if (q38_gguf_pread(&m->g, l->ex_up.t, (int64_t)e * bu, s->data + bg, bu)) return -1;
+    if (q38_gguf_pread(&m->g, l->ex_down.t, (int64_t)e * bd, s->data + bg + bu, bd)) return -1;
+    return 0;
+}
+
+
+/* ------------------------------------------------------- background reads -- */
+/* q38_model_prefetch hands experts to a few reader threads. The main thread owns the cache
+ * (table, LRU, slot_alloc); a reader only fills s->data and then clears s->loading, and a
+ * slot with loading set is neither evicted nor used until it is clear (slot_ready). */
+#ifdef _WIN32
+typedef struct { q38_slot *s; int il, e; } PfJob;
+typedef struct {
+    q38_model *m;
+    CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv;
+    PfJob q[4096];
+    int head, tail, quit, n_th;
+    HANDLE th[8];
+} Pf;
+
+static int slot_read(q38_model *m, int il, int e, q38_slot *s);
+
+static DWORD WINAPI pf_main(LPVOID arg)
+{
+    Pf *pf = (Pf *)arg;
+    for (;;) {
+        EnterCriticalSection(&pf->cs);
+        while (pf->head == pf->tail && !pf->quit) SleepConditionVariableCS(&pf->cv, &pf->cs, INFINITE);
+        if (pf->head == pf->tail && pf->quit) { LeaveCriticalSection(&pf->cs); return 0; }
+        const PfJob j = pf->q[pf->tail % 4096];
+        pf->tail++;
+        LeaveCriticalSection(&pf->cs);
+        const int bad = slot_read(pf->m, j.il, j.e, j.s) != 0;
+        InterlockedExchange(&j.s->loading, bad ? 2 : 0);
+    }
+}
+
+static Pf *pf_get(q38_model *m)
+{
+    if (m->pf) return (Pf *)m->pf;
+    Pf *pf = (Pf *)calloc(1, sizeof(Pf));
+    if (!pf) return NULL;
+    pf->m = m;
+    InitializeCriticalSection(&pf->cs);
+    InitializeConditionVariable(&pf->cv);
+    const char *e = getenv("Q38_PREFETCH_THREADS");
+    pf->n_th = e ? atoi(e) : 4;
+    if (pf->n_th < 1) pf->n_th = 1;
+    if (pf->n_th > 8) pf->n_th = 8;
+    for (int i = 0; i < pf->n_th; i++) pf->th[i] = CreateThread(NULL, 0, pf_main, pf, 0, NULL);
+    m->pf = pf;
+    return pf;
+}
+
+static void pf_stop(q38_model *m)
+{
+    Pf *pf = (Pf *)m->pf;
+    if (!pf) return;
+    EnterCriticalSection(&pf->cs);
+    pf->quit = 1;
+    WakeAllConditionVariable(&pf->cv);
+    LeaveCriticalSection(&pf->cs);
+    WaitForMultipleObjects(pf->n_th, pf->th, TRUE, INFINITE);
+    for (int i = 0; i < pf->n_th; i++) CloseHandle(pf->th[i]);
+    DeleteCriticalSection(&pf->cs);
+    free(pf);
+    m->pf = NULL;
+}
+
+void q38_model_prefetch(q38_model *m, int il, int e)
+{
+    if (m->table[il * m->c.n_exp + e]) return;
+    Pf *pf = pf_get(m);
+    if (!pf) return;
+    EnterCriticalSection(&pf->cs);
+    const int full = pf->head - pf->tail >= 4096;
+    LeaveCriticalSection(&pf->cs);
+    if (full) return;
+    q38_slot *s = slot_alloc(m, il, e);
+    if (!s) return;
+    s->loading = 1;
+    s->pf = 1;
+    m->cache_misses++;
+    m->expert_bytes_read += s->bytes;
+    m->pf_issued++;
+    EnterCriticalSection(&pf->cs);
+    pf->q[pf->head % 4096] = (PfJob){ s, il, e };
+    pf->head++;
+    WakeConditionVariable(&pf->cv);
+    LeaveCriticalSection(&pf->cs);
+}
+#else
+static void pf_stop(q38_model *m) { (void)m; }
+void q38_model_prefetch(q38_model *m, int il, int e) { (void)m; (void)il; (void)e; }
+#endif
+
+int q38_model_expert_known(const q38_model *m, int il, int e) { return m->table[il * m->c.n_exp + e] != NULL; }
+
+/* A resident slot about to be used: wait for its background read, redo it if it failed. */
+static int slot_ready(q38_model *m, int il, int e, q38_slot *s)
+{
+    if (!s->loading) return 0;
+    const double t0 = now_s();
+    if (s->loading == 1) m->pf_waited++;
+    while (s->loading == 1) {
+#ifdef _WIN32
+        YieldProcessor();
+#endif
+    }
+    m->t_pf_wait += now_s() - t0;
+    m->t_read += now_s() - t0;
+    if (s->loading == 2) {
+        s->loading = 0;
+        return slot_read(m, il, e, s);
+    }
     return 0;
 }
 
@@ -840,6 +987,8 @@ static int experts_compute(q38_model *m, int il, const float *x, const int *ids,
             s->stamp = m->token_stamp;
             lru_unlink(m, s);
             lru_front(m, s);
+            if (s->pf) { m->pf_used++; s->pf = 0; }
+            if (slot_ready(m, il, ids[k], s)) return -1;
             m->cache_hits++;
         } else {
             s = slot_alloc(m, il, ids[k]);
@@ -887,26 +1036,39 @@ static int experts_compute(q38_model *m, int il, const float *x, const int *ids,
             matvec_rows(td[k], wd[k], rd[k], F, E, h + (int64_t)k * F, dn + (int64_t)k * E);
         }
     } else if (NX > 0) {
+        /* Q38_ACT8 (default 1): the activations in 8 bits for the integer dot products, as
+         * llama.cpp's CPU path does; 0: float32 activations (the exact path) */
+        static int act8 = -1;
+        if (act8 < 0) act8 = !(getenv("Q38_ACT8") && !atoi(getenv("Q38_ACT8")));
         float bsx[MAX_NE0 / 32];
         q38_xvec vx;
         q38_xprep(&vx, x, E, bsx);
+        static q38_q8K xk[MAX_NE0 / 256];
+        static q38_q8b xb[MAX_NE0 / 32];
+        q38_xq vq;
+        q38_xquant(&vq, x, E, act8 ? xk : NULL, NULL);
         int r, nr = NX * 2 * F;
 #pragma omp parallel for schedule(static)
         for (r = 0; r < nr; r++) {
             const int k = r / (2 * F), j = r % (2 * F);
-            gu[r] = j < F ? q38_dot(tg[k], wg[k] + (int64_t)j * rg[k], &vx)
-                          : q38_dot(tu[k], wu[k] + (int64_t)(j - F) * ru[k], &vx);
+            const int ty = j < F ? tg[k] : tu[k];
+            const uint8_t *row = j < F ? wg[k] + (int64_t)j * rg[k] : wu[k] + (int64_t)(j - F) * ru[k];
+            gu[r] = act8 && q38_dot8_supported(ty, &vq) ? q38_dot8(ty, row, &vq) : q38_dot(ty, row, &vx);
         }
         q38_xvec vh[65];
+        static q38_xq hq[65];
+        static q38_q8b hb[65][MAX_NE0 / 32];
         for (int k = 0; k < NX; k++) {
             for (int i = 0; i < F; i++) h[k * F + i] = siluf_(gu[k * 2 * F + i]) * gu[k * 2 * F + F + i];
             q38_xprep(&vh[k], h + (int64_t)k * F, F, m->moe_bsum + (int64_t)k * (F / 32));
+            q38_xquant(&hq[k], h + (int64_t)k * F, F, NULL, act8 ? hb[k] : NULL);
         }
         nr = NX * E;
 #pragma omp parallel for schedule(static)
         for (r = 0; r < nr; r++) {
             const int k = r / E, i = r % E;
-            dn[r] = q38_dot(td[k], wd[k] + (int64_t)i * rd[k], &vh[k]);
+            const uint8_t *row = wd[k] + (int64_t)i * rd[k];
+            dn[r] = act8 && q38_dot8_supported(td[k], &hq[k]) ? q38_dot8(td[k], row, &hq[k]) : q38_dot(td[k], row, &vh[k]);
         }
     }
     float sg = 0;
@@ -978,6 +1140,8 @@ int q38_model_experts_batch(q38_model *m, int il, const float *X, int n_tok, con
                 s->stamp = m->token_stamp;
                 lru_unlink(m, s);
                 lru_front(m, s);
+                if (s->pf) { m->pf_used++; s->pf = 0; }
+                if (slot_ready(m, il, ue[i], s)) goto out;
                 m->cache_hits++;
             } else {
                 s = slot_alloc(m, il, ue[i]);
@@ -1053,6 +1217,8 @@ int q38_model_experts_resident(q38_model *m, int il, const int *ids, int n, cons
             s->stamp = m->token_stamp;
             lru_unlink(m, s);
             lru_front(m, s);
+            if (s->pf) { m->pf_used++; s->pf = 0; }
+            if (slot_ready(m, il, ids[i], s)) { rc = -1; break; }
             m->cache_hits++;
         } else {
             s = slot_alloc(m, il, ids[i]);
@@ -1091,7 +1257,7 @@ int q38_model_experts(q38_model *m, int il, const float *x, const int *ids, cons
 int q38_model_expert_slot(q38_model *m, int il, int e, const uint8_t **data, int64_t *bytes)
 {
     q38_slot *s = m->table[il * m->c.n_exp + e];
-    if (!s) return -1;
+    if (!s || s->loading) return -1;
     *data = s->data;
     *bytes = s->bytes;
     return 0;
@@ -1100,7 +1266,7 @@ int q38_model_expert_slot(q38_model *m, int il, int e, const uint8_t **data, int
 void *q38_model_expert_hold(q38_model *m, int il, int e, const uint8_t **data, int64_t *bytes)
 {
     q38_slot *s = m->table[il * m->c.n_exp + e];
-    if (!s) return NULL;
+    if (!s || s->loading) return NULL;
     s->busy++;
     *data = s->data;
     *bytes = s->bytes;
@@ -1362,6 +1528,7 @@ int q38_model_open(q38_model *m, const char *path, int max_ctx)
 
 void q38_model_close(q38_model *m)
 {
+    pf_stop(m);
 #ifdef Q38_CUDA
     if (m->gpu) q38_gpu_close(m);
 #endif
@@ -1380,6 +1547,7 @@ void q38_model_close(q38_model *m)
     free(m->ple_hist); free(m->toks); free(m->res); free(m->xn); free(m->mixed); free(m->out);
     free(m->inject); free(m->tmp); free(m->tmp2); free(m->big); free(m->logits); free(m->exbuf);
     for (q38_slot *sl = m->lru_head; sl;) { q38_slot *nx = sl->next; free(sl->data); free(sl); sl = nx; }
+    for (int k = 0; k < m->n_fb; k++) { for (int i = 0; i < m->fb_n[k]; i++) free(m->fb[k][i]); free(m->fb[k]); }
     free(m->use);
     free(m->table); free(m->moe_gu); free(m->moe_h); free(m->moe_dn); free(m->moe_bsum);
     q38_gguf_close(&m->g);

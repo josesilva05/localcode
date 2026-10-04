@@ -106,6 +106,9 @@ int  q38_gguf_read(const q38_gguf *g, const q38_tensor *t, int64_t off, void *ds
 /* q38_gguf_pread past the OS file cache when the shard could be opened that way (sector-aligned
  * reads into a per-thread buffer, then copied); otherwise the same as q38_gguf_pread. */
 int  q38_gguf_pread_direct(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes);
+/* n such reads issued together (asynchronous, all in flight at once), then waited for */
+int  q38_gguf_pread_multi(q38_gguf *g, int n, const q38_tensor *const *t, const int64_t *off, void *const *dst,
+                          const int64_t *nbytes);
 int  q38_gguf_pread(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes);
 
 #endif

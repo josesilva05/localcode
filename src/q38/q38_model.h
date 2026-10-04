@@ -75,6 +75,9 @@ typedef struct q38_slot {
     int      key;                    /* layer * n_exp + expert */
     int      stamp;                  /* last token that used it */
     volatile int busy;               /* > 0: being copied to VRAM, not to be evicted */
+    volatile long loading;           /* 1: a background read fills data (not to be used or evicted
+                                      * yet); 2: that read failed; 0: ready */
+    int      pf;                     /* read ahead and not used yet */
     struct q38_slot *prev, *next;    /* LRU list, most recent first */
 } q38_slot;
 
@@ -87,6 +90,10 @@ typedef struct {
     int64_t    cache_budget, cache_used;
     int64_t    cache_hits, cache_misses, cache_count;
     int        token_stamp;
+    /* evicted experts' buffers, kept for the next expert of the same size */
+    int64_t    fb_size[8];
+    uint8_t  **fb[8];
+    int        fb_n[8], n_fb;
     float     *moe_gu, *moe_h, *moe_dn, *moe_bsum;
     q38_layer L[Q38_MAX_LAYERS];
     q38_mat   tok_embd, output, out_hc_norm, out_hc_down, out_hc_up, ple_table;
@@ -114,6 +121,9 @@ typedef struct {
     void     *tap_ctx;
 
     void     *gpu;                   /* q38_gpu.cu state when the trunk is on a device */
+    void     *pf;                    /* background expert reads (q38_model_prefetch) */
+    int64_t   pf_issued, pf_used, pf_waited;
+    double    t_pf_wait;             /* time a used expert's background read was still running */
     float    *use;                   /* [n_layer * n_exp] router choices: this session + loaded profile */
 
     /* counters */
@@ -140,6 +150,11 @@ int  q38_model_experts_resident(q38_model *m, int il, const int *ids, int n, con
 int  q38_model_experts_batch(q38_model *m, int il, const float *X, int n_tok, const int *ptok, const int *pexp,
                              const float *pw, int npair, float *Y);
 /* an expert's bytes in the RAM cache (gate | up | down), or -1 when it is not resident */
+/* Starts reading expert e of layer il from the GGUF into the RAM cache on a background
+ * thread; nothing when it is resident or already on its way. Its first use waits for it. */
+void q38_model_prefetch(q38_model *m, int il, int e);
+/* 1 when expert e of layer il is in the RAM cache or being read into it */
+int  q38_model_expert_known(const q38_model *m, int il, int e);
 int  q38_model_expert_slot(q38_model *m, int il, int e, const uint8_t **data, int64_t *bytes);
 /* The same, holding the expert in RAM until q38_model_expert_release (it may be released
  * from another thread). Returns a handle, or NULL when it is not resident. */

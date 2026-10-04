@@ -32,6 +32,8 @@ int  q38_gpu_prefill(void *model);
 /* n consecutive tokens in one pass per layer (prompt reading); the logits of the last one
  * land in the model's host buffer. Returns 0 or -1. */
 int  q38_gpu_forward_batch(void *model, const int *toks, int n);
+int  q38_gpu_mvbench(void *model);
+int  q38_gpu_launchbench(void *model);
 /* One token; the logits land in the model's host buffer. Returns 0 or -1. */
 int  q38_gpu_forward(void *model, int token);
 
