@@ -798,6 +798,17 @@ static q38_slot *slot_alloc(q38_model *m, int il, int e)
     return s;
 }
 
+/* A slot whose read failed leaves the cache: its bytes are not the expert's. */
+static void slot_forget(q38_model *m, q38_slot *s)
+{
+    lru_unlink(m, s);
+    m->table[s->key] = NULL;
+    m->cache_used -= s->bytes;
+    m->cache_count--;
+    slot_buf_put(m, s->data, s->bytes);
+    free(s);
+}
+
 static int slot_read(q38_model *m, int il, int e, q38_slot *s)
 {
     const q38_layer *l = &m->L[il];
@@ -1000,12 +1011,16 @@ static int experts_compute(q38_model *m, int il, const float *x, const int *ids,
     }
     if (nmiss) {
         double t0 = now_s();
-        int bad = 0, i;
+        int bad = 0, i, rc[64];
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad)
-        for (i = 0; i < nmiss; i++) bad += slot_read(m, il, ids[miss[i]], sl[miss[i]]) != 0;
+        for (i = 0; i < nmiss; i++) bad += (rc[i] = slot_read(m, il, ids[miss[i]], sl[miss[i]]) != 0);
         m->t_read += now_s() - t0;
         for (i = 0; i < nmiss; i++) m->expert_bytes_read += sl[miss[i]]->bytes;
-        if (bad) { fprintf(stderr, "q38: reading experts of layer %d failed\n", il); return -1; }
+        if (bad) {
+            for (i = 0; i < nmiss; i++) if (rc[i]) slot_forget(m, sl[miss[i]]);
+            fprintf(stderr, "q38: reading experts of layer %d failed\n", il);
+            return -1;
+        }
     }
 
     /* the routed experts and the shared one (index n) as one batch of matrices */
@@ -1154,11 +1169,16 @@ int q38_model_experts_batch(q38_model *m, int il, const float *X, int n_tok, con
         if (nmiss) {
             const double t0 = now_s();
             int bad = 0, i;
+            int rcs[1024];
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad)
-            for (i = 0; i < nmiss; i++) bad += slot_read(m, il, ue[miss[i]], us[miss[i]]) != 0;
+            for (i = 0; i < nmiss; i++) bad += (rcs[i] = slot_read(m, il, ue[miss[i]], us[miss[i]]) != 0);
             m->t_read += now_s() - t0;
             for (i = 0; i < nmiss; i++) m->expert_bytes_read += us[miss[i]]->bytes;
-            if (bad) { fprintf(stderr, "q38: reading experts of layer %d failed\n", il); goto out; }
+            if (bad) {
+                for (i = 0; i < nmiss; i++) if (rcs[i]) slot_forget(m, us[miss[i]]);
+                fprintf(stderr, "q38: reading experts of layer %d failed\n", il);
+                goto out;
+            }
         }
     }
 
@@ -1235,11 +1255,20 @@ int q38_model_experts_resident(q38_model *m, int il, const int *ids, int n, cons
         static int nth = -1;
         if (nth < 0) nth = getenv("Q38_READ_THREADS") ? atoi(getenv("Q38_READ_THREADS")) : 0;
         const int nt = nth > 0 ? nth : omp_get_max_threads();
+        int *rcs = (int *)calloc((size_t)nmiss, sizeof(int));
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad) num_threads(nt)
-        for (i = 0; i < nmiss; i++) bad += slot_read(m, il, ids[miss[i]], sl[miss[i]]) != 0;
+        for (i = 0; i < nmiss; i++) {
+            const int r = slot_read(m, il, ids[miss[i]], sl[miss[i]]) != 0;
+            if (rcs) rcs[i] = r;
+            bad += r;
+        }
         m->t_read += now_s() - t0;
         for (i = 0; i < nmiss; i++) m->expert_bytes_read += sl[miss[i]]->bytes;
-        if (bad) rc = -1;
+        if (bad) {
+            for (i = 0; i < nmiss; i++) if (!rcs || rcs[i]) slot_forget(m, sl[miss[i]]);
+            rc = -1;
+        }
+        free(rcs);
     }
     if (!rc) for (int i = 0; i < n; i++) data[i] = sl[i]->data;
     free(sl);
@@ -1295,6 +1324,12 @@ int q38_model_profile_load(q38_model *m, const char *path)
     ok = ok && v && fread(v, sizeof(float), (size_t)n, f) == (size_t)n;
     fclose(f);
     if (ok) for (int i = 0; i < n; i++) m->use[i] += v[i];
+    if (getenv("Q38_DEBUG_PRELOAD")) {
+        double sv = 0, su = 0;
+        int pos = 0;
+        for (int i = 0; ok && i < n; i++) { sv += v[i]; su += m->use[i]; pos += m->use[i] > 0; }
+        fprintf(stderr, "q38: profile %s: ok %d, file sum %.4g, use sum %.4g, positive %d\n", path, ok, sv, su, pos);
+    }
     free(v);
     return ok ? 0 : -1;
 }
@@ -1329,6 +1364,9 @@ int q38_model_preload(q38_model *m, double gb)
     qsort(ord, (size_t)nz, sizeof(int), by_use);
     int64_t limit = (int64_t)(gb * 1e9);
     if (limit > m->cache_budget) limit = m->cache_budget;
+    if (getenv("Q38_DEBUG_PRELOAD"))
+        fprintf(stderr, "q38: preload: %d experts with use > 0, limit %.1f GB, budget %.1f GB, cache %.1f GB\n", nz,
+                limit / 1e9, m->cache_budget / 1e9, m->cache_used / 1e9);
     int done = 0;
     int64_t bytes = 0;
     for (int i0 = 0; i0 < nz && bytes < limit; i0 += 64) {
@@ -1347,11 +1385,15 @@ int q38_model_preload(q38_model *m, double gb)
             bytes += s->bytes;
         }
         if (!cnt) break;
-        int bad = 0, i;
+        int bad = 0, i, rcs[64];
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad)
-        for (i = 0; i < cnt; i++) bad += slot_read(m, key[i] / c->n_exp, key[i] % c->n_exp, sl[i]) != 0;
-        if (bad) break;
-        done += cnt;
+        for (i = 0; i < cnt; i++) bad += (rcs[i] = slot_read(m, key[i] / c->n_exp, key[i] % c->n_exp, sl[i]) != 0);
+        for (i = 0; i < cnt; i++) if (rcs[i]) slot_forget(m, sl[i]);
+        done += cnt - bad;
+        if (bad) {
+            fprintf(stderr, "q38: preload: %d of %d experts could not be read; stopping\n", bad, cnt);
+            break;
+        }
     }
     /* reads went most-used first, so the most used sit at the LRU tail: put them back in
      * front, least used first, most used last (at the head) */
