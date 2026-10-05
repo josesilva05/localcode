@@ -149,6 +149,10 @@ if(WIN32)
 endif()
 
 # localcode: the interactive session on Qwen3.8-Flash-Next (this repository's model).
+# the engine behind a C ABI, for tools/q38_server.py (an OpenAI / llama-server compatible API)
+add_library(q38api SHARED src/q38/q38_api.c)
+target_link_libraries(q38api PRIVATE q38)
+
 add_executable(localcode src/cli/q38_localcode.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
 target_link_libraries(localcode PRIVATE q38 glm53f)
 

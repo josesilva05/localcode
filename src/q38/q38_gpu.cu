@@ -129,6 +129,8 @@ typedef struct {
      * layer's experts it submits the second device's experts, this device's experts and the
      * next layer's graph, whose first kernel waits for h_flag[il] (mapped host memory) to move */
     int       launcher;
+    uint8_t  *snap;                 /* q38_gpu_state: the host copy of the sequence state */
+    size_t    snap_bytes;
     volatile long job_seq, done_aux_seq, done_f_seq, launch_stop, launch_err;
     int       job_il, job_aux, job_last;
     volatile unsigned *h_flag;
@@ -1728,8 +1730,9 @@ extern "C" int q38_gpu_open(void *model, int device)
         g->hcE = hcE;
         if (c->idx_top_k > 0) {
             const int nblk = m->max_ctx / c->idx_ratio + 1;
+            /* the sort only ever holds complete blocks: at most max_ctx / ratio of them */
             int ns = 1;
-            while (ns < nblk) ns <<= 1;
+            while (ns < m->max_ctx / c->idx_ratio) ns <<= 1;
             if (ns > 8192) { fprintf(stderr, "q38_gpu: context %d is above the device indexer's limit (32768)\n", m->max_ctx); return -1; }
             g->ins = ns;
             for (int il = 0; il < c->n_layer; il++) {
@@ -1811,6 +1814,40 @@ extern "C" void q38_gpu_reset(void *model)
         if (G->ssm[il]) cudaMemset(G->ssm[il], 0, (size_t)c->n_vh * S * S * sizeof(float));
     }
     cudaDeviceSynchronize();
+}
+
+extern "C" int q38_gpu_state(void *model, int save)
+{
+    q38_model *m = (q38_model *)model;
+    const q38_cfg *c = &m->c;
+    if (!G) return -1;
+    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
+    const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
+    const size_t ring_b = G->ple_ring ? (size_t)(c->ple_kern - 1) * c->ple_ngram * c->hc * c->n_embd * sizeof(float) : 0;
+    cudaSetDevice(G->dev);
+    CK(cudaDeviceSynchronize());
+    if (!G->snap) {
+        size_t tot = ring_b;
+        for (int il = 0; il < c->n_layer; il++) tot += (G->conv[il] ? conv_b : 0) + (G->ssm[il] ? ssm_b : 0);
+        CK(cudaMallocHost(&G->snap, tot));
+        G->snap_bytes = tot;
+        if (!save) return -1;                       /* nothing saved yet */
+    }
+    const cudaMemcpyKind k = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
+    size_t off = 0;
+    for (int il = 0; il < c->n_layer; il++) {
+        if (G->conv[il]) {
+            CK(save ? cudaMemcpyAsync(G->snap + off, G->conv[il], conv_b, k, G->st) : cudaMemcpyAsync(G->conv[il], G->snap + off, conv_b, k, G->st));
+            off += conv_b;
+        }
+        if (G->ssm[il]) {
+            CK(save ? cudaMemcpyAsync(G->snap + off, G->ssm[il], ssm_b, k, G->st) : cudaMemcpyAsync(G->ssm[il], G->snap + off, ssm_b, k, G->st));
+            off += ssm_b;
+        }
+    }
+    if (ring_b) CK(save ? cudaMemcpyAsync(G->snap + off, G->ple_ring, ring_b, k, G->st) : cudaMemcpyAsync(G->ple_ring, G->snap + off, ring_b, k, G->st));
+    CK(cudaStreamSynchronize(G->st));
+    return 0;
 }
 
 /* Times each trunk matrix-vector product of one recurrent and one attention layer on the
@@ -1920,6 +1957,7 @@ extern "C" void q38_gpu_close(void *model)
     }
     cudaSetDevice(G->dev);
     cudaDeviceSynchronize();
+    if (G->snap) cudaFreeHost(G->snap);
     cudaDeviceReset();
     free(G);
     G = NULL;

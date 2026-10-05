@@ -36,6 +36,11 @@ int  q38_gpu_mvbench(void *model);
 int  q38_gpu_launchbench(void *model);
 /* One token; the logits land in the model's host buffer. Returns 0 or -1. */
 int  q38_gpu_forward(void *model, int token);
+/* The sequence state that does not follow from the position alone (Gated DeltaNet states,
+ * convolution windows, the PLE ring) copied to a host buffer (save = 1) or back (save = 0).
+ * With n_past set back to the position of the save, the model continues from there: the
+ * attention and indexer caches are indexed by position. Returns 0 or -1. */
+int  q38_gpu_state(void *model, int save);
 
 #ifdef __cplusplus
 }
