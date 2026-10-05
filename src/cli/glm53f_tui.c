@@ -822,7 +822,8 @@ static void menu_gen(const char *typed)
         if (g_s->last_spt > 0.0) {
             char d[32];
             duration(d, sizeof d, v[i] * g_s->last_spt);
-            snprintf(it->hint, sizeof it->hint, "up to %s at the last answer's %.2f s/token", d, g_s->last_spt);
+            snprintf(it->hint, sizeof it->hint, "up to %s at the last answer's %.1f tok/s (%.3f s/token)", d,
+                     1.0 / g_s->last_spt, g_s->last_spt);
         } else {
             snprintf(it->hint, sizeof it->hint, "its time shows once an answer has been measured");
         }
@@ -964,7 +965,7 @@ static void menu_build(void)
     M.title[0] = M.right[0] = 0;
     if (t[0] != '/' || strchr(t, '\n')) return;
     if (g_s->last_spt > 0.0)
-        snprintf(M.right, sizeof M.right, "last answer %.2f s/token · %.2f tokens/s", g_s->last_spt, 1.0 / g_s->last_spt);
+        snprintf(M.right, sizeof M.right, "last answer %.1f tok/s · %.3f s/token", 1.0 / g_s->last_spt, g_s->last_spt);
     else
         snprintf(M.right, sizeof M.right, "local · %s", g_s->e->name);
     const char *sp = strchr(t, ' ');

@@ -196,7 +196,8 @@ void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char
     if (!strcmp(n, "/reasoning"))     snprintf(buf, cap, "%s", s->reasoning);
     else if (!strcmp(n, "/gen"))      snprintf(buf, cap, "%d", s->gen);
     else if (!strcmp(n, "/thinking")) snprintf(buf, cap, "%s", s->show_thinking ? "shown" : "folded");
-    else if (!strcmp(n, "/stats") && s->last_spt > 0.0) snprintf(buf, cap, "%.2f s/token", s->last_spt);
+    else if (!strcmp(n, "/stats") && s->last_spt > 0.0)
+        snprintf(buf, cap, "%.1f tok/s · %.3f s/token", 1.0 / s->last_spt, s->last_spt);
     else if (!strcmp(n, "/copy"))     snprintf(buf, cap, "%s", s->last_answer ? "last answer" : "nothing yet");
     else if (!strcmp(n, "/save") && s->log_len) snprintf(buf, cap, "%.1f KB", (double)s->log_len / 1024.0);
     else if (!strcmp(n, "/reset"))    snprintf(buf, cap, "%d/%d", s->e->cached, s->e->cap);
@@ -232,10 +233,11 @@ static char *stats_note(const Glm53fChat *s)
         duration(d2, sizeof d2, s->pre_s);
         spark(s, sp, sizeof sp);
         n += snprintf(buf + n, sizeof buf - (size_t)n,
-                      "writing   %ld tokens in %s over %d answer%s · %.2f s/token (%.2f tokens/s) %s\n",
-                      s->dec_tok, d1, s->turns, s->turns == 1 ? "" : "s", spt, 1.0 / spt, sp);
-        n += snprintf(buf + n, sizeof buf - (size_t)n, "reading   %ld prompt tokens in %s · %.2f s/token\n",
-                      s->pre_tok, d2, s->pre_tok ? s->pre_s / (double)s->pre_tok : 0.0);
+                      "writing   %ld tokens in %s over %d answer%s · %.1f tok/s · %.3f s/token %s\n",
+                      s->dec_tok, d1, s->turns, s->turns == 1 ? "" : "s", 1.0 / spt, spt, sp);
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "reading   %ld prompt tokens in %s · %.1f tok/s · %.3f s/token\n",
+                      s->pre_tok, d2, s->pre_s > 0.0 ? (double)s->pre_tok / s->pre_s : 0.0,
+                      s->pre_tok ? s->pre_s / (double)s->pre_tok : 0.0);
         const double wait = s->dec_wait_s / (double)s->dec_tok;
         const double reqs = s->dec_reqs ? (double)s->dec_reqs : 1.0;
         const double ahead = (double)s->dec_ahead, demand = (double)s->dec_demand;
@@ -245,8 +247,8 @@ static char *stats_note(const Glm53fChat *s)
                       "%.0f%% read on demand · %.2f GB read per token\n",
                       (double)s->dec_reqs / (double)s->dec_tok, 100.0 * ram / reqs, 100.0 * ahead / reqs,
                       100.0 * demand / reqs, s->dec_read_gb / (double)s->dec_tok);
-        n += snprintf(buf + n, sizeof buf - (size_t)n, "waiting   %.2f s/token on the disk, %.0f%% of a token\n",
-                      wait, spt > 0.0 ? 100.0 * wait / spt : 0.0);
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "waiting   %.0f ms per token on the disk, %.0f%% of the time\n",
+                      1e3 * wait, spt > 0.0 ? 100.0 * wait / spt : 0.0);
         /* the finding the engine is built around (PERFORMANCE.md): decode time follows bytes read */
         n += snprintf(buf + n, sizeof buf - (size_t)n, "limit     %s\n",
                       wait > 0.5 * spt ? "the disk: tokens go as fast as experts arrive; more cache or int4 experts read less"
@@ -523,8 +525,8 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
 
     char stats[256], d[32];
     duration(d, sizeof d, t_dec);
-    snprintf(stats, sizeof stats, "%d tokens · %.2f s/token · %s · read %d in %.1f s%s",
-             nout, nout ? t_dec / nout : 0.0, d, n, t_prefill,
+    snprintf(stats, sizeof stats, "%d tokens · %.1f tok/s · %.3f s/token · %s · read %d tokens in %.1f s%s",
+             nout, t_dec > 0.0 ? nout / t_dec : 0.0, nout ? t_dec / nout : 0.0, d, n, t_prefill,
              interrupted ? " · interrupted" : stopped ? "" : " · reached /gen");
     int len = nout ? e->decode(e, s->out, nout, s->text, s->text_cap - 1) : 0;
     if (len < 0) len = 0;
