@@ -1,29 +1,26 @@
-# Line endings are normalised to LF in the repository. Without this, a clone on Windows
-# with core.autocrlf=true checks the shell scripts out with CRLF and every one of them
-# fails under bash with `bad interpreter: /bin/bash^M`.
-* text=auto eol=lf
-
-# Executable text that must be LF on every platform, including a Windows checkout.
-*.sh    text eol=lf
-*.py    text eol=lf
-Makefile text eol=lf
-
-# Binary: never transform, and do not attempt a textual diff.
-*.png   binary
-*.pdf   binary
-*.bin   binary
-*.safetensors binary
-*.model binary
 
 # Binary fixtures are read with fread and interpreted as raw tensor bytes. EOL
-# translation on these would corrupt them into a test failure that looks like a kernel
-# bug. The text fixtures alongside them are parsed as JSON and normalise safely.
-tests/fixtures/**/*.safetensors -text
-tests/fixtures/**/*.bin         -text
-
+# Binary: never transform, and do not attempt a textual diff.
 # Collapse generated artefacts in pull-request diffs. They stay in the repository and are
-# still versioned; this only stops them dominating the review.
-docs/images/*.png linguist-generated=true
-
+# Executable text that must be LF on every platform, including a Windows checkout.
+# Line endings are normalised to LF in the repository. Without this, a clone on Windows
+# bug. The text fixtures alongside them are parsed as JSON and normalise safely.
 # cmd.exe needs CRLF: with LF, labels and goto misbehave.
+# fails under bash with `bad interpreter: /bin/bash^M`.
+# still versioned; this only stops them dominating the review.
+# translation on these would corrupt them into a test failure that looks like a kernel
+# with core.autocrlf=true checks the shell scripts out with CRLF and every one of them
+* text=auto eol=lf
 *.bat   text eol=crlf
+*.bat text eol=crlf
+*.bin   binary
+*.model binary
+*.pdf   binary
+*.png   binary
+*.py    text eol=lf
+*.safetensors binary
+*.sh    text eol=lf
+Makefile text eol=lf
+docs/images/*.png linguist-generated=true
+tests/fixtures/**/*.bin         -text
+tests/fixtures/**/*.safetensors -text
