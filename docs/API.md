@@ -27,6 +27,13 @@ The `llamacpp` route (`@deepseek-ai/dsh-llm-llamacpp`) looks at `http://127.0.0.
 default, so with `start-api.bat` running, select `llamacpp/loaded`. Nothing else to configure.
 Do not run llama-server, localcode and the API at the same time: each loads the model.
 
+`start-harness.bat` (or `start-api.bat --harness`) also starts the harness: once the model is
+ready it runs `dsh web --no-open` from `..\deepseek-harness` (`--harness-dir`, `--harness-port`
+3080) with `LLAMACPP_BASE_URL` pointing at the API, and opens the UI as an app window of Chrome
+(or Edge: `--browser`) in a profile of its own without extensions, sync or background services,
+to keep the browser's memory low. The harness is tied to the API process: stopping the API, or
+closing its window, stops it. Its output goes to `%LOCALAPPDATA%\localcode\harness.log`.
+
 ## Options (`start-api.bat --help`)
 
 | Option | Default | |

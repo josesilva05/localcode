@@ -6,6 +6,8 @@ rem
 rem   start-api.bat                              the model from LOCALCODE_MODEL, or the UD-Q4_K_XL GGUF
 rem   start-api.bat --reasoning-effort medium    any option of tools\q38_server.py (--help lists them)
 rem   start-api.bat --ctx 16384 --port 8081
+rem   start-api.bat --harness                    also start deepseek-harness once the model is ready
+rem                                              (its web UI in an app window; start-harness.bat does this)
 rem
 rem Do not run it beside localcode or llama-server: one copy of the model fills the RAM.
 setlocal

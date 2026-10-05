@@ -25,9 +25,12 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -722,6 +725,150 @@ def make_handler(srv):
     return Handler
 
 
+# --------------------------------------------------------------------------- deepseek-harness
+def _answers(url):
+    try:
+        urllib.request.urlopen(url, timeout=2).close()
+        return True
+    except urllib.error.HTTPError:
+        return True                                    # it is serving, whatever the page says
+    except Exception:                                  # noqa: BLE001
+        return False
+
+
+def _find_browser():
+    pf, pf86, local = os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", ""), os.environ.get("LOCALAPPDATA", "")
+    for p in (os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+              os.path.join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+              os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+              os.path.join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+              os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe")):
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def open_app_window(url, browser):
+    """The page as an app window (no tabs, no address bar) of a browser profile of its own,
+    without extensions, sync or background services: the lightest way to keep it open."""
+    exe = browser or _find_browser()
+    if not exe:
+        log("no Chrome or Edge found; open %s yourself" % url)
+        return
+    profile = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "localcode", "harness-browser")
+    flags = ["--app=" + url, "--user-data-dir=" + profile, "--no-first-run", "--no-default-browser-check",
+             "--disable-extensions", "--disable-component-extensions-with-background-pages",
+             "--disable-background-networking", "--disable-sync", "--disable-default-apps",
+             "--disable-features=Translate,MediaRouter,OptimizationHints", "--window-size=1320,920"]
+    kw = {"creationflags": 0x00000008} if os.name == "nt" else {}       # DETACHED_PROCESS
+    subprocess.Popen([exe] + flags, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    log("opened %s in %s (app window)" % (url.split("?")[0], os.path.basename(exe)))
+
+
+_JOB = None
+
+
+def _tie_to_this_process(proc):
+    """Windows: put proc (and what it starts) in a job that ends when this process ends,
+    however it ends, so closing the console does not leave the harness running."""
+    global _JOB
+    if os.name != "nt":
+        return
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = ctypes.c_void_p
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    k32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("r_ops", "w_ops", "o_ops", "r_bytes", "w_bytes", "o_bytes")]
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", ctypes.c_uint32), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", ctypes.c_uint32),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", ctypes.c_uint32), ("SchedulingClass", ctypes.c_uint32)]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BasicLimits), ("IoInfo", IoCounters), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return
+    info = ExtendedLimits()
+    info.BasicLimitInformation.LimitFlags = 0x2000                      # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)) and \
+            k32.AssignProcessToJobObject(job, ctypes.c_void_p(int(proc._handle))):
+        _JOB = job                                                      # closed when this process ends
+
+
+def start_harness(args):
+    """deepseek-harness's web UI (dsh web --no-open) pointed at this API, then its app window.
+    Returns the harness process this server started (stopped with it), or None."""
+    url = "http://127.0.0.1:%d" % args.harness_port
+    if _answers(url):
+        log("deepseek-harness already answers at %s" % url)
+        open_app_window(url, args.browser)
+        return None
+    bin_ts = os.path.join(args.harness_dir, "apps", "cli", "src", "bin.ts")
+    if not os.path.exists(bin_ts):
+        log("deepseek-harness not found in %s (give --harness-dir)" % args.harness_dir)
+        return None
+    env = dict(os.environ)
+    host = "127.0.0.1" if args.host in ("0.0.0.0", "::", "") else args.host
+    env["LLAMACPP_BASE_URL"] = "http://%s:%d" % (host, args.port)      # the llamacpp route's address
+    logdir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "localcode")
+    os.makedirs(logdir, exist_ok=True)
+    logpath = os.path.join(logdir, "harness.log")
+    start_at = os.path.getsize(logpath) if os.path.exists(logpath) else 0
+    logf = open(logpath, "ab")
+    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}       # CREATE_NO_WINDOW
+    proc = subprocess.Popen(["node", "--import", "tsx/esm", bin_ts, "web", "--no-open", "--port", str(args.harness_port)],
+                            cwd=args.harness_dir, env=env, stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT, **kw)
+    try:
+        _tie_to_this_process(proc)
+    except Exception as e:                                              # noqa: BLE001
+        log("could not tie deepseek-harness to this process (%s); stop it yourself if the API is closed" % e)
+    log("starting deepseek-harness (log: %s)" % logpath)
+    # the UI's address carries an access token: "dsh web: http://127.0.0.1:3080/?token=..."
+    t0, page = time.time(), None
+    while time.time() - t0 < 180:
+        if proc.poll() is not None:
+            log("deepseek-harness exited with code %d; see %s" % (proc.returncode, logpath))
+            return None
+        if page is None:
+            try:
+                with open(logpath, "rb") as f:
+                    f.seek(start_at)
+                    m = re.search(r"dsh web: (https?://\S+)", f.read().decode("utf-8", "replace"))
+                if m:
+                    page = m.group(1)
+            except OSError:
+                pass
+        if page and _answers(url):
+            log("deepseek-harness ready at %s in %.0f s" % (url, time.time() - t0))
+            open_app_window(page, args.browser)
+            return proc
+        time.sleep(1)
+    if _answers(url):
+        log("deepseek-harness answers at %s but printed no address; opening it without one" % url)
+        open_app_window(url, args.browser)
+    else:
+        log("deepseek-harness did not answer at %s in 3 minutes; see %s" % (url, logpath))
+    return proc
+
+
+def stop_process_tree(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        proc.terminate()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--model", default=os.environ.get("LOCALCODE_MODEL", DEFAULT_MODEL))
@@ -738,6 +885,11 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--min-p", type=float, default=0.0)
     ap.add_argument("--dll", default=None)
+    ap.add_argument("--harness", action="store_true",
+                    help="once the model is ready, start deepseek-harness's web UI and open it as an app window")
+    ap.add_argument("--harness-dir", default=os.environ.get("DSH_DIR", os.path.join(os.path.dirname(ROOT), "deepseek-harness")))
+    ap.add_argument("--harness-port", type=int, default=3080)
+    ap.add_argument("--browser", default=None, help="Chrome or Edge executable (found by itself when omitted)")
     args = ap.parse_args()
     if not os.path.exists(args.model):
         sys.exit("no model at %s (give --model or set LOCALCODE_MODEL)" % args.model)
@@ -747,12 +899,14 @@ def main():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     log("listening on http://%s:%d (loading the model; /health answers 503 until it is ready)" % (args.host, args.port))
     srv.load()
+    harness = start_harness(args) if args.harness and srv.engine else None
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
         log("stopping")
     finally:
+        stop_process_tree(harness)
         httpd.shutdown()
         with srv.lock:
             if srv.engine:
