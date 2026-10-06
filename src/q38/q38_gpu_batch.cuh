@@ -992,7 +992,7 @@ static int stream_experts(q38_model *m, int il, int N, const int *ptok, const in
     int nu = 0;
     for (int e = 0; e < NE; e++) slot_of[e] = -1;
     for (int p = 0; p < npc; p++) if (slot_of[pexp[p]] < 0) { slot_of[pexp[p]] = nu; ue[nu++] = pexp[p]; }
-    if (q38_model_experts_resident(m, il, ue, nu, data)) return -1;
+    if (q38_model_experts_stream(m, il, ue, nu, data)) return -1;
     const q38_layer *L = &m->L[il];
     const int64_t bg = (int64_t)F * L->ex_gate.row_bytes, bu = (int64_t)F * L->ex_up.row_bytes;
     const int64_t eb = bg + bu + (int64_t)E * L->ex_down.row_bytes;

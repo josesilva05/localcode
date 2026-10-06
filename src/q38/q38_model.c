@@ -774,8 +774,49 @@ void q38_model_set_cache(q38_model *m, double gb)
         if (budget < (int64_t)2e9) budget = (int64_t)2e9;
     }
     if (budget > all) budget = all;
+    budget -= (int64_t)m->tr_n * m->tr_size;     /* the prompt pass's buffers count against it */
     m->cache_budget = budget;
+    m->cache_budget0 = budget;
     lru_make_room(m, 0);
+}
+
+/* Keeps the free RAM above a floor (Q38_MEM_FLOOR_GB, default 3; 0 = off). The budget counts
+ * the RAM free at start, before the harness and its browser open; once the free RAM runs out,
+ * Windows trims the cache's pages to the pagefile and every hit becomes a page fault, which
+ * costs far more than the reads the cache saves. Shrinks the budget below the floor and gives
+ * it back, up to what set_cache chose, when RAM frees up. */
+static void mem_guard(q38_model *m)
+{
+#ifdef _WIN32
+    const double t = now_s();
+    if (t - m->t_memcheck < 0.25) return;
+    m->t_memcheck = t;
+    static int64_t floor_b = -1;
+    if (floor_b < 0) {
+        const char *e = getenv("Q38_MEM_FLOOR_GB");
+        floor_b = (int64_t)((e ? atof(e) : 3.0) * 1e9);
+    }
+    if (floor_b <= 0 || m->cache_budget0 <= 0) return;
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    const int64_t avail = (int64_t)ms.ullAvailPhys;
+    int64_t b = m->cache_budget;
+    if (avail < floor_b) {
+        const int64_t want = m->cache_used - (floor_b - avail) - (int64_t)5e8;
+        if (want < b) b = want;
+    } else if (avail > floor_b + (int64_t)4e9 && b < m->cache_budget0) {
+        b += (avail - floor_b - (int64_t)4e9) / 2;
+    }
+    if (b > m->cache_budget0) b = m->cache_budget0;
+    if (b < (int64_t)4e9) b = (int64_t)4e9;
+    if (b != m->cache_budget) {
+        m->cache_budget = b;
+        lru_make_room(m, 0);
+    }
+#else
+    (void)m;
+#endif
 }
 
 /* The expert's three matrices in RAM, reading them from the GGUF on a miss. Misses of one
@@ -783,6 +824,7 @@ void q38_model_set_cache(q38_model *m, double gb)
 static q38_slot *slot_alloc(q38_model *m, int il, int e)
 {
     const int64_t b = expert_bytes(m, il);
+    mem_guard(m);
     lru_make_room(m, b);
     q38_slot *s = (q38_slot *)calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -1276,6 +1318,97 @@ int q38_model_experts_resident(q38_model *m, int il, const int *ids, int n, cons
     return rc;
 }
 
+/* Reused buffer k for the prompt pass's experts that the full cache does not take; a new one
+ * comes out of the cache budget (the least recent experts make room). */
+static uint8_t *tr_get(q38_model *m, int k)
+{
+    if (k < m->tr_n) return m->tr_buf[k];
+    if (k >= m->c.n_exp) return NULL;
+    if (!m->tr_buf) {
+        m->tr_buf = (uint8_t **)calloc((size_t)m->c.n_exp, sizeof(uint8_t *));
+        if (!m->tr_buf) return NULL;
+        for (int il = 0; il < m->c.n_layer; il++)
+            if (expert_bytes(m, il) > m->tr_size) m->tr_size = expert_bytes(m, il);
+    }
+    uint8_t *p = (uint8_t *)malloc((size_t)m->tr_size);
+    if (!p) return NULL;
+    m->tr_buf[m->tr_n++] = p;
+    m->cache_budget -= m->tr_size;
+    m->cache_budget0 -= m->tr_size;
+    lru_make_room(m, 0);
+    return p;
+}
+
+int q38_model_experts_stream(q38_model *m, int il, const int *ids, int n, const uint8_t **data)
+{
+    const int NE = m->c.n_exp, nn = n ? n : 1;
+    const int64_t eb = expert_bytes(m, il);
+    m->token_stamp++;
+    q38_slot **sl = (q38_slot **)calloc((size_t)nn, sizeof(q38_slot *));
+    q38_slot *tmp = (q38_slot *)calloc((size_t)nn, sizeof(q38_slot));
+    int *miss = (int *)malloc((size_t)nn * sizeof(int)), nmiss = 0, ntr = 0, rc = 0;
+    if (!sl || !tmp || !miss) { free(sl); free(tmp); free(miss); return -1; }
+    /* the hits first: stamped, the room made for the misses below cannot evict them */
+    for (int i = 0; i < n && !rc; i++) {
+        q38_slot *s = m->table[il * NE + ids[i]];
+        if (!s) continue;
+        s->stamp = m->token_stamp;
+        lru_unlink(m, s);
+        lru_front(m, s);
+        if (s->pf) { m->pf_used++; s->pf = 0; }
+        if (slot_ready(m, il, ids[i], s)) rc = -1;
+        m->cache_hits++;
+        sl[i] = s;
+    }
+    for (int i = 0; i < n && !rc; i++) {
+        if (sl[i]) continue;
+        q38_slot *s = NULL;
+        if (m->cache_used + eb <= m->cache_budget) {
+            s = slot_alloc(m, il, ids[i]);
+        } else {
+            uint8_t *p = tr_get(m, ntr);
+            if (p) {
+                s = &tmp[i];
+                s->data = p;
+                s->bytes = eb;
+                s->key = -1;              /* not in the cache */
+                ntr++;
+            }
+        }
+        if (!s) { rc = -1; break; }
+        miss[nmiss++] = i;
+        m->cache_misses++;
+        sl[i] = s;
+    }
+    if (!rc && nmiss) {
+        const double t0 = now_s();
+        int bad = 0, i;
+        static int nth = -1;
+        if (nth < 0) nth = getenv("Q38_READ_THREADS") ? atoi(getenv("Q38_READ_THREADS")) : 0;
+        const int nt = nth > 0 ? nth : omp_get_max_threads();
+        int *rcs = (int *)calloc((size_t)nmiss, sizeof(int));
+#pragma omp parallel for schedule(dynamic, 1) reduction(+ : bad) num_threads(nt)
+        for (i = 0; i < nmiss; i++) {
+            const int r = slot_read(m, il, ids[miss[i]], sl[miss[i]]) != 0;
+            if (rcs) rcs[i] = r;
+            bad += r;
+        }
+        m->t_read += now_s() - t0;
+        for (i = 0; i < nmiss; i++) m->expert_bytes_read += eb;
+        if (bad) {
+            for (i = 0; i < nmiss; i++)
+                if ((!rcs || rcs[i]) && sl[miss[i]]->key >= 0) slot_forget(m, sl[miss[i]]);
+            rc = -1;
+        }
+        free(rcs);
+    }
+    if (!rc) for (int i = 0; i < n; i++) data[i] = sl[i]->data;
+    free(sl);
+    free(tmp);
+    free(miss);
+    return rc;
+}
+
 void q38_model_route(q38_model *m, int il, const float *logits, int *top, float *w) { route(m, il, logits, top, w); }
 
 int q38_model_experts(q38_model *m, int il, const float *x, const int *ids, const float *w, int n, float *y)
@@ -1462,7 +1595,15 @@ const float *q38_model_forward_batch(q38_model *m, const int *toks, int n)
         return NULL;
     }
 #ifdef Q38_CUDA
-    if (m->gpu && n > 1 && !m->tap && !(getenv("Q38_NO_BATCH") && atoi(getenv("Q38_NO_BATCH")))) {
+    /* a batch passes over most experts whatever its size (100 tokens already choose most of
+     * them), so below Q38_BATCH_MIN tokens one at a time, through the warm cache, is cheaper */
+    static int bmin = -1;
+    if (bmin < 0) {
+        const char *e = getenv("Q38_BATCH_MIN");
+        bmin = e ? atoi(e) : 256;
+        if (bmin < 2) bmin = 2;
+    }
+    if (m->gpu && n >= bmin && !m->tap && !(getenv("Q38_NO_BATCH") && atoi(getenv("Q38_NO_BATCH")))) {
         const double t0 = now_s();
         m->token_stamp++;
         if (q38_gpu_forward_batch(m, toks, n)) return NULL;
@@ -1590,6 +1731,8 @@ void q38_model_close(q38_model *m)
     free(m->inject); free(m->tmp); free(m->tmp2); free(m->big); free(m->logits); free(m->exbuf);
     for (q38_slot *sl = m->lru_head; sl;) { q38_slot *nx = sl->next; free(sl->data); free(sl); sl = nx; }
     for (int k = 0; k < m->n_fb; k++) { for (int i = 0; i < m->fb_n[k]; i++) free(m->fb[k][i]); free(m->fb[k]); }
+    for (int k = 0; k < m->tr_n; k++) free(m->tr_buf[k]);
+    free(m->tr_buf);
     free(m->use);
     free(m->table); free(m->moe_gu); free(m->moe_h); free(m->moe_dn); free(m->moe_bsum);
     q38_gguf_close(&m->g);

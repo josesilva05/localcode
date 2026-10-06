@@ -94,6 +94,14 @@ typedef struct {
     int64_t    fb_size[8];
     uint8_t  **fb[8];
     int        fb_n[8], n_fb;
+    /* the prompt pass's experts once the cache is full: read into these reused buffers and
+     * not kept (q38_model_experts_stream); their bytes come out of the cache budget */
+    uint8_t  **tr_buf;
+    int        tr_n;
+    int64_t    tr_size;
+    /* the budget set_cache chose, and when the free RAM was last compared with the floor */
+    int64_t    cache_budget0;
+    double     t_memcheck;
     float     *moe_gu, *moe_h, *moe_dn, *moe_bsum;
     q38_layer L[Q38_MAX_LAYERS];
     q38_mat   tok_embd, output, out_hc_norm, out_hc_down, out_hc_up, ple_table;
@@ -145,6 +153,11 @@ int  q38_model_experts(q38_model *m, int il, const float *x, const int *ids, con
 /* Make n experts of layer il resident in the RAM cache (misses read in parallel) and return
  * their bytes; they stay protected from eviction until the next call. 0 or -1. */
 int  q38_model_experts_resident(q38_model *m, int il, const int *ids, int n, const uint8_t **data);
+/* The prompt pass's form of it: hits come from the cache, misses go into the cache while it
+ * has room and into reused buffers outside it once it is full, so a pass over more experts
+ * than the cache holds keeps what the cache has instead of evicting what the next batch
+ * needs. The bytes stay valid until the next call. 0 or -1. */
+int  q38_model_experts_stream(q38_model *m, int il, const int *ids, int n, const uint8_t **data);
 /* the same for many tokens: pairs (token ptok[p], expert pexp[p], weight pw[p]), each expert
  * read once for all of its tokens; Y[n_tok][n_embd] gets each token's sum in pair order */
 int  q38_model_experts_batch(q38_model *m, int il, const float *X, int n_tok, const int *ptok, const int *pexp,
