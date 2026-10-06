@@ -156,7 +156,9 @@ static char *save(Glm53fChat *s, const char *arg)
 
 const Glm53fCommand glm53f_commands[] = {
     { "/file",      "PATH [question]", "send a file's text, then the question (a path with spaces in quotes)", 2 },
-    { "/reasoning", "LEVEL",           "reasoning effort (set when a conversation opens)", 2 },
+    { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
+    { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
+    { "/reasoning", "LEVEL",           "reasoning effort of level 0 chat (set when a conversation opens)", 2 },
     { "/gen",       "N",               "tokens to generate per answer", 2 },
     { "/thinking",  "",                "show or fold the model's reasoning", 0 },
     { "/stats",     "",                "measured speed, disk reads and expert cache of this session", 0 },
@@ -194,6 +196,8 @@ void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char
     const char *n = c->name;
     buf[0] = 0;
     if (!strcmp(n, "/reasoning"))     snprintf(buf, cap, "%s", s->reasoning);
+    else if (!strcmp(n, "/level"))    snprintf(buf, cap, "%s", s->agent_level == 2 ? "2 agent" : s->agent_level == 1 ? "1 quick" : "0 chat");
+    else if (!strcmp(n, "/approve"))  snprintf(buf, cap, "%s", s->auto_approve ? "auto" : "ask");
     else if (!strcmp(n, "/gen"))      snprintf(buf, cap, "%d", s->gen);
     else if (!strcmp(n, "/thinking")) snprintf(buf, cap, "%s", s->show_thinking ? "shown" : "folded");
     else if (!strcmp(n, "/stats") && s->last_spt > 0.0)
@@ -352,6 +356,29 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
         s->log_len = 0;                          /* a new conversation, a new transcript */
         in->kind = GLM53F_IN_RESET;
         in->note = dup_str("conversation cleared");
+    } else if (!strncmp(line, "/level ", 7) || !strncmp(line, "/nivel ", 7)) {
+        const int v = atoi(line + 7);
+        if (v < 0 || v > 2 || line[7] < '0' || line[7] > '9') {
+            in->note = dup_str("/level takes 0 (chat), 1 (quick: reads files) or 2 (agent: edits files, runs commands)");
+        } else if (v > 0 && !s->e->agent) {
+            in->note = dup_str("this model has no agent mode here; only /level 0");
+        } else {
+            s->agent_level = v;
+            s->e->reset(s->e);                   /* the system prompt differs per level */
+            s->first = 1;
+            s->log_len = 0;
+            in->kind = GLM53F_IN_RESET;
+            in->note = dup_str(v == 2 ? "level 2 · agent: reads, edits, runs commands (asks first) · new conversation"
+                               : v == 1 ? "level 1 · quick: reads the project's files to answer · new conversation"
+                                        : "level 0 · chat, no tools · new conversation");
+        }
+    } else if (!strcmp(line, "/approve ask") || !strcmp(line, "/approve auto")) {
+        s->auto_approve = !strcmp(line, "/approve auto");
+        if (!s->auto_approve) s->always = 0;
+        in->note = dup_str(s->auto_approve ? "writes and commands run without asking (inside the working directory)"
+                                           : "writes and commands ask first");
+    } else if (!strncmp(line, "/approve", 8)) {
+        in->note = dup_str("/approve takes ask or auto");
     } else if (!strcmp(line, "/save") || !strncmp(line, "/save ", 6)) {
         in->note = save(s, line[5] ? line + 6 : NULL);
     } else if (!strncmp(line, "/gen ", 5)) {
@@ -422,14 +449,19 @@ void glm53f_chat_gauge(const Glm53fChat *s, char *buf, size_t cap)
 
 /* ----------------------------------------------------------------------- turn ---- */
 
-static volatile sig_atomic_t g_stop = 0;
+static volatile int g_stop = 0;
 
 void glm53f_chat_stop(void) { g_stop = 1; }
+
+volatile int *glm53f_chat_stop_flag(void) { return &g_stop; }
+
+void glm53f_chat_log(Glm53fChat *s, const char *text) { log_str(s, text); }
 
 int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
 {
     Glm53fEngine *e = s->e;
     char line[320];
+    if (s->agent_level > 0 && e->agent) return lc_agent_turn(s, in, k);
 
     /* the chat template: the preamble only opens the conversation, every turn after that
      * appends its own user block, and the cache already holds what came before. */
@@ -574,6 +606,32 @@ static void plain_thought(Glm53fTurnSink *k, double sec, int tokens)
 static void plain_answer(Glm53fTurnSink *k, const char *p, int n) { (void)k; fwrite(p, 1, (size_t)n, stdout); fflush(stdout); }
 static const char *g_name = "";
 
+static void plain_tool(Glm53fTurnSink *k, const char *title, const char *summary, int ok)
+{
+    (void)k;
+    printf("\n  %s %s · %s\n", ok ? "⚙" : "✗", title, summary);
+    fflush(stdout);
+}
+
+static int read_line(char *buf, int cap);
+
+static int plain_approve(Glm53fTurnSink *k, const char *title, const char *detail)
+{
+    (void)k;
+    char a[64];
+    printf("\n  ? allow %s\n", title);
+    if (detail && *detail) printf("%s\n", detail);
+    for (;;) {
+        printf("  [y] yes  [a] always for this tool  [n] no: ");
+        fflush(stdout);
+        if (read_line(a, sizeof a) < 0) return 0;
+        const char c = (char)(a[0] | 32);
+        if (c == 'y' || c == 's') return 1;
+        if (c == 'a' || c == 't') return 2;
+        if (c == 'n') return 0;
+    }
+}
+
 static void plain_done(Glm53fTurnSink *k, const char *stats, int state)
 {
     (void)k;
@@ -611,7 +669,7 @@ static int plain_run(Glm53fChat *s)
     g_name = s->e->name;
     printf("localcode · %s · ready in %.1f s · /help for commands\n", s->e->name, s->load_s);
     int rc = 0, shown = 0;
-    Glm53fTurnSink k = { plain_status, plain_reasoning, plain_thought, plain_answer, plain_done, &shown };
+    Glm53fTurnSink k = { plain_status, plain_reasoning, plain_thought, plain_answer, plain_done, &shown, plain_tool, plain_approve };
     for (;;) {
         printf("\n> ");
         fflush(stdout);

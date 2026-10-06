@@ -273,7 +273,7 @@ static int in_read(char *buf, int cap, int timeout_ms)
 /* The conversation as the screen shows it. The worker thread appends, the UI thread draws;
  * both under g_mu. */
 
-enum { B_SPLASH, B_USER, B_STATUS, B_REASON, B_THOUGHT, B_ANSWER, B_STATS, B_NOTE, B_ERROR };
+enum { B_SPLASH, B_USER, B_STATUS, B_REASON, B_THOUGHT, B_ANSWER, B_STATS, B_NOTE, B_ERROR, B_TOOL, B_ASK };
 
 typedef struct {
     int    kind;
@@ -663,6 +663,20 @@ static void render_blocks(Lines *L, const Glm53fChat *s, int W)
             break;
         }
         case B_NOTE:  render_plain(L, t, b->text.n, W, C_DIM, "  "); break;
+        case B_TOOL: {                           /* t0: 1 the call worked, 0 it failed */
+            char prefix[64];
+            snprintf(prefix, sizeof prefix, "  %s%s ", b->t0 > 0.5 ? C_GREEN : C_BRIGHT, b->t0 > 0.5 ? "⚙" : "✗");
+            render_plain(L, t, b->text.n, W, C_DIM, prefix);
+            break;
+        }
+        case B_ASK: {
+            char prefix[64];
+            snprintf(prefix, sizeof prefix, "  %s? ", C_BRIGHT);
+            render_plain(L, t, b->text.n, W, C_TEXT, prefix);
+            push_text(L, "  " C_BRIGHT "s" C_DIM " sim · " C_BRIGHT "a" C_DIM " sempre para esta ferramenta · "
+                         C_BRIGHT "n" C_DIM " não" C_RESET);
+            break;
+        }
         case B_ERROR: {
             char prefix[64];
             snprintf(prefix, sizeof prefix, "  %s! ", C_BRIGHT);
@@ -1126,10 +1140,63 @@ static void sink_done(Glm53fTurnSink *k, const char *stats, int state)
     pthread_mutex_unlock(&g_mu);
 }
 
+/* the agent's tool calls, and its question before one that writes or runs: the worker
+ * waits on g_ask_cv until the UI thread reads s, a or n (or esc) */
+static pthread_cond_t g_ask_cv;
+static volatile int   g_ask_state, g_ask_answer;    /* state 1: a question is open */
+static int            g_ask_block;                  /* its block */
+
+static void sink_tool(Glm53fTurnSink *k, const char *title, const char *summary, int ok)
+{
+    (void)k;
+    pthread_mutex_lock(&g_mu);
+    Block *b = block_new(B_TOOL);
+    if (b) { buf_str(&b->text, title); buf_str(&b->text, " · "); buf_str(&b->text, summary); b->t0 = ok ? 1.0 : 0.0; }
+    pthread_mutex_unlock(&g_mu);
+}
+
+static int sink_approve(Glm53fTurnSink *k, const char *title, const char *detail)
+{
+    (void)k;
+    pthread_mutex_lock(&g_mu);
+    Block *b = block_new(B_ASK);
+    if (b) {
+        buf_str(&b->text, "permitir ");
+        buf_str(&b->text, title);
+        if (detail && *detail) { buf_str(&b->text, "\n"); buf_str(&b->text, detail); }
+    }
+    g_ask_block = g_nblocks - 1;
+    g_ask_answer = 0;
+    g_ask_state = 1;
+    g_offset = 0;
+    g_dirty = 1;
+    while (g_ask_state == 1) pthread_cond_wait(&g_ask_cv, &g_mu);
+    const int a = g_ask_answer;
+    pthread_mutex_unlock(&g_mu);
+    return a;
+}
+
+/* The UI thread's answer to the open question (under g_mu). */
+static void ask_answer(int a)
+{
+    if (g_ask_state != 1) return;
+    g_ask_answer = a;
+    g_ask_state = 0;
+    if (g_ask_block < g_nblocks && g_blocks[g_ask_block].kind == B_ASK) {
+        Block *b = &g_blocks[g_ask_block];
+        char *nl = b->text.p ? strchr(b->text.p, '\n') : NULL;   /* keep the title line */
+        if (nl) { b->text.n = (size_t)(nl - b->text.p); *nl = 0; }
+        buf_str(&b->text, a == 2 ? " — sempre" : a == 1 ? " — sim" : " — não");
+        b->kind = B_NOTE;
+    }
+    g_dirty = 1;
+    pthread_cond_broadcast(&g_ask_cv);
+}
+
 static void *worker_main(void *arg)
 {
     (void)arg;
-    Glm53fTurnSink k = { sink_status, sink_reasoning, sink_thought, sink_answer, sink_done, NULL };
+    Glm53fTurnSink k = { sink_status, sink_reasoning, sink_thought, sink_answer, sink_done, NULL, sink_tool, sink_approve };
     if (glm53f_chat_turn(g_s, &g_job, &k) != 0) g_fatal = 1;
     pthread_mutex_lock(&g_mu);
     g_worker_done = 1;
@@ -1280,10 +1347,17 @@ static void draw(Glm53fChat *s)
     }
     {   /* settings row, with the state on the right */
         char left[200], plain[160], right[120];
-        snprintf(plain, sizeof plain, "%s · reasoning %s", s->e->name, s->reasoning);
-        snprintf(left, sizeof left, C_BRIGHT "%s" C_DIM " · reasoning %s", s->e->name, s->reasoning);
+        static const char *lv[] = { "", "level 1 · quick", "level 2 · agent" };
+        if (s->agent_level > 0 && s->e->agent) {
+            snprintf(plain, sizeof plain, "%s · %s%s", s->e->name, lv[s->agent_level], s->auto_approve ? " · auto" : "");
+            snprintf(left, sizeof left, C_BRIGHT "%s" C_DIM " · %s%s", s->e->name, lv[s->agent_level], s->auto_approve ? " · auto" : "");
+        } else {
+            snprintf(plain, sizeof plain, "%s · reasoning %s", s->e->name, s->reasoning);
+            snprintf(left, sizeof left, C_BRIGHT "%s" C_DIM " · reasoning %s", s->e->name, s->reasoning);
+        }
         const int lc = cols_of(plain, (int)strlen(plain));
-        if (g_busy) snprintf(right, sizeof right, "esc interrupt%s", g_nqueue ? " · queued" : "");
+        if (g_ask_state == 1) snprintf(right, sizeof right, "s / a / n");
+        else if (g_busy) snprintf(right, sizeof right, "esc interrupt%s", g_nqueue ? " · queued" : "");
         else        snprintf(right, sizeof right, "%s", g_nqueue ? "queued" : "");
         const int rc = cols_of(right, (int)strlen(right));
         buf_fmt(&f, "\033[%d;1H\033[2K  %s%s", row++, bar, left);
@@ -1331,6 +1405,22 @@ static int on_input(const char *p, int n, int view_rows)
     int i = 0;
     while (i < n) {
         const unsigned char c = (unsigned char)p[i];
+        if (g_ask_state == 1) {                          /* an open question takes the keys */
+            if (c == 0x1b && i + 1 < n && (p[i + 1] == '[' || p[i + 1] == 'O')) {   /* arrows, mouse: not an answer */
+                int j = i + 2;
+                while (j < n && !((unsigned char)p[j] >= 0x40 && (unsigned char)p[j] <= 0x7e)) j++;
+                i = j + 1;
+                continue;
+            }
+            int a = -1;
+            if (c == 's' || c == 'S' || c == 'y' || c == 'Y') a = 1;
+            else if (c == 'a' || c == 'A') a = 2;
+            else if (c == 'n' || c == 'N' || c == 0x1b || c == 0x03) a = 0;
+            if (c == 0x1b || c == 0x03) glm53f_chat_stop();
+            if (a >= 0) { pthread_mutex_lock(&g_mu); ask_answer(a); pthread_mutex_unlock(&g_mu); }
+            i++;
+            continue;
+        }
         if (g_paste) {
             if (c == 0x1b && i + 5 < n && !memcmp(p + i, "\033[201~", 6)) { g_paste = 0; i += 6; continue; }
             if (c == '\r') { ed_insert("\n", 1); if (i + 1 < n && p[i + 1] == '\n') i++; }
@@ -1464,6 +1554,7 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
     if (term_open(forced) != 0) return -1;
     g_s = s;
     pthread_mutex_init(&g_mu, NULL);
+    pthread_cond_init(&g_ask_cv, NULL);
     block_add(B_SPLASH, NULL);
 
     char in[4096];
@@ -1505,6 +1596,9 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
     }
     if (g_busy) {                                        /* leaving mid-answer: stop it first */
         glm53f_chat_stop();
+        pthread_mutex_lock(&g_mu);
+        ask_answer(0);
+        pthread_mutex_unlock(&g_mu);
         pthread_join(g_worker, NULL);
         glm53f_chat_input_free(&g_job);
         g_busy = 0;

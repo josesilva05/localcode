@@ -46,6 +46,14 @@ typedef struct Glm53fEngine {
      * precision), _STATS (the "engine" line of /stats). */
     void (*describe)(struct Glm53fEngine *e, int what, char *buf, size_t cap);
     void (*counters)(struct Glm53fEngine *e, Glm53fCounters *c);
+    /* 1 when the engine's chat template is Qwen's with <tool_call> functions, which the
+     * agent (lc_agent.c) writes directly; 0 keeps the session to plain chat. */
+    int  agent;
+    /* The whole sequence state to a file and back (NULL when the engine cannot): the agent
+     * keeps its system prompt read once. Both return the position, or -1; after a failed
+     * load the state is undefined (reset). */
+    int  (*state_save)(struct Glm53fEngine *e, const char *path);
+    int  (*state_load)(struct Glm53fEngine *e, const char *path);
 } Glm53fEngine;
 
 enum { GLM53F_DESC_BANNER, GLM53F_DESC_SETTINGS, GLM53F_DESC_STATS };
@@ -81,6 +89,10 @@ typedef struct {
     double       last_spt;       /* s/token of the last answer, 0 before one   */
     double       spt_hist[16];   /* s/token of the last answers, oldest first  */
     int          n_spt;
+    /* the agent (lc_agent.c): 0 plain chat, 1 quick (reading tools), 2 agent (every tool) */
+    int          agent_level;
+    int          auto_approve;   /* 1: writes and commands run without asking  */
+    unsigned     always;         /* tools the user allowed for the session (bit per tool) */
 } Glm53fChat;
 
 int glm53f_chat_run(Glm53fChat *s);
@@ -96,6 +108,11 @@ typedef struct Glm53fTurnSink {
     void (*answer)(struct Glm53fTurnSink *k, const char *bytes, int n);
     void (*done)(struct Glm53fTurnSink *k, const char *stats, int interrupted);
     void *ctx;
+    /* agent turns: a tool call carried out (title "edit_file src/a.c", one-line summary, ok),
+     * and the question before one that changes files or runs a program: returns 0 no,
+     * 1 yes, 2 yes for this tool until the session ends. NULL approve: always no. */
+    void (*tool)(struct Glm53fTurnSink *k, const char *title, const char *summary, int ok);
+    int  (*approve)(struct Glm53fTurnSink *k, const char *title, const char *detail);
 } Glm53fTurnSink;
 
 /* What a line typed by the user asks for. */
@@ -116,6 +133,12 @@ void glm53f_chat_input_free(Glm53fInput *in);
 /* Run one turn. g_stop (glm53f_chat_stop) ends it early; returns -1 if the engine failed. */
 int  glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k);
 void glm53f_chat_stop(void);
+/* the flag glm53f_chat_stop raises (cleared when a turn starts), for long tool calls */
+volatile int *glm53f_chat_stop_flag(void);
+/* Append to the session's Markdown transcript (/save). */
+void glm53f_chat_log(Glm53fChat *s, const char *text);
+/* An agent turn (lc_agent.c); glm53f_chat_turn hands over to it when agent_level > 0. */
+int  lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k);
 
 /* "context 88/2048 (4%)" and the settings line, for status rows. */
 void glm53f_chat_gauge(const Glm53fChat *s, char *buf, size_t cap);

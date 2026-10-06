@@ -14,6 +14,7 @@
 #include "q38_gpu.h"
 #endif
 #include "glm53f_chat.h"
+#include "lc_tools.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +132,22 @@ static void qw_turn_text(Glm53fEngine *e, int first, const char *level, const ch
         snprintf(out, cap, "<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n", msg);
 }
 
+#ifdef Q38_CUDA
+static int qw_state_save(Glm53fEngine *e, const char *path)
+{
+    QwenEngine *q = (QwenEngine *)e->impl;
+    return q->gpu >= 0 ? q38_gpu_state_file(q->m, path, 1) : -1;
+}
+
+static int qw_state_load(Glm53fEngine *e, const char *path)
+{
+    QwenEngine *q = (QwenEngine *)e->impl;
+    const int n = q->gpu >= 0 ? q38_gpu_state_file(q->m, path, 0) : -1;
+    e->cached = q->m->n_past;
+    return n;
+}
+#endif
+
 static void qw_describe(Glm53fEngine *e, int what, char *buf, size_t cap)
 {
     QwenEngine *q = (QwenEngine *)e->impl;
@@ -144,9 +161,10 @@ static void qw_describe(Glm53fEngine *e, int what, char *buf, size_t cap)
         snprintf(buf, cap, "GGUF weights as stored · expert cache %.1f GB · trunk on %s · %d threads",
                  q->m->cache_budget / 1e9, q->gpu >= 0 ? (q->gpu ? "gpu 1" : "gpu 0") : "the cpu", q->threads);
     else
-        snprintf(buf, cap, "expert cache %.1f of %.1f GB (%lld experts) · trunk on %s · %d threads",
+        snprintf(buf, cap, "expert cache %.1f of %.1f GB (%lld experts) · trunk on %s · %d threads · disk busy %d%%%s",
                  q->m->cache_used / 1e9, q->m->cache_budget / 1e9, (long long)q->m->cache_count,
-                 q->gpu >= 0 ? (q->gpu ? "gpu 1" : "gpu 0") : "the cpu", q->threads);
+                 q->gpu >= 0 ? (q->gpu ? "gpu 1" : "gpu 0") : "the cpu", q->threads, q38_gguf_disk_busy(),
+                 q38_gguf_disk_pause_ms() ? " (reads paused to keep it below the limit)" : "");
 }
 
 static void qw_counters(Glm53fEngine *e, Glm53fCounters *o)
@@ -163,7 +181,8 @@ static void usage(void)
 {
     fprintf(stderr,
             "localcode - Qwen3.8-Flash-Next on this engine\n\n"
-            "  localcode [model.gguf] [--ctx N] [--gen N] [--reasoning xhigh|medium|low] [--threads N]\n\n"
+            "  localcode [model.gguf] [--ctx N] [--gen N] [--level 0|1|2] [--reasoning xhigh|medium|low] [--threads N]\n\n"
+            "--level: 0 chat, 1 quick (reads the files of this folder), 2 agent (edits files, runs commands; default)\n"
             "The model is any shard of the split GGUF, or LOCALCODE_MODEL in the environment.\n");
 }
 
@@ -174,7 +193,7 @@ int main(int argc, char **argv)
     SetConsoleCP(CP_UTF8);
 #endif
     const char *path = getenv("LOCALCODE_MODEL");
-    int ctx = 0, gen = 2048, threads = 0;
+    int ctx = 0, gen = 2048, threads = 0, agent_level = 2;
     double cache_gb = 0;
     int gpu = -1;                       /* -1: try GPU 1 then 0; -2: --cpu */
     double preload_gb = 24.0;           /* experts read into RAM at start, most used first */
@@ -184,6 +203,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reasoning") && i + 1 < argc) level = argv[++i];
+        else if (!strcmp(argv[i], "--level") && i + 1 < argc) agent_level = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gpu") && i + 1 < argc) gpu = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cpu")) gpu = -2;
@@ -281,11 +301,17 @@ int main(int argc, char **argv)
     e.turn_text = qw_turn_text;
     e.describe = qw_describe;
     e.counters = qw_counters;
+    e.agent = 1;                        /* the GGUF template is Qwen's, with <tool_call> functions */
+#ifdef Q38_CUDA
+    if (on_gpu >= 0) { e.state_save = qw_state_save; e.state_load = qw_state_load; }
+#endif
 
     Glm53fChat s;
     memset(&s, 0, sizeof s);
     s.e = &e;
     s.reasoning = QWEN_LEVELS[li].name;
+    s.agent_level = agent_level < 0 ? 0 : agent_level > 2 ? 2 : agent_level;
+    if (lc_tools_init(NULL) != 0) s.agent_level = 0;   /* no working directory: chat only */
     if (gen >= e.cap) gen = e.cap / 2;
     s.gen = gen;
     s.load_s = now_s() - t0;
