@@ -1850,6 +1850,73 @@ extern "C" int q38_gpu_state(void *model, int save)
     return 0;
 }
 
+/* The whole sequence state at n_past to a file, or back from one: the token ids, the attention
+ * and indexer caches up to n_past, the recurrent states and the PLE history. A prompt's fixed
+ * beginning (a harness's system prompt and tools) is then read once, not once per
+ * conversation. Returns the position (n_past), or -1 (the state is then undefined: reset). */
+#define Q38_STATE_MAGIC 0x53383351          /* "Q38S" */
+#define Q38_STATE_VERSION 1
+extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
+{
+    q38_model *m = (q38_model *)model;
+    const q38_cfg *c = &m->c;
+    if (!G) return -1;
+    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
+    const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
+    const size_t ring_b = G->ple_ring ? (size_t)(c->ple_kern - 1) * c->ple_ngram * c->hc * c->n_embd * sizeof(float) : 0;
+    const size_t kv_row = (size_t)c->n_head_kv * c->head_dim * sizeof(float), ix_row = (size_t)c->idx_dim * sizeof(float);
+    /* what the file's layout depends on: a state from another shape is refused */
+    const int64_t shape[10] = { Q38_STATE_MAGIC, Q38_STATE_VERSION, c->n_layer, (int64_t)kv_row, (int64_t)ix_row,
+                                c->idx_ratio, (int64_t)conv_b, (int64_t)ssm_b, (int64_t)ring_b, c->n_vocab };
+    FILE *f = fopen(path, save ? "wb" : "rb");
+    if (!f) return -1;
+    int64_t n = save ? m->n_past : -1;
+    int ok = 1;
+    if (save) {
+        ok = fwrite(shape, sizeof shape, 1, f) == 1 && fwrite(&n, sizeof n, 1, f) == 1;
+    } else {
+        int64_t got[10];
+        ok = fread(got, sizeof got, 1, f) == 1 && memcmp(got, shape, sizeof got) == 0 && fread(&n, sizeof n, 1, f) == 1
+             && n > 0 && n < m->max_ctx;
+    }
+    size_t big = ring_b > conv_b ? ring_b : conv_b;
+    if (ssm_b > big) big = ssm_b;
+    if (ok && (size_t)n * kv_row > big) big = (size_t)n * kv_row;
+    if (ok && (size_t)n * ix_row > big) big = (size_t)n * ix_row;
+    uint8_t *buf = ok ? (uint8_t *)malloc(big) : NULL;
+    if (!buf) ok = 0;
+    cudaSetDevice(G->dev);
+    if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = 0;
+    /* one device array: through buf to the file, or from the file to the device */
+    auto io = [&](void *dev, size_t bytes) {
+        if (!ok || !bytes) return;
+        if (save) {
+            ok = cudaMemcpy(buf, dev, bytes, cudaMemcpyDeviceToHost) == cudaSuccess && fwrite(buf, 1, bytes, f) == bytes;
+        } else {
+            ok = fread(buf, 1, bytes, f) == bytes && cudaMemcpy(dev, buf, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+    };
+    if (ok) ok = save ? fwrite(m->toks, sizeof(int), (size_t)n, f) == (size_t)n : fread(m->toks, sizeof(int), (size_t)n, f) == (size_t)n;
+    for (int il = 0; il < c->n_layer && ok; il++) {
+        if (G->conv[il]) io(G->conv[il], conv_b);
+        if (G->ssm[il]) io(G->ssm[il], ssm_b);
+        if (G->kc[il]) { io(G->kc[il], (size_t)n * kv_row); io(G->vc[il], (size_t)n * kv_row); }
+        if (G->idx_raw[il]) {
+            io(G->idx_raw[il], (size_t)n * ix_row);
+            io(G->idx_pool[il], (size_t)(n / c->idx_ratio + 1) * ix_row);   /* with the partial block */
+        }
+    }
+    if (ring_b) io(G->ple_ring, ring_b);
+    free(buf);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        if (save) remove(path);
+        return -1;
+    }
+    if (!save) m->n_past = (int)n;
+    return (int)n;
+}
+
 /* Times each trunk matrix-vector product of one recurrent and one attention layer on the
  * device (kept busy, so at full clocks) and the per-token total they add up to. */
 extern "C" int q38_gpu_mvbench(void *model)

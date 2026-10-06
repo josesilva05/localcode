@@ -52,6 +52,11 @@ Q38API void    q38api_reset(q38api *h);
  * GPU). q38api_restore goes back to it: returns the position, or -1 when nothing is saved. */
 Q38API int     q38api_snapshot(q38api *h);
 Q38API int     q38api_restore(q38api *h);
+/* The sequence state at the current position to a file, and back (the position becomes the
+ * file's; the remembered state of q38api_snapshot is dropped). Both return that position, or
+ * -1; after a failed load the state is undefined (q38api_reset). GPU only. */
+Q38API int     q38api_state_save(q38api *h, const char *path);
+Q38API int     q38api_state_load(q38api *h, const char *path);
 /* Writes the usage profile now (also done by q38api_close). Returns 0 or -1. */
 Q38API int     q38api_save_profile(q38api *h);
 

@@ -41,6 +41,9 @@ int  q38_gpu_forward(void *model, int token);
  * With n_past set back to the position of the save, the model continues from there: the
  * attention and indexer caches are indexed by position. Returns 0 or -1. */
 int  q38_gpu_state(void *model, int save);
+/* The whole sequence state at n_past (also the caches up to it and the token ids) to a file
+ * (save = 1) or back; returns the position, or -1 (after a failed load: reset). */
+int  q38_gpu_state_file(void *model, const char *path, int save);
 
 #ifdef __cplusplus
 }

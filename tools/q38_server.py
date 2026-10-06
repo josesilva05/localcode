@@ -20,11 +20,14 @@ conversation, so usually only the new messages are read.
 """
 import argparse
 import codecs
+import contextlib
 import ctypes
 import datetime
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -75,12 +78,17 @@ class Engine:
             "q38api_eval": (I, [P, ctypes.POINTER(I), I, ctypes.POINTER(ctypes.c_float)]),
             "q38api_reset": (None, [P]),
             "q38api_snapshot": (I, [P]), "q38api_restore": (I, [P]),
+            "q38api_state_save": (I, [P, ctypes.c_char_p]), "q38api_state_load": (I, [P, ctypes.c_char_p]),
             "q38api_save_profile": (I, [P]),
         }
         for name, (res, args) in sig.items():
             f = getattr(lib, name)
             f.restype, f.argtypes = res, args
         self.lib = lib
+        # saved prompt beginnings (see _from_prefix): only valid for this model and this build
+        self.prefix_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "localcode", "prefix")
+        self.prefix_tag = "%s|%d|%d|%d" % (os.path.abspath(model), os.path.getsize(model), ctx,
+                                           int(os.path.getmtime(dll)))
         self.h = lib.q38api_open(model.encode("utf-8"), ctx, gpu, preload_gb)
         if not self.h:
             raise RuntimeError("the engine could not open " + model)
@@ -102,6 +110,16 @@ class Engine:
         for t in ("<|im_end|>", "<|endoftext|>"):
             eos.add(lib.q38api_token_id(self.h, t.encode()))
         self.eos = {e for e in eos if e >= 0}
+        self.im_start = lib.q38api_token_id(self.h, b"<|im_start|>")
+        self.parked = []         # [(tokens, file)]: conversations set aside for another prompt (_park)
+        self.park_seq = 0
+        if os.path.isdir(self.prefix_dir):
+            for f in os.listdir(self.prefix_dir):
+                if f.endswith(".park"):
+                    try:
+                        os.remove(os.path.join(self.prefix_dir, f))
+                    except OSError:
+                        pass
         self.live = []           # the tokens the engine state holds (n_past == len(live))
         self.snap = -1           # len(live) at the saved state, -1 = none
         self.snap_logits = None
@@ -121,6 +139,21 @@ class Engine:
             raise RuntimeError("the engine failed while reading tokens")
         self.live.extend(toks)
 
+    # a prompt's first turn (a harness's system prompt with its tools) at least this long is kept
+    # in a file once read: every new conversation starts with it (Q38_PREFIX_MIN, 0 = never)
+    PREFIX_MIN = int(os.environ.get("Q38_PREFIX_MIN", "1024"))
+    PREFIX_FILES = 4
+
+    def prefix_len(self, prompt):
+        """Where the prompt's second turn starts (its second <|im_start|>), or 0."""
+        seen = 0
+        for i, t in enumerate(prompt):
+            if t == self.im_start:
+                seen += 1
+                if seen == 2:
+                    return i
+        return 0
+
     def prepare(self, prompt):
         """Bring the state to the end of prompt with the next-token logits in self.logits.
         Returns how many prompt tokens did not have to be read."""
@@ -129,13 +162,18 @@ class Engine:
         lim = min(len(live), n)
         while common < lim and live[common] == prompt[common]:
             common += 1
-        if common == len(live) and n > common:                       # it extends what the engine holds
+        P = self.prefix_len(prompt) if self.PREFIX_MIN > 0 else 0
+        if P < self.PREFIX_MIN or n <= P:
+            P = 0
+        parked = self._parked_for(prompt)
+        best = max(P, len(parked[0]) if parked else 0)   # what a file would spare
+        if common == len(live) and n > common and common >= best:    # it extends what the engine holds
             self._eval(prompt[common:])
             reused = common
-        elif self.snap >= 0 and self.snap <= common and self.snap_logits is not None:
+        elif self.snap >= 0 and best <= self.snap <= common and self.snap_logits is not None:
             if self.snap < len(live) or self.lib.q38api_n_past(self.h) != self.snap:
                 if self.lib.q38api_restore(self.h) < 0:
-                    return self._from_start(prompt)
+                    return self._from_start(prompt, P)
                 del self.live[self.snap:]
             if n > self.snap:
                 self._eval(prompt[self.snap:])
@@ -143,14 +181,120 @@ class Engine:
                 self.logits[:] = self.snap_logits
             reused = self.snap
         else:
-            return self._from_start(prompt)
+            self._park()
+            if parked and len(parked[0]) >= P and self._unpark(parked):
+                self._eval(prompt[len(parked[0]):])
+                self._save()
+                return len(parked[0])
+            return self._from_start(prompt, P)
         self._save()
         return reused
 
-    def _from_start(self, prompt):
+    # conversations set aside while another prompt (a session title, another session) used the
+    # engine: their next turn continues from the file instead of reading everything again
+    PARKED = 2
+
+    def _parked_for(self, prompt):
+        """The longest set-aside conversation the prompt continues, or None."""
+        best = None
+        for toks, path in self.parked:
+            k = len(toks)
+            if k < len(prompt) and (best is None or k > len(best[0])) and prompt[:k] == toks:
+                best = (toks, path)
+        return best
+
+    def _park(self):
+        """The conversation the engine holds to a file, before another prompt takes its place."""
+        live = self.live
+        if len(live) < max(self.PREFIX_MIN, 1) or any(t == live for t, _ in self.parked):
+            return
+        try:
+            os.makedirs(self.prefix_dir, exist_ok=True)
+            if shutil.disk_usage(self.prefix_dir).free < 20e9:
+                return
+        except OSError:
+            return
+        path = os.path.join(self.prefix_dir, "%d-%d.park" % (os.getpid(), self.park_seq))
+        self.park_seq += 1
+        t0 = time.time()
+        if self.lib.q38api_state_save(self.h, path.encode("mbcs" if os.name == "nt" else "utf-8")) != len(live):
+            return
+        self.parked.insert(0, (list(live), path))
+        for _, old in self.parked[self.PARKED:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        del self.parked[self.PARKED:]
+        log("conversation of %d tokens set aside in %.1f s" % (len(live), time.time() - t0))
+
+    def _unpark(self, parked):
+        toks, path = parked
+        t0 = time.time()
+        if self.lib.q38api_state_load(self.h, path.encode("mbcs" if os.name == "nt" else "utf-8")) == len(toks):
+            self.live = list(toks)
+            self.snap = -1
+            log("conversation of %d tokens taken back in %.1f s" % (len(toks), time.time() - t0))
+            return True
+        self.parked = [p for p in self.parked if p[1] != path]
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        self.lib.q38api_reset(self.h)
+        self.live, self.snap = [], -1
+        return False
+
+    def _prefix_path(self, toks):
+        key = hashlib.sha1(self.prefix_tag.encode("utf-8") + np.asarray(toks, dtype=np.int32).tobytes()).hexdigest()
+        return os.path.join(self.prefix_dir, key[:20] + ".q38s")
+
+    def _keep_prefix_files(self):
+        try:
+            files = sorted((os.path.join(self.prefix_dir, f) for f in os.listdir(self.prefix_dir) if f.endswith(".q38s")),
+                           key=os.path.getmtime, reverse=True)
+            for f in files[self.PREFIX_FILES:]:
+                os.remove(f)
+        except OSError:
+            pass
+
+    def _from_start(self, prompt, P=0):
+        """Read prompt into an empty state. Its first P tokens come from their file when an
+        earlier prompt began the same way, and go into one otherwise."""
+        path = self._prefix_path(prompt[:P]) if P else None
+        if path and os.path.exists(path):
+            t0 = time.time()
+            got = self.lib.q38api_state_load(self.h, path.encode("mbcs" if os.name == "nt" else "utf-8"))
+            if got == P:
+                os.utime(path)
+                self.live = list(prompt[:P])
+                self.snap = -1
+                log("prompt beginning: %d tokens from %s in %.1f s" % (P, os.path.basename(path), time.time() - t0))
+                self._eval(prompt[P:])
+                self._save()
+                return P
+            log("prompt beginning %s does not load; reading the prompt" % os.path.basename(path))
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         self.lib.q38api_reset(self.h)
         self.live = []
         self.snap = -1
+        if path:
+            self._eval(prompt[:P])
+            free = shutil.disk_usage(os.path.dirname(self.prefix_dir)).free if os.path.isdir(
+                os.path.dirname(self.prefix_dir)) else 0
+            if free > 20e9:                    # never fill the disk (the file is a few hundred MB)
+                os.makedirs(self.prefix_dir, exist_ok=True)
+                tmp = path + ".tmp"
+                t0 = time.time()
+                if self.lib.q38api_state_save(self.h, tmp.encode("mbcs" if os.name == "nt" else "utf-8")) == P:
+                    os.replace(tmp, path)
+                    self._keep_prefix_files()
+                    log("prompt beginning: %d tokens kept in %s (%.0f MB, %.1f s)" %
+                        (P, os.path.basename(path), os.path.getsize(path) / 1e6, time.time() - t0))
+            prompt = prompt[P:]
         self._eval(prompt)
         self._save()
         return 0
@@ -386,12 +530,36 @@ class Server:
         self.engine = None
         self.template = None
         self.lock = threading.Lock()
+        self.cv = threading.Condition()
+        self.turns_waiting = 0              # requests with tools (a conversation's turns) waiting or running
         self.model_path = os.path.abspath(args.model)
         self.model_name = os.path.basename(self.model_path)
         if self.model_name.lower().endswith(".gguf"):
             self.model_name = self.model_name[:-5]
         self.loading = True
         self.error = None
+
+    @contextlib.contextmanager
+    def turn(self, side):
+        """The engine for one request. With --turns-first a side request (no tools: a harness
+        asking for a session title as the conversation starts) lets a conversation's turn sent
+        with it, or waiting, go first: the person waits for the answer, not for the title."""
+        side = side and self.args.turns_first
+        if side:
+            time.sleep(0.3)
+            with self.cv:
+                self.cv.wait_for(lambda: self.turns_waiting == 0, timeout=900)
+        else:
+            with self.cv:
+                self.turns_waiting += 1
+        try:
+            with self.lock:
+                yield
+        finally:
+            if not side:
+                with self.cv:
+                    self.turns_waiting -= 1
+                    self.cv.notify_all()
 
     def load(self):
         try:
@@ -576,7 +744,7 @@ def make_handler(srv):
                 return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": srv.model_name,
                         "system_fingerprint": "q38", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-            with srv.lock:
+            with srv.turn(not tools):
                 t0 = time.time()
                 alive = True
                 if stream:
@@ -818,7 +986,8 @@ def start_harness(args):
         return None
     env = dict(os.environ)
     host = "127.0.0.1" if args.host in ("0.0.0.0", "::", "") else args.host
-    env["LLAMACPP_BASE_URL"] = "http://%s:%d" % (host, args.port)      # the llamacpp route's address
+    # the address of this API for the harness's localcode route (and for a profile still on the llamacpp route)
+    env["LOCALCODE_BASE_URL"] = env["LLAMACPP_BASE_URL"] = "http://%s:%d" % (host, args.port)
     logdir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "localcode")
     os.makedirs(logdir, exist_ok=True)
     logpath = os.path.join(logdir, "harness.log")
@@ -880,6 +1049,9 @@ def main():
     ap.add_argument("--reasoning-effort", default="low", choices=["low", "medium", "xhigh"],
                     help="the template's reasoning effort when a request names none")
     ap.add_argument("--no-thinking", action="store_true", help="answer without a reasoning block by default")
+    ap.add_argument("--turns-first", action="store_true",
+                    help="requests without tools (session titles) wait for the conversation's turns; the answer "
+                         "comes sooner, but a title can outlast the harness's 60 s title timeout")
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--top-p", type=float, default=0.95)

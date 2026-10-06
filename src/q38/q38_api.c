@@ -136,6 +136,25 @@ int q38api_restore(q38api *h)
     return -1;
 }
 
+int q38api_state_save(q38api *h, const char *path)
+{
+#ifdef Q38_CUDA
+    if (h->gpu >= 0) return q38_gpu_state_file(&h->m, path, 1);
+#endif
+    (void)h; (void)path;
+    return -1;
+}
+
+int q38api_state_load(q38api *h, const char *path)
+{
+    h->snap_pos = -1;                  /* the remembered state is not this one any more */
+#ifdef Q38_CUDA
+    if (h->gpu >= 0) return q38_gpu_state_file(&h->m, path, 0);
+#endif
+    (void)path;
+    return -1;
+}
+
 int q38api_save_profile(q38api *h)
 {
     return h->prof[0] ? q38_model_profile_save(&h->m, h->prof) : -1;
