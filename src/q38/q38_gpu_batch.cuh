@@ -980,7 +980,11 @@ static int run_pairs(q38_model *m, int il, int dev2, int np, const float *X, flo
 /* The pairs whose expert is in neither VRAM pool: make the experts resident in RAM, then in
  * rounds of the staging area's size copy them to the device, rearrange them and run their
  * pairs there (adding into ygpu). */
-static int stream_experts(q38_model *m, int il, int N, const int *ptok, const int *pexp, const float *pw, int npc)
+/* last: the prompt's last batch. Its experts go into the cache as decoding uses it (least
+ * recent out), since the answer that follows needs mostly the same ones; earlier batches
+ * keep a full cache as it is (q38_model_experts_stream), or a long prompt would evict what
+ * its next batch needs. */
+static int stream_experts(q38_model *m, int il, int N, const int *ptok, const int *pexp, const float *pw, int npc, int last)
 {
     const q38_cfg *c = &m->c;
     const int E = c->n_embd, F = c->ff_exp, K = c->n_exp_used, NE = c->n_exp;
@@ -992,7 +996,7 @@ static int stream_experts(q38_model *m, int il, int N, const int *ptok, const in
     int nu = 0;
     for (int e = 0; e < NE; e++) slot_of[e] = -1;
     for (int p = 0; p < npc; p++) if (slot_of[pexp[p]] < 0) { slot_of[pexp[p]] = nu; ue[nu++] = pexp[p]; }
-    if (q38_model_experts_stream(m, il, ue, nu, data)) return -1;
+    if (last ? q38_model_experts_resident(m, il, ue, nu, data) : q38_model_experts_stream(m, il, ue, nu, data)) return -1;
     const q38_layer *L = &m->L[il];
     const int64_t bg = (int64_t)F * L->ex_gate.row_bytes, bu = (int64_t)F * L->ex_up.row_bytes;
     const int64_t eb = bg + bu + (int64_t)E * L->ex_down.row_bytes;
@@ -1218,7 +1222,7 @@ static int forward_batch_chunk(q38_model *m, const int *toks, int N, int want_la
                 for (int k = 0; k < ncpu[t]; k++) { ptok[npc] = t; pexp[npc] = cpu_ids[t][k]; pw[npc] = cpu_w[t][k]; npc++; }
             if (G->pst_n > 0 && N > 1 && !(getenv("Q38_PREFILL_CPU") && atoi(getenv("Q38_PREFILL_CPU")))) {
                 for (int64_t i = 0; i < (int64_t)N * E; i++) b->h_y[i] = 0.0f;
-                if (stream_experts(m, il, N, ptok, pexp, pw, npc)) return -1;
+                if (stream_experts(m, il, N, ptok, pexp, pw, npc, want_last)) return -1;
             } else if (q38_model_experts_batch(m, il, b->h_x, N, ptok, pexp, pw, npc, b->h_y)) {
                 return -1;
             }

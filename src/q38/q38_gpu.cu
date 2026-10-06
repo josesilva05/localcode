@@ -1887,13 +1887,23 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     if (!buf) ok = 0;
     cudaSetDevice(G->dev);
     if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = 0;
+    /* the file side in 8 MB pieces, each after the disk governor's quiet window */
+    auto fio = [&](uint8_t *p, size_t bytes) {
+        for (size_t done = 0; done < bytes;) {
+            const size_t k = bytes - done > ((size_t)8 << 20) ? (size_t)8 << 20 : bytes - done;
+            q38_gguf_disk_wait();
+            if ((save ? fwrite(p + done, 1, k, f) : fread(p + done, 1, k, f)) != k) return false;
+            done += k;
+        }
+        return true;
+    };
     /* one device array: through buf to the file, or from the file to the device */
     auto io = [&](void *dev, size_t bytes) {
         if (!ok || !bytes) return;
         if (save) {
-            ok = cudaMemcpy(buf, dev, bytes, cudaMemcpyDeviceToHost) == cudaSuccess && fwrite(buf, 1, bytes, f) == bytes;
+            ok = cudaMemcpy(buf, dev, bytes, cudaMemcpyDeviceToHost) == cudaSuccess && fio(buf, bytes);
         } else {
-            ok = fread(buf, 1, bytes, f) == bytes && cudaMemcpy(dev, buf, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+            ok = fio(buf, bytes) && cudaMemcpy(dev, buf, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
         }
     };
     if (ok) ok = save ? fwrite(m->toks, sizeof(int), (size_t)n, f) == (size_t)n : fread(m->toks, sizeof(int), (size_t)n, f) == (size_t)n;

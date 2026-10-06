@@ -776,15 +776,17 @@ void q38_model_set_cache(q38_model *m, double gb)
     if (budget > all) budget = all;
     budget -= (int64_t)m->tr_n * m->tr_size;     /* the prompt pass's buffers count against it */
     m->cache_budget = budget;
-    m->cache_budget0 = budget;
+    /* a size given is a cap; a size from the free RAM may grow when more RAM frees up later
+     * (a program closing, or the previous engine still handing its memory back at start) */
+    m->cache_budget0 = gb > 0 ? budget : all - (int64_t)m->tr_n * m->tr_size;
     lru_make_room(m, 0);
 }
 
 /* Keeps the free RAM above a floor (Q38_MEM_FLOOR_GB, default 3; 0 = off). The budget counts
  * the RAM free at start, before the harness and its browser open; once the free RAM runs out,
  * Windows trims the cache's pages to the pagefile and every hit becomes a page fault, which
- * costs far more than the reads the cache saves. Shrinks the budget below the floor and gives
- * it back, up to what set_cache chose, when RAM frees up. */
+ * costs far more than the reads the cache saves. Shrinks the budget below the floor, and
+ * grows it while more than 8 GB stay free (the margin set_cache keeps), up to cache_budget0. */
 static void mem_guard(q38_model *m)
 {
 #ifdef _WIN32
@@ -805,8 +807,8 @@ static void mem_guard(q38_model *m)
     if (avail < floor_b) {
         const int64_t want = m->cache_used - (floor_b - avail) - (int64_t)5e8;
         if (want < b) b = want;
-    } else if (avail > floor_b + (int64_t)4e9 && b < m->cache_budget0) {
-        b += (avail - floor_b - (int64_t)4e9) / 2;
+    } else if (avail > (int64_t)9e9 && b < m->cache_budget0 && m->cache_used + (int64_t)1e9 >= b) {
+        b += (avail - (int64_t)8e9) / 2;           /* only a full cache grows */
     }
     if (b > m->cache_budget0) b = m->cache_budget0;
     if (b < (int64_t)4e9) b = (int64_t)4e9;

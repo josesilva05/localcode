@@ -7,9 +7,113 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "pdh.lib")
+#endif
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+
+/* ------------------------------------------------------------- disk governor -- */
+/* The expert reads can keep the SSD busy all the time, and then every other program waits
+ * on the disk and the machine stops responding. Two guards:
+ *  - the model's file handles carry the low I/O priority hint, so other programs' reads
+ *    and writes go first (Q38_IO_PRIORITY=normal: as before);
+ *  - a thread measures the active time of the disk holding the model four times a second
+ *    and keeps it under the ceiling Q38_DISK_BUSY_MAX (percent, default 95; 0 = off): it
+ *    aims 20 points lower. While the disk is above that, every 250 ms starts with a quiet
+ *    window in which no read of the model starts, the same window for every thread (a
+ *    pause per thread lets the threads' reads overlap and the disk never goes idle); the
+ *    window doubles at once past the ceiling and shortens below the aim. */
+#ifdef _WIN32
+static volatile LONG g_disk_pause_ms;          /* the quiet window per 250 ms */
+static volatile LONG64 g_quiet_until;          /* GetTickCount64 at which reads may start again */
+static volatile LONG g_disk_busy = -1;         /* last active time, percent; -1 unknown */
+static volatile LONG g_gov_started;
+static wchar_t g_gov_drive[4];
+
+static void low_io_priority(HANDLE h)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("Q38_IO_PRIORITY"); on = !(e && !strcmp(e, "normal")); }
+    if (!on || h == INVALID_HANDLE_VALUE || !h) return;
+    FILE_IO_PRIORITY_HINT_INFO p;
+    p.PriorityHint = IoPriorityHintLow;
+    SetFileInformationByHandle(h, FileIoPriorityHintInfo, &p, sizeof p);
+}
+
+static DWORD WINAPI gov_main(LPVOID arg)
+{
+    (void)arg;
+    const char *e = getenv("Q38_DISK_BUSY_MAX");
+    const int ceiling = e ? atoi(e) : 95, target = ceiling - 20;
+    if (ceiling <= 0) return 0;
+    PDH_HQUERY q;
+    PDH_HCOUNTER c;
+    if (PdhOpenQueryW(NULL, 0, &q) != ERROR_SUCCESS) return 0;
+    if (PdhAddEnglishCounterW(q, L"\\PhysicalDisk(*)\\% Idle Time", 0, &c) != ERROR_SUCCESS) { PdhCloseQuery(q); return 0; }
+    PdhCollectQueryData(q);
+    for (;;) {
+        Sleep(250);
+        if (PdhCollectQueryData(q) != ERROR_SUCCESS) continue;
+        DWORD size = 0, count = 0;
+        if (PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &size, &count, NULL) != PDH_MORE_DATA) continue;
+        PDH_FMT_COUNTERVALUE_ITEM_W *items = (PDH_FMT_COUNTERVALUE_ITEM_W *)malloc(size);
+        if (!items) continue;
+        double idle = -1.0;
+        if (PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &size, &count, items) == ERROR_SUCCESS) {
+            for (DWORD i = 0; i < count; i++) {   /* the instance "0 C:" of the model's drive, else _Total */
+                if (wcsstr(items[i].szName, g_gov_drive)) { idle = items[i].FmtValue.doubleValue; break; }
+                if (!wcscmp(items[i].szName, L"_Total")) idle = items[i].FmtValue.doubleValue;
+            }
+        }
+        free(items);
+        if (idle < 0.0) continue;
+        if (idle > 100.0) idle = 100.0;
+        const int busy = (int)(100.0 - idle + 0.5);
+        InterlockedExchange(&g_disk_busy, busy);
+        LONG d = g_disk_pause_ms;
+        if (busy >= ceiling)        d = d * 2 > 40 ? d * 2 : 40;       /* past the ceiling: at once */
+        else if (busy > target)     d = d ? d * 3 / 2 + 1 : 8;
+        else if (busy < target - 5) d = d * 2 / 3;
+        if (d > 150) d = 150;
+        InterlockedExchange(&g_disk_pause_ms, d);
+        if (d > 0) InterlockedExchange64(&g_quiet_until, (LONG64)(GetTickCount64() + (ULONGLONG)d));
+    }
+}
+
+static void gov_start(const char *model_path)
+{
+    if (InterlockedExchange(&g_gov_started, 1)) return;
+    if (model_path[0] && model_path[1] == ':') {
+        g_gov_drive[0] = (wchar_t)(model_path[0] & ~32);
+    } else {
+        wchar_t cwd[MAX_PATH];
+        g_gov_drive[0] = GetCurrentDirectoryW(MAX_PATH, cwd) && cwd[1] == L':' ? cwd[0] : L'C';
+    }
+    g_gov_drive[1] = L':';
+    g_gov_drive[2] = 0;
+    HANDLE t = CreateThread(NULL, 0, gov_main, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+}
+
+static void gov_pause(void)
+{
+    for (;;) {
+        const LONG64 left = g_quiet_until - (LONG64)GetTickCount64();
+        if (left <= 0) return;
+        Sleep((DWORD)left);
+    }
+}
+
+int q38_gguf_disk_busy(void) { return (int)g_disk_busy; }
+int q38_gguf_disk_pause_ms(void) { return (int)g_disk_pause_ms; }
+#else
+int q38_gguf_disk_busy(void) { return -1; }
+int q38_gguf_disk_pause_ms(void) { return 0; }
 #endif
 
 #if defined(_MSC_VER)
@@ -289,6 +393,9 @@ static int split_count(const char *path, size_t *prefix_len)
 int q38_gguf_open(q38_gguf *g, const char *path)
 {
     memset(g, 0, sizeof *g);
+#ifdef _WIN32
+    gov_start(path);                            /* before the headers are read */
+#endif
     size_t plen = 0;
     int count = split_count(path, &plen);
     if (count > Q38_MAX_SHARDS) {
@@ -319,9 +426,12 @@ int q38_gguf_open(q38_gguf *g, const char *path)
                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, NULL);
         if (h == INVALID_HANDLE_VALUE) { fprintf(stderr, "q38_gguf: cannot open %s\n", g->paths[s]); q38_gguf_close(g); return -1; }
         g->fh[s] = (intptr_t)h;
+        low_io_priority(h);
         HANDLE hd = CreateFileA(g->paths[s], GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
         g->fhd[s] = hd == INVALID_HANDLE_VALUE ? 0 : (intptr_t)hd;
+        low_io_priority(hd);
+        gov_start(g->paths[s]);
 #else
         int fd = open(g->paths[s], O_RDONLY);
         if (fd < 0) { fprintf(stderr, "q38_gguf: cannot open %s\n", g->paths[s]); q38_gguf_close(g); return -1; }
@@ -396,7 +506,26 @@ int q38_gguf_read(const q38_gguf *g, const q38_tensor *t, int64_t off, void *dst
     if (off < 0 || nbytes < 0 || off + nbytes > t->nbytes) return -1;
     FILE *f = (FILE *)g->fp[t->shard];
     if (q38_fseek(f, t->offset + off, SEEK_SET)) return -1;
-    return fread(dst, 1, (size_t)nbytes, f) == (size_t)nbytes ? 0 : -1;
+    char *p = (char *)dst;
+    while (nbytes > 0) {                        /* 8 MB pieces, each after the disk governor */
+        const size_t n = nbytes > ((int64_t)8 << 20) ? (size_t)8 << 20 : (size_t)nbytes;
+#ifdef _WIN32
+        gov_pause();
+#endif
+        if (fread(p, 1, n, f) != n) return -1;
+        p += n;
+        nbytes -= (int64_t)n;
+    }
+    return 0;
+}
+
+/* Waits out the disk governor's quiet window, for the engine's other big disk transfers
+ * (state files) to go through the same gate. */
+void q38_gguf_disk_wait(void)
+{
+#ifdef _WIN32
+    gov_pause();
+#endif
 }
 
 #ifdef _WIN32
@@ -410,6 +539,7 @@ int q38_gguf_pread_multi(q38_gguf *g, int n, const q38_tensor *const *t, const i
                          const int64_t *nbytes)
 {
 #ifdef _WIN32
+    gov_pause();
     for (int c0 = 0; c0 < n; c0 += Q38_DIO_MAX) {
         const int cn = n - c0 < Q38_DIO_MAX ? n - c0 : Q38_DIO_MAX;
         OVERLAPPED ov[Q38_DIO_MAX];
@@ -477,7 +607,13 @@ int q38_gguf_pread(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int
     char *p = (char *)dst;
     while (done < nbytes) {
         int64_t want = nbytes - done;
+#ifdef _WIN32
+        /* pieces of 8 MB, so the disk governor can pause a long read between them */
+        if (want > ((int64_t)8 << 20)) want = (int64_t)8 << 20;
+        gov_pause();
+#else
         if (want > ((int64_t)1 << 30)) want = (int64_t)1 << 30;
+#endif
 #ifdef _WIN32
         OVERLAPPED ov;
         memset(&ov, 0, sizeof ov);
