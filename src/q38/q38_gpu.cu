@@ -578,8 +578,93 @@ __device__ __forceinline__ void scale_min_k4_d(int j, const uint8_t *q, int *d, 
 
 __device__ __forceinline__ int sc_byte(const uint32_t *w3, int i) { return (w3[i >> 2] >> (8 * (i & 3))) & 0xFF; }
 
+/* -- the IQ types (UD-IQ4_XS's experts): IQ4_NL, IQ4_XS, IQ3_S, kept as stored (a slot holds
+ * them unrearranged). A row is cut into chunks of 8 weights, each decoded to floats with
+ * q38_dequant_row's arithmetic and applied to two runs of 4 activations, x[o0..o0+4) and
+ * x[o1..o1+4); lane l takes chunks l, l+32, ... */
+__device__ const int8_t d_kv_iq4nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+__device__ const uint32_t d_iq3s_grid[512] = {
+#include "q38_iq3s_grid.inc"
+};
+
+__device__ __forceinline__ bool is_iq(int type) { return type == Q38_IQ4_NL || type == Q38_IQ4_XS || type == Q38_IQ3_S; }
+
+__device__ __forceinline__ int64_t iq_row_bytes(int type, int ne0)
+{
+    return type == Q38_IQ4_NL ? (int64_t)(ne0 / 32) * 18 : (int64_t)(ne0 / 256) * (type == Q38_IQ4_XS ? 136 : 110);
+}
+
+__device__ __forceinline__ int iq_chunks(int type, int ne0) { return type == Q38_IQ4_NL ? (ne0 / 32) * 4 : (ne0 / 256) * 32; }
+
+__device__ __forceinline__ void iq_chunk(int type, const uint8_t *w, int c, float *wt, int *o0, int *o1)
+{
+    if (type == Q38_IQ4_NL) {                       /* block of 32: bytes p..p+3 -> elements p.., 16+p.. */
+        const int b = c >> 2, p = (c & 3) * 4;
+        const uint8_t *blk = w + (int64_t)b * 18;
+        const float d = __half2float(__ushort_as_half((unsigned short)(blk[0] | (blk[1] << 8))));
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const int q = blk[2 + p + k];
+            wt[k] = d * (float)__ldg(&d_kv_iq4nl[q & 15]);
+            wt[4 + k] = d * (float)__ldg(&d_kv_iq4nl[q >> 4]);
+        }
+        *o0 = 32 * b + p;
+        *o1 = *o0 + 16;
+    } else if (type == Q38_IQ4_XS) {                /* super-block of 256: sub-block j, bytes p..p+3 */
+        const int sb = c >> 5, j = (c & 31) >> 2, p = (c & 3) * 4;
+        const uint8_t *blk = w + (int64_t)sb * 136;
+        const float d = __half2float(__ushort_as_half((unsigned short)(blk[0] | (blk[1] << 8))));
+        const int sh = blk[2] | (blk[3] << 8);
+        const int ls = ((blk[4 + j / 2] >> 4 * (j % 2)) & 0xf) | (((sh >> 2 * j) & 3) << 4);
+        const float dl = d * (ls - 32);
+        const uint8_t *qs = blk + 8 + 16 * j + p;
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            wt[k] = dl * (float)__ldg(&d_kv_iq4nl[qs[k] & 15]);
+            wt[4 + k] = dl * (float)__ldg(&d_kv_iq4nl[qs[k] >> 4]);
+        }
+        *o0 = 256 * sb + 32 * j + p;
+        *o1 = *o0 + 16;
+    } else {                                        /* IQ3_S: sub-block j, group pair l: 8 elements */
+        const int sb = c >> 5, j = (c & 31) >> 2, l = c & 3;
+        const uint8_t *blk = w + (int64_t)sb * 110;
+        const float d = __half2float(__ushort_as_half((unsigned short)(blk[0] | (blk[1] << 8))));
+        const uint8_t *qs = blk + 2 + 8 * j;
+        const int qh = blk[66 + j], signs = blk[74 + 4 * j + l];
+        const float db = d * (1 + 2 * ((blk[106 + j / 2] >> 4 * (j & 1)) & 0xf));
+        const uint32_t g1 = __ldg(&d_iq3s_grid[qs[2 * l + 0] | ((qh << (8 - 2 * l)) & 256)]);
+        const uint32_t g2 = __ldg(&d_iq3s_grid[qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)]);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            wt[k] = db * (float)((g1 >> (8 * k)) & 0xFF) * (signs & (1 << k) ? -1.f : 1.f);
+            wt[4 + k] = db * (float)((g2 >> (8 * k)) & 0xFF) * (signs & (1 << (k + 4)) ? -1.f : 1.f);
+        }
+        *o0 = 256 * sb + 32 * j + 8 * l;
+        *o1 = *o0 + 4;
+    }
+}
+
+__device__ __forceinline__ float iq_apply(const float *wt, const float *x, int o0, int o1)
+{
+    return wt[0] * x[o0] + wt[1] * x[o0 + 1] + wt[2] * x[o0 + 2] + wt[3] * x[o0 + 3] +
+           wt[4] * x[o1] + wt[5] * x[o1 + 1] + wt[6] * x[o1 + 2] + wt[7] * x[o1 + 3];
+}
+
+__device__ float iq_lane_dot(int type, const uint8_t *w, const float *xs, int ne0, int lane)
+{
+    float acc = 0.0f, wt[8];
+    const int n = iq_chunks(type, ne0);
+    for (int c = lane; c < n; c += 32) {
+        int o0, o1;
+        iq_chunk(type, w, c, wt, &o0, &o1);
+        acc += iq_apply(wt, xs, o0, o1);
+    }
+    return acc;
+}
+
 __device__ float lane_dot(int type, const uint8_t *w, const float *xs, int ne0, int lane)
 {
+    if (is_iq(type)) return iq_lane_dot(type, w, xs, ne0, lane);
     float acc = 0.0f;
     const int g = lane >> 3, t = lane & 7;          /* 4 groups of 8 lanes, one 32-block each */
     if (type == Q38_Q8_0) {
@@ -688,6 +773,8 @@ __device__ __forceinline__ void repack_unit(const uint8_t *src, uint8_t *dst, in
         const uint16_t v = ((const uint16_t *)(const void *)src)[w];
         uint8_t *o = k == 0 ? dst + (int64_t)rows * ne0 + i * 2 : dst + r * ne0 + b * 32 + 2 * (k - 1);
         *(uint16_t *)(void *)o = v;
+    } else if (is_iq(type)) {                       /* kept as stored: copied a 16-bit word at a time */
+        ((uint16_t *)(void *)dst)[w] = ((const uint16_t *)(const void *)src)[w];
     }
 }
 
@@ -697,6 +784,7 @@ __device__ __forceinline__ int64_t repack_units(int type, int rows, int ne0)
     if (type == Q38_Q5_K) return (int64_t)rows * (ne0 / 256) * 44;
     if (type == Q38_Q5_1) return (int64_t)rows * (ne0 / 32) * 6;
     if (type == Q38_Q8_0) return (int64_t)rows * (ne0 / 32) * 17;
+    if (is_iq(type)) return (int64_t)rows * iq_row_bytes(type, ne0) / 2;
     return 0;
 }
 
@@ -743,6 +831,7 @@ __device__ __forceinline__ void kscales(const uint8_t *hd, int j, float *s1, flo
 /* row r of a repacked matrix (base = start of the matrix region) times xs; warp-reduced by the caller */
 __device__ float lane_dot_rp(int type, const uint8_t *base, int rows, int r, const float *xs, int ne0, int lane)
 {
+    if (is_iq(type)) return iq_lane_dot(type, base + (int64_t)r * iq_row_bytes(type, ne0), xs, ne0, lane);
     float acc = 0.0f;
     if (type == Q38_Q4_K || type == Q38_Q5_K) {
         const int nsb = ne0 / 256, five = type == Q38_Q5_K;
@@ -1098,6 +1187,38 @@ __global__ void k_wait_flag(const volatile unsigned *flag, unsigned *seen)
     __threadfence_system();
 }
 
+/* Q6_K rows as stored (UD-IQ4_XS's output head): a warp per row; in each half (128) of a
+ * super-block lane l takes elements l, l+32, l+64, l+96, with q38_dequant_row's arithmetic
+ * d * sc * (q - 32). Block: ql[128], qh[64], int8 scales[16], fp16 d at 208. */
+__global__ void k_mv_q6_K(const uint8_t *w, int64_t row_bytes, int ne0, int rows, const float *x, float *y)
+{
+    const int r = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (r >= rows) return;
+    const int l = threadIdx.x, is = l / 16;
+    const uint8_t *row = w + (int64_t)r * row_bytes;
+    float acc = 0.0f;
+    for (int b = 0; b < ne0 / 256; b++) {
+        const uint8_t *blk = row + (int64_t)b * 210;
+        const float d = __half2float(__ushort_as_half((unsigned short)(blk[208] | (blk[209] << 8))));
+        const int8_t *sc = (const int8_t *)(blk + 192);
+        const float *xb = x + b * 256;
+#pragma unroll
+        for (int n = 0; n < 2; n++) {
+            const uint8_t *ql = blk + 64 * n, *qh = blk + 128 + 32 * n;
+            const int8_t *s = sc + 8 * n;
+            const int q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            const float *xh = xb + 128 * n;
+            acc += d * s[is + 0] * q1 * xh[l] + d * s[is + 2] * q2 * xh[l + 32] + d * s[is + 4] * q3 * xh[l + 64] +
+                   d * s[is + 6] * q4 * xh[l + 96];
+        }
+    }
+    acc = warp_sum(acc);
+    if (l == 0) y[r] = acc;
+}
+
 /* --------------------------------------------------------------------- host -- */
 static Gpu *G;
 
@@ -1174,6 +1295,8 @@ static int mv(const DMat *w, const float *x, float *y, cudaStream_t st)
         k_mv_f32_blk<<<(int)w->rows, 256, 0, st>>>((const float *)w->d, (int)w->ne0, x, y);
     } else if (w->type == Q38_F32) {
         k_mv_f32<<<grid, blk, 0, st>>>((const float *)w->d, (int)w->ne0, (int)w->rows, x, y);
+    } else if (w->type == Q38_Q6_K) {
+        k_mv_q6_K<<<grid, blk, 0, st>>>((const uint8_t *)w->d, w->row_bytes, (int)w->ne0, (int)w->rows, x, y);
     } else {
         fprintf(stderr, "q38_gpu: no device kernel for type %s\n", q38_type_name(w->type));
         return -1;

@@ -87,7 +87,7 @@ static int info(const q38_gguf *g)
         char dims[64];
         snprintf(dims, sizeof dims, "[%lld,%lld,%lld]", (long long)rows[r].ne[0], (long long)rows[r].ne[1], (long long)rows[r].ne[2]);
         printf("%-4d %-8s %-40s %-24s %10.1f%s\n", rows[r].count, q38_type_name(rows[r].type), rows[r].name, dims,
-               rows[r].bytes / 1048576.0, q38_quant_supported(rows[r].type) ? "" : "  (no dequant)");
+               rows[r].bytes / 1048576.0, q38_dequant_supported(rows[r].type) ? "" : "  (no dequant)");
     }
     printf("\ntotal %.2f GiB\n", total / 1073741824.0);
     free(rows);
@@ -100,7 +100,7 @@ static int dump(const q38_gguf *g, const char *name, int64_t first, int64_t n, c
     if (!t) { fprintf(stderr, "no tensor %s\n", name); return 1; }
     int64_t rows = t->ne[1] * t->ne[2] * t->ne[3];
     if (first < 0 || n <= 0 || first + n > rows) { fprintf(stderr, "rows %lld..%lld outside 0..%lld\n", (long long)first, (long long)(first + n), (long long)rows); return 1; }
-    if (!q38_quant_supported(t->type)) { fprintf(stderr, "type %s not supported\n", q38_type_name(t->type)); return 1; }
+    if (!q38_dequant_supported(t->type)) { fprintf(stderr, "type %s not supported\n", q38_type_name(t->type)); return 1; }
     int64_t rb = q38_row_bytes(t->type, t->ne[0]);
     unsigned char *raw = (unsigned char *)malloc((size_t)rb);
     float *y = (float *)malloc((size_t)t->ne[0] * sizeof(float));

@@ -513,7 +513,20 @@ __device__ __forceinline__ void lane_dot_rp_t(int type, const uint8_t *base, int
 {
 #pragma unroll
     for (int t = 0; t < XT; t++) acc[t] = 0.0f;
-    if (type == Q38_Q4_K || type == Q38_Q5_K) {
+    if (is_iq(type)) {                              /* a chunk decoded once, applied to every token */
+        const uint8_t *w = base + (int64_t)r * iq_row_bytes(type, ne0);
+        const int nch = iq_chunks(type, ne0);
+        for (int c = lane; c < nch; c += 32) {
+            float wt[8];
+            int o0, o1;
+            iq_chunk(type, w, c, wt, &o0, &o1);
+#pragma unroll
+            for (int t = 0; t < XT; t++) {
+                if (t >= n) break;
+                acc[t] += iq_apply(wt, X + xoff[t], o0, o1);
+            }
+        }
+    } else if (type == Q38_Q4_K || type == Q38_Q5_K) {
         const int nsb = ne0 / 256, five = type == Q38_Q5_K;
         const uint8_t *qs = base + (int64_t)r * (ne0 / 2);
         const uint8_t *qh = base + (int64_t)rows * (ne0 / 2) + (int64_t)r * nsb * 32;
@@ -742,7 +755,9 @@ static int mm(const DMat *w, const float *X, int ldx, float *Y, int ldy, int N, 
     const dim3 blk(32, ROWS_PER_BLOCK), grid(nblocks(w->rows, ROWS_PER_BLOCK), nblocks(N, TB));
     if (w->type == Q38_Q8R) k_mm_q8r<<<grid, blk, 0, st>>>((const int8_t *)w->d, w->scale, (int)w->ne0, (int)w->rows, X, ldx, Y, ldy, N);
     else if (w->type == Q38_F32) k_mm_f32<<<grid, blk, 0, st>>>((const float *)w->d, (int)w->ne0, (int)w->rows, X, ldx, Y, ldy, N);
-    else { fprintf(stderr, "q38_gpu: no batched kernel for type %s\n", q38_type_name(w->type)); return -1; }
+    else {                                                  /* no batched kernel (Q6_K): token by token */
+        for (int t = 0; t < N; t++) if (mv(w, X + (int64_t)t * ldx, Y + (int64_t)t * ldy, st)) return -1;
+    }
     return 0;
 }
 

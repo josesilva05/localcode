@@ -3,6 +3,7 @@
 #include "q38_kernels.h"
 #include "q38_gguf.h"
 #include "q38_quant.h"
+#include "q38_iq_tables.h"
 
 #include <math.h>
 #include <string.h>
@@ -211,6 +212,91 @@ static float dot_q5_K(const uint8_t *row, const q38_xvec *v)
         }
     }
     return hsum8(acc) - macc;
+}
+
+/* sum of q[0..32) * x[0..32), q as 32 signed bytes in a register */
+static inline __m256 dot32_s8(__m256i q, const float *x)
+{
+    __m128i lo = _mm256_castsi256_si128(q), hi = _mm256_extracti128_si256(q, 1);
+    __m256 a = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), _mm256_loadu_ps(x));
+    a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), _mm256_loadu_ps(x + 8), a);
+    a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), _mm256_loadu_ps(x + 16), a);
+    a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), _mm256_loadu_ps(x + 24), a);
+    return a;
+}
+
+/* the 16 values of IQ4_NL / IQ4_XS, for a byte shuffle */
+static inline __m128i iq4_table(void)
+{
+    return _mm_setr_epi8(-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+}
+
+/* 16 bytes of nibble indices -> 32 signed values: low nibbles (elements 0..15), then high (16..31) */
+static inline __m256i iq4_values(const uint8_t *qs, __m128i tab)
+{
+    const __m128i q = _mm_loadu_si128((const __m128i *)qs), m4 = _mm_set1_epi8(0x0F);
+    const __m128i lo = _mm_shuffle_epi8(tab, _mm_and_si128(q, m4));
+    const __m128i hi = _mm_shuffle_epi8(tab, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
+    return _mm256_set_m128i(hi, lo);
+}
+
+/* IQ4_NL: fp16 d, qs[16] */
+static float dot_iq4_nl(const uint8_t *row, const q38_xvec *v)
+{
+    const int64_t nb = v->n / 32;
+    const __m128i tab = iq4_table();
+    __m256 acc = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; b++, row += 18)
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(h2f(row)), dot32_s8(iq4_values(row + 2, tab), v->x + b * 32), acc);
+    return hsum8(acc);
+}
+
+/* IQ4_XS: fp16 d, u16 scales_h, scales_l[4], qs[128]; scale per 32 = d * (6-bit - 32) */
+static float dot_iq4_xs(const uint8_t *row, const q38_xvec *v)
+{
+    const int64_t nb = v->n / 256;
+    const __m128i tab = iq4_table();
+    __m256 acc = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; b++, row += 136) {
+        const float d = h2f(row);
+        uint16_t sh;
+        memcpy(&sh, row + 2, 2);
+        const float *x = v->x + b * 256;
+        for (int ib = 0; ib < 8; ib++) {
+            const int ls = ((row[4 + ib / 2] >> 4 * (ib % 2)) & 0xf) | (((sh >> 2 * ib) & 3) << 4);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d * (ls - 32)), dot32_s8(iq4_values(row + 8 + 16 * ib, tab), x + 32 * ib), acc);
+        }
+    }
+    return hsum8(acc);
+}
+
+/* IQ3_S: fp16 d, qs[64], qh[8], signs[32], scales[4]; per 32: eight grid entries (four
+ * magnitudes each), the 32 sign bits, scale d * (1 + 2 * s) */
+static float dot_iq3_s(const uint8_t *row, const q38_xvec *v)
+{
+    const int64_t nb = v->n / 256;
+    __m256 acc = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; b++, row += 110) {
+        const float d = h2f(row);
+        const uint8_t *qs = row + 2, *qh = row + 66, *signs = row + 74, *scales = row + 106;
+        const float *x = v->x + b * 256;
+        for (int j = 0; j < 8; j++) {
+            const uint8_t *q = qs + 8 * j;
+            const int h = qh[j];
+            const __m256i mag = _mm256_setr_epi32(
+                (int)q38_iq3s_grid[q[0] | ((h << 8) & 256)], (int)q38_iq3s_grid[q[1] | ((h << 7) & 256)],
+                (int)q38_iq3s_grid[q[2] | ((h << 6) & 256)], (int)q38_iq3s_grid[q[3] | ((h << 5) & 256)],
+                (int)q38_iq3s_grid[q[4] | ((h << 4) & 256)], (int)q38_iq3s_grid[q[5] | ((h << 3) & 256)],
+                (int)q38_iq3s_grid[q[6] | ((h << 2) & 256)], (int)q38_iq3s_grid[q[7] | ((h << 1) & 256)]);
+            uint32_t sg;
+            memcpy(&sg, signs + 4 * j, 4);
+            const __m256i neg = bits_to_bytes(sg);               /* 0xFF where the weight is negative */
+            const __m256i val = _mm256_sub_epi8(_mm256_xor_si256(mag, neg), neg);
+            const float db = d * (1 + 2 * ((scales[j / 2] >> 4 * (j & 1)) & 0xf));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(db), dot32_s8(val, x + 32 * j), acc);
+        }
+    }
+    return hsum8(acc);
 }
 #endif /* Q38_AVX2 */
 
@@ -439,6 +525,9 @@ float q38_dot(int type, const uint8_t *row, const q38_xvec *v)
     case Q38_Q5_1: return dot_q5_1(row, v);
     case Q38_Q4_K: return dot_q4_K(row, v);
     case Q38_Q5_K: return dot_q5_K(row, v);
+    case Q38_IQ4_NL: return dot_iq4_nl(row, v);
+    case Q38_IQ4_XS: return dot_iq4_xs(row, v);
+    case Q38_IQ3_S: return dot_iq3_s(row, v);
     default: break;
     }
 #endif

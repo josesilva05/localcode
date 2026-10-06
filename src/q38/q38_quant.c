@@ -2,6 +2,7 @@
  * name; keep the arithmetic order identical (it decides the last bit). */
 #include "q38_quant.h"
 #include "q38_gguf.h"
+#include "q38_iq_tables.h"
 
 #include <string.h>
 
@@ -167,15 +168,78 @@ static void dequant_iq4_nl(const uint8_t *x, float *y, int64_t nb)
     }
 }
 
+/* IQ4_XS: fp16 d, u16 scales_h, u8 scales_l[4], u8 qs[128]; 6-bit scale per 32, minus 32. */
+static void dequant_iq4_xs(const uint8_t *x, float *y, int64_t nb)
+{
+    for (int64_t i = 0; i < nb; i++, x += 136) {
+        const float d = H(x);
+        const uint16_t scales_h = rd16(x + 2);
+        const uint8_t *scales_l = x + 4, *qs = x + 8;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = ((scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((scales_h >> 2 * ib) & 3) << 4);
+            const float dl = d * (ls - 32);
+            for (int j = 0; j < 16; ++j) {
+                y[j + 0] = dl * kvalues_iq4nl[qs[j] & 0xf];
+                y[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+            }
+            y += 32;
+            qs += 16;
+        }
+    }
+}
+
+/* IQ3_S: fp16 d, u8 qs[64], u8 qh[8], u8 signs[32], u8 scales[4]. A group of four weights is
+ * an entry of q38_iq3s_grid (8 bits of qs and a 9th from qh), each with its own sign bit;
+ * a 4-bit scale per 32 weights, as 1 + 2 * s. */
+static void dequant_iq3_s(const uint8_t *x, float *y, int64_t nb)
+{
+    for (int64_t i = 0; i < nb; i++, x += 110) {
+        const float d = H(x);
+        const uint8_t *qs = x + 2, *qh = x + 66, *signs = x + 74, *scales = x + 106;
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            const float db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf));
+            const float db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4));
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid1 = (const uint8_t *)(q38_iq3s_grid + (qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)));
+                const uint8_t *grid2 = (const uint8_t *)(q38_iq3s_grid + (qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j + 0] = db1 * grid1[j] * (signs[l] & (1 << (j + 0)) ? -1.f : 1.f);
+                    y[j + 4] = db1 * grid2[j] * (signs[l] & (1 << (j + 4)) ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 8;
+            signs += 4;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid1 = (const uint8_t *)(q38_iq3s_grid + (qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)));
+                const uint8_t *grid2 = (const uint8_t *)(q38_iq3s_grid + (qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j + 0] = db2 * grid1[j] * (signs[l] & (1 << (j + 0)) ? -1.f : 1.f);
+                    y[j + 4] = db2 * grid2[j] * (signs[l] & (1 << (j + 4)) ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qh += 2;
+            qs += 8;
+            signs += 4;
+        }
+    }
+}
+
 int q38_quant_supported(int type)
 {
     switch (type) {
     case Q38_F32: case Q38_F16: case Q38_BF16: case Q38_Q8_0: case Q38_Q5_1:
-    case Q38_Q4_K: case Q38_Q5_K: case Q38_Q6_K: case Q38_IQ4_NL:
+    case Q38_Q4_K: case Q38_Q5_K: case Q38_Q6_K: case Q38_IQ4_NL: case Q38_IQ4_XS: case Q38_IQ3_S:
         return 1;
     default:
         return 0;
     }
+}
+
+int q38_dequant_supported(int type)
+{
+    return q38_quant_supported(type) || type == Q38_IQ4_XS || type == Q38_IQ3_S;
 }
 
 int q38_dequant_row(int type, const void *src, float *dst, int64_t n)
@@ -194,6 +258,8 @@ int q38_dequant_row(int type, const void *src, float *dst, int64_t n)
     case Q38_Q5_K: dequant_q5_K(x, dst, nb); return 0;
     case Q38_Q6_K: dequant_q6_K(x, dst, nb); return 0;
     case Q38_IQ4_NL: dequant_iq4_nl(x, dst, nb); return 0;
+    case Q38_IQ4_XS: dequant_iq4_xs(x, dst, nb); return 0;
+    case Q38_IQ3_S:  dequant_iq3_s(x, dst, nb); return 0;
     default: return -1;
     }
 }
