@@ -161,6 +161,8 @@ void  lc_session_answer(Glm53fChat *s, const char *answer, const char *actions, 
 /* The conversation ends (/reset, /level, leaving); keep_state also keeps the engine state. */
 void  lc_session_end(Glm53fChat *s, int keep_state);
 char *lc_session_list(Glm53fChat *s);
+/* The latest conversations of this folder, one line each ("06/10 14:33  first message"). */
+char *lc_session_recent(Glm53fChat *s, int max);
 /* /resume [N]: the N-th latest conversation of this folder (default 1); returns the note.
  * *ok is 1 when the conversation changed. */
 char *lc_session_resume(Glm53fChat *s, const char *arg, int *ok);

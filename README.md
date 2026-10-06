@@ -94,6 +94,12 @@ style of terminal coding tools (green theme, folded reasoning, rendered Markdown
 build/Release/localcode <model_dir>
 ```
 
+`install-cli.bat` puts a `localcode` command on the user PATH (`%USERPROFILE%\.local\bin`):
+then `cd` to any project and type `localcode`. That folder is the agent's working folder,
+and the model is found in `%USERPROFILE%\models\Qwen3.8-Flash-Next\UD-Q4_K_XL` when none is
+given. The screen opens with a welcome box (the model, the folder, this folder's recent
+conversations) and keeps the input panel, the agent's mode and the context at the bottom.
+
 With NVIDIA GPUs:
 
 ```bash

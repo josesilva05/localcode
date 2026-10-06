@@ -25,6 +25,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 #endif
 
 typedef struct {
@@ -177,6 +178,122 @@ static void qw_counters(Glm53fEngine *e, Glm53fCounters *o)
     o->wait = q->m->t_read;
 }
 
+/* ------------------------------------------------------------------ loading ---- */
+/* While the model opens (half a minute), one animated line instead of the engine's log; the
+ * log goes to %LOCALAPPDATA%\localcode\engine.log, and comes back to the screen when the
+ * opening fails. LOCALCODE_VERBOSE=1 keeps the log on the screen. */
+static struct {
+    volatile int on;
+    volatile const char *stage;
+    double t0;
+    int saved_err;                      /* stderr's descriptor before the log file took it */
+    char log[1024];
+#ifdef _WIN32
+    HANDLE th;
+#endif
+} LD = { 0, "", 0.0, -1, "" };
+
+#ifdef _WIN32
+static DWORD WINAPI load_anim(LPVOID arg)
+{
+    (void)arg;
+    static const char *spin[] = { "·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢" };
+    for (int i = 0; LD.on; i++) {
+        printf("\r\033[2K  \033[38;2;72;222;128m%s \033[1mlocalcode\033[22m\033[38;2;138;145;140m · %s… %.0f s\033[0m",
+               spin[i % 10], (const char *)LD.stage, now_s() - LD.t0);
+        fflush(stdout);
+        Sleep(120);
+    }
+    return 0;
+}
+#endif
+
+static void load_begin(void)
+{
+    LD.t0 = now_s();
+#ifdef _WIN32
+    DWORD mode;
+    const int console = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode) != 0;
+    const char *v = getenv("LOCALCODE_VERBOSE");
+    const char *base = getenv("LOCALAPPDATA");
+    if (console && !(v && *v && strcmp(v, "0")) && base) {
+        char dir[900];
+        snprintf(dir, sizeof dir, "%s\\localcode", base);
+        CreateDirectoryA(dir, NULL);
+        snprintf(LD.log, sizeof LD.log, "%s\\engine.log", dir);
+        FILE *f = fopen(LD.log, "wb");
+        if (f) {
+            fflush(stderr);
+            LD.saved_err = _dup(2);
+            _dup2(_fileno(f), 2);
+            fclose(f);
+        }
+        SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode | 0x0004);   /* VT colours */
+        LD.on = 1;
+        LD.th = CreateThread(NULL, 0, load_anim, NULL, 0, NULL);
+        return;
+    }
+#endif
+    printf("  loading Qwen3.8-Flash-Next…");
+    fflush(stdout);
+}
+
+static void load_stage(const char *what) { LD.stage = what; }
+
+static void load_end(int ok)
+{
+#ifdef _WIN32
+    if (LD.on) {
+        LD.on = 0;
+        if (LD.th) { WaitForSingleObject(LD.th, 2000); CloseHandle(LD.th); LD.th = NULL; }
+        printf("\r\033[2K");
+        fflush(stdout);
+    }
+    if (LD.saved_err >= 0) {
+        fflush(stderr);
+        _dup2(LD.saved_err, 2);
+        _close(LD.saved_err);
+        LD.saved_err = -1;
+        if (!ok) {                      /* the reason, from the log */
+            FILE *f = fopen(LD.log, "rb");
+            if (f) {
+                char buf[4096];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, f)) > 0) fwrite(buf, 1, n, stderr);
+                fclose(f);
+            }
+        }
+    }
+#endif
+    (void)ok;
+}
+
+/* Without a model given: the first shard in %USERPROFILE%\models\Qwen3.8-Flash-Next\UD-Q4_K_XL
+ * (where start.bat looks too), so `localcode` typed in any folder opens it there. */
+static int default_model(char *out, size_t cap)
+{
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+    if (!home) return 0;
+    static const char *pats[] = { "*-00001-of-*.gguf", "*.gguf" };
+    for (int i = 0; i < 2; i++) {
+        char dir[1024], pat[1100];
+        snprintf(dir, sizeof dir, "%s\\models\\Qwen3.8-Flash-Next\\UD-Q4_K_XL", home);
+        snprintf(pat, sizeof pat, "%s\\%s", dir, pats[i]);
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        FindClose(h);
+        snprintf(out, cap, "%s\\%s", dir, fd.cFileName);
+        return 1;
+    }
+#else
+    (void)out;
+    (void)cap;
+#endif
+    return 0;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -184,7 +301,9 @@ static void usage(void)
             "  localcode [model.gguf] [--ctx N] [--gen N] [--level 0|1|2] [--continue] [--reasoning xhigh|medium|low] [--threads N]\n\n"
             "--level: 0 chat, 1 quick (reads the files of this folder), 2 agent (edits files, runs commands; default)\n"
             "--continue: go back to the latest conversation of this folder (as /resume)\n"
-            "The model is any shard of the split GGUF, or LOCALCODE_MODEL in the environment.\n");
+            "The model is any shard of the split GGUF, or LOCALCODE_MODEL in the environment, or the first\n"
+            "shard in %%USERPROFILE%%\\models\\Qwen3.8-Flash-Next\\UD-Q4_K_XL. The folder it starts in is the\n"
+            "agent's working folder (install-cli.bat puts `localcode` on the PATH).\n");
 }
 
 int main(int argc, char **argv)
@@ -215,6 +334,8 @@ int main(int argc, char **argv)
         else if (argv[i][0] != '-') path = argv[i];
         else { usage(); return 2; }
     }
+    static char found[1200];
+    if (!path && default_model(found, sizeof found)) path = found;
     if (!path) { usage(); return 2; }
     int li = -1;
     for (int i = 0; i < 3; i++) if (!strcmp(level, QWEN_LEVELS[i].name)) li = i;
@@ -229,9 +350,10 @@ int main(int argc, char **argv)
 
     static q38_model m;
     const double t0 = now_s();
-    printf("  loading Qwen3.8-Flash-Next…");
-    fflush(stdout);
-    if (q38_model_open(&m, path, ctx)) return 1;
+    load_begin();
+    load_stage("abrindo o modelo");
+    if (q38_model_open(&m, path, ctx)) { load_end(0); return 1; }
+    load_stage("levando o tronco para a GPU");
     int on_gpu = -1;
 #ifdef Q38_CUDA
     if (gpu >= 0) {
@@ -243,7 +365,7 @@ int main(int argc, char **argv)
 #endif
     if (cache_gb > 0) q38_model_set_cache(&m, cache_gb);
     q38_tok *tok = q38_tok_load(&m.g);
-    if (!tok) return 1;
+    if (!tok) { load_end(0); return 1; }
 
     QwenEngine q;
     memset(&q, 0, sizeof q);
@@ -270,8 +392,7 @@ int main(int argc, char **argv)
     }
     if (*prof && q38_model_profile_load(&m, prof) == 0 && preload_gb > 0) {
         const double tp = now_s();
-        printf("\r  warming the expert cache…");
-        fflush(stdout);
+        load_stage("aquecendo o cache de especialistas");
         const int nread = q38_model_preload(&m, preload_gb);
         int nv = 0;
 #ifdef Q38_CUDA
@@ -280,6 +401,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "\rq38: warmed %d experts into RAM (%.1f GB) and %d into VRAM in %.1f s\n", nread,
                 m.cache_used / 1e9, nv, now_s() - tp);
     }
+    load_end(1);
     const int ids[] = { (int)q38_gguf_int(&m.g, "tokenizer.ggml.eos_token_id", -1), q38_tok_id(tok, "<|im_end|>"),
                         q38_tok_id(tok, "<|endoftext|>") };
     for (int i = 0; i < 3; i++) {

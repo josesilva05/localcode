@@ -456,6 +456,20 @@ char *lc_session_list(Glm53fChat *s)
     return o.p;
 }
 
+char *lc_session_recent(Glm53fChat *s, int max)
+{
+    Entry en[8];
+    if (max > 8) max = 8;
+    const int n = list_entries(s, en, max);
+    if (!n) return NULL;
+    Str o = { 0 };
+    for (int i = 0; i < n; i++) {
+        const char *st = en[i].name;
+        s_fmt(&o, "%.2s/%.2s %.2s:%.2s  %s\n", st + 6, st + 4, st + 9, st + 11, en[i].first);
+    }
+    return o.p;
+}
+
 /* the conversation as text for a new context: the last summary and what came after it */
 static char *text_preface(const char *all, int budget_chars, int *n_msgs)
 {
