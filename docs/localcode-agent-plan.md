@@ -26,7 +26,7 @@ Restrições do nosso hardware: um modelo só a ~10 tok/s → os subagentes roda
 
 - `src/cli/lc_agent.c/.h` — loop do agente: monta o prompt com o template do Qwen e o bloco `# Tools`, gera, interpreta as chamadas de ferramenta, executa, devolve o resultado, repete.
 - `src/cli/lc_tools.c/.h` — ferramentas: `read_file` (faixa de linhas), `write_file`, `edit_file` (troca de texto exato), `list_dir`, `glob`, `grep`, `run` (pwsh com timeout e limite de saída), `todo`, `ask_user`. Tudo confinado à pasta de trabalho; modos de permissão: só leitura / escrita na pasta / acesso total.
-- `src/cli/lc_session.c` — sessão em JSONL (`%LOCALAPPDATA%\localcode\sessions`) e compactação por resumo contínuo perto do limite de 32k.
+- `src/cli/lc_session.c` — sessão em JSONL (`%LOCALAPPDATA%\localcode\sessions`) e compactação por resumo perto do fim do contexto, qualquer que seja o tamanho (32k, 64k, 128k, 256k): o modelo escreve um resumo para si mesmo (até contexto/16 tokens, 768–8192), o contexto é esvaziado e o resumo abre o próximo; repete quantas vezes precisar. Ao sair, o estado do motor fica guardado ao lado (as 3 últimas conversas) e `/resume` / `--continue` volta exatamente; conversas mais antigas voltam pelo texto (último resumo + mensagens depois dele).
 - `src/cli/lc_gauntlet.c` — orquestrador do nível 3 (barra, peças, construtor, crítico, comparação cega, orçamento).
 - `tools/lc_web_probe.mjs` — sonda Playwright usada pelo crítico de web.
 - Engine vtable: `save_state` / `load_state` para os contextos dos subagentes.
@@ -35,6 +35,8 @@ Restrições do nosso hardware: um modelo só a ~10 tok/s → os subagentes roda
 
 1. Ferramentas + loop do agente + níveis 1 e 2 no TUI (chamadas de ferramenta visíveis, aprovação).
 2. Sessões em disco + compactação.
+   - 2a: `lc_session.c`, `/compact [foco]`, `/sessions`, `/resume [N]`, `--continue`; limite proporcional ao contexto.
+   - 2b: contexto maior no motor — hoje 32k na GPU (limite da ordenação do indexador) e 64k na CPU; o modelo vai a 262.144. KV em fp32 custa ~54 KB/posição (12 camadas de atenção, 2 cabeças KV × 256, mais o indexador): 1,8 GB em 32k, 7 GB em 128k, 14 GB em 256k. Caminho: KV em fp16 (metade), ordenação do indexador sem o teto de 8192 blocos, e medir VRAM tirada do cache de especialistas × velocidade. Preferido: 128k; topo: 256k.
 3. Contextos de subagente + nível 3 para código com testes.
 4. Críticos de web (Playwright) e de documentos.
 5. Ajuste com tarefas reais: tempo, taxa de vitória na comparação cega, regressões.

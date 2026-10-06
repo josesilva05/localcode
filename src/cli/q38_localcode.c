@@ -181,8 +181,9 @@ static void usage(void)
 {
     fprintf(stderr,
             "localcode - Qwen3.8-Flash-Next on this engine\n\n"
-            "  localcode [model.gguf] [--ctx N] [--gen N] [--level 0|1|2] [--reasoning xhigh|medium|low] [--threads N]\n\n"
+            "  localcode [model.gguf] [--ctx N] [--gen N] [--level 0|1|2] [--continue] [--reasoning xhigh|medium|low] [--threads N]\n\n"
             "--level: 0 chat, 1 quick (reads the files of this folder), 2 agent (edits files, runs commands; default)\n"
+            "--continue: go back to the latest conversation of this folder (as /resume)\n"
             "The model is any shard of the split GGUF, or LOCALCODE_MODEL in the environment.\n");
 }
 
@@ -198,6 +199,7 @@ int main(int argc, char **argv)
     int gpu = -1;                       /* -1: try GPU 1 then 0; -2: --cpu */
     double preload_gb = 24.0;           /* experts read into RAM at start, most used first */
     const char *level = "xhigh";
+    const char *resume = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
@@ -207,6 +209,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gpu") && i + 1 < argc) gpu = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cpu")) gpu = -2;
+        else if (!strcmp(argv[i], "--continue") || !strcmp(argv[i], "-c")) resume = "1";
         else if (!strcmp(argv[i], "--preload-gb") && i + 1 < argc) preload_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
         else if (argv[i][0] != '-') path = argv[i];
@@ -314,6 +317,7 @@ int main(int argc, char **argv)
     if (lc_tools_init(NULL) != 0) s.agent_level = 0;   /* no working directory: chat only */
     if (gen >= e.cap) gen = e.cap / 2;
     s.gen = gen;
+    s.resume = resume;
     s.load_s = now_s() - t0;
     printf("\r%*s\r", 40, "");
     s.ids_cap = 1 << 20;

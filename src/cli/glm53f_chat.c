@@ -165,6 +165,9 @@ const Glm53fCommand glm53f_commands[] = {
     { "/params",    "",                "the settings in force", 0 },
     { "/copy",      "",                "put the last answer on the clipboard", 0 },
     { "/save",      "[FILE]",          "write the conversation as Markdown (default localcode-DATE.md)", 1 },
+    { "/compact",   "[FOCUS]",         "summarise the conversation and go on from the summary (it also happens by itself near the context's end)", 1 },
+    { "/sessions",  "",                "this folder's earlier conversations", 0 },
+    { "/resume",    "[N]",             "go back to an earlier conversation (default the latest; /sessions lists them)", 1 },
     { "/reset",     "",                "forget the conversation and start a new one", 0 },
     { "/help",      "",                "the commands and keys", 0 },
     { "/quit",      "",                "leave", 0 },
@@ -205,6 +208,7 @@ void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char
     else if (!strcmp(n, "/copy"))     snprintf(buf, cap, "%s", s->last_answer ? "last answer" : "nothing yet");
     else if (!strcmp(n, "/save") && s->log_len) snprintf(buf, cap, "%.1f KB", (double)s->log_len / 1024.0);
     else if (!strcmp(n, "/reset"))    snprintf(buf, cap, "%d/%d", s->e->cached, s->e->cap);
+    else if (!strcmp(n, "/compact") && s->compactions) snprintf(buf, cap, "%d so far", s->compactions);
     else if (!strcmp(n, "/file"))     snprintf(buf, cap, "%d left", s->e->cap - s->e->cached);
 }
 
@@ -350,7 +354,19 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
     } else if (!strcmp(line, "/thinking")) {
         s->show_thinking = !s->show_thinking;
         in->note = dup_str(s->show_thinking ? "reasoning shown as it is written" : "reasoning folded into one line");
+    } else if (!strcmp(line, "/compact") || !strncmp(line, "/compact ", 9)) {
+        in->kind = GLM53F_IN_MESSAGE;
+        in->compact = 1;
+        in->prompt = dup_str(line[8] ? line + 9 : "");
+        in->shown = dup_str(line);
+    } else if (!strcmp(line, "/sessions")) {
+        in->note = lc_session_list(s);
+    } else if (!strcmp(line, "/resume") || !strncmp(line, "/resume ", 8)) {
+        int ok = 0;
+        in->note = lc_session_resume(s, line[7] ? line + 8 : NULL, &ok);
+        if (ok) in->kind = GLM53F_IN_RESET;
     } else if (!strcmp(line, "/reset") || !strcmp(line, "/clear") || !strcmp(line, "/new")) {
+        lc_session_end(s, 0);
         s->e->reset(s->e);
         s->first = 1;
         s->log_len = 0;                          /* a new conversation, a new transcript */
@@ -363,6 +379,7 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
         } else if (v > 0 && !s->e->agent) {
             in->note = dup_str("this model has no agent mode here; only /level 0");
         } else {
+            lc_session_end(s, 0);
             s->agent_level = v;
             s->e->reset(s->e);                   /* the system prompt differs per level */
             s->first = 1;
@@ -443,8 +460,10 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
 
 void glm53f_chat_gauge(const Glm53fChat *s, char *buf, size_t cap)
 {
-    snprintf(buf, cap, "context %d/%d (%d%%)", s->e->cached, s->e->cap,
-             s->e->cap ? (int)(100.0 * s->e->cached / s->e->cap + 0.5) : 0);
+    const int n = snprintf(buf, cap, "context %d/%d (%d%%)", s->e->cached, s->e->cap,
+                           s->e->cap ? (int)(100.0 * s->e->cached / s->e->cap + 0.5) : 0);
+    if (s->compactions && n > 0 && (size_t)n < cap)
+        snprintf(buf + n, cap - (size_t)n, " · compacted %d×", s->compactions);
 }
 
 /* ----------------------------------------------------------------------- turn ---- */
@@ -461,16 +480,41 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
 {
     Glm53fEngine *e = s->e;
     char line[320];
+    if (in->compact) {
+        g_stop = 0;
+        const int rc = lc_compact(s, k, NULL, in->prompt);
+        k->done(k, rc == 0 ? "the conversation goes on from the summary; the next message opens a new context"
+                   : rc > 0 ? "nothing to compact yet" : "the engine failed while compacting", rc ? 2 : 0);
+        return rc < 0 ? -1 : 0;
+    }
     if (s->agent_level > 0 && e->agent) return lc_agent_turn(s, in, k);
 
     /* the chat template: the preamble only opens the conversation, every turn after that
-     * appends its own user block, and the cache already holds what came before. */
-    const size_t tl = strlen(in->prompt) + 1024;
-    char *text = (char *)malloc(tl);
-    if (!text) { k->done(k, "out of memory", 2); return 0; }
-    e->turn_text(e, s->first, s->reasoning, in->prompt, text, tl);
-    const int n = e->encode(e, text, (int)strlen(text), s->ids, s->ids_cap);
+     * appends its own user block, and the cache already holds what came before. A message
+     * that would not fit first has the conversation summarised (lc_compact), and then opens
+     * a new context after the summary. */
+    lc_session_user(s, in->shown ? in->shown : in->prompt);
+    char *text = NULL;
+    int n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        const char *pre = s->first && s->preface ? s->preface : "";
+        const size_t tl = strlen(pre) + strlen(in->prompt) + 1024;
+        free(text);
+        text = (char *)malloc(tl);
+        char *msg = (char *)malloc(tl);
+        if (!text || !msg) { free(msg); free(text); k->done(k, "out of memory", 2); return 0; }
+        snprintf(msg, tl, "%s%s", pre, in->prompt);
+        e->turn_text(e, s->first, s->reasoning, msg, text, tl);
+        free(msg);
+        n = e->encode(e, text, (int)strlen(text), s->ids, s->ids_cap);
+        if (n <= 0 || !lc_compact_due(s, n + s->gen)) break;
+        g_stop = 0;
+        const int rc = lc_compact(s, k, NULL, NULL);
+        if (rc < 0) { free(text); k->done(k, "the engine failed while compacting", 2); return -1; }
+        if (rc > 0) break;
+    }
     free(text);
+    if (s->first && s->preface) { free(s->preface); s->preface = NULL; }
     if (n <= 0) { k->done(k, "could not tokenise the message (is it longer than the session?)", 2); return 0; }
     if (e->cached + n + s->gen > e->cap) {
         snprintf(line, sizeof line, "the session holds %d positions and this turn needs %d; "
@@ -574,6 +618,7 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
             if (*close) s->last_answer = dup_str(close);
         }
     }
+    lc_session_answer(s, s->last_answer ? s->last_answer : "", NULL, stats);
     k->done(k, stats, interrupted);
     return 0;
 }
@@ -668,6 +713,7 @@ static int plain_run(Glm53fChat *s)
     if (!line) return 1;
     g_name = s->e->name;
     printf("localcode · %s · ready in %.1f s · /help for commands\n", s->e->name, s->load_s);
+    if (s->start_note) printf("  %s\n", s->start_note);
     int rc = 0, shown = 0;
     Glm53fTurnSink k = { plain_status, plain_reasoning, plain_thought, plain_answer, plain_done, &shown, plain_tool, plain_approve };
     for (;;) {
@@ -693,6 +739,10 @@ static int plain_run(Glm53fChat *s)
 int glm53f_chat_run(Glm53fChat *s)
 {
     s->first = 1;
+    if (s->resume) {                             /* --continue: the latest conversation here */
+        int ok = 0;
+        s->start_note = lc_session_resume(s, s->resume, &ok);
+    }
     /* LOCALCODE_TUI=1 forces the full-screen front end (captured sessions); LOCALCODE_PLAIN=1
      * or NO_COLOR keeps the plain one. */
     const char *force = getenv("LOCALCODE_TUI");
@@ -700,6 +750,13 @@ int glm53f_chat_run(Glm53fChat *s)
     int rc = -1;
     if (!getenv("LOCALCODE_PLAIN") && !getenv("NO_COLOR")) rc = glm53f_tui_run(s, forced);
     if (rc < 0) rc = plain_run(s);
+    if (s->sess && s->e->state_save && s->e->cached > 0) {
+        printf("localcode · keeping this conversation's context for /resume…\n");
+        fflush(stdout);
+    }
+    lc_session_end(s, 1);                        /* the context too, for an exact /resume */
+    free(s->start_note);
+    s->start_note = NULL;
     free(s->log);
     s->log = NULL;
     free(s->last_answer);

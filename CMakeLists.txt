@@ -133,7 +133,7 @@ if(Q38_LLAMA_CPP_DIR)
 endif()
 
 # ------------------------------------------------------------------------------ cli --
-add_executable(glm53f_cli src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c)
+add_executable(glm53f_cli src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c src/cli/lc_session.c)
 set_target_properties(glm53f_cli PROPERTIES OUTPUT_NAME glm53f)
 target_link_libraries(glm53f_cli PRIVATE glm53f)
 if(WIN32)
@@ -141,7 +141,7 @@ if(WIN32)
 endif()
 
 # localcode_glm: the GLM program opening straight into the interactive session.
-add_executable(localcode_glm src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c)
+add_executable(localcode_glm src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c src/cli/lc_session.c)
 target_compile_definitions(localcode_glm PRIVATE GLM53F_LOCALCODE=1)
 target_link_libraries(localcode_glm PRIVATE glm53f)
 if(WIN32)
@@ -153,7 +153,7 @@ endif()
 add_library(q38api SHARED src/q38/q38_api.c)
 target_link_libraries(q38api PRIVATE q38)
 
-add_executable(localcode src/cli/q38_localcode.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c)
+add_executable(localcode src/cli/q38_localcode.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c src/cli/lc_session.c)
 target_link_libraries(localcode PRIVATE q38 glm53f)
 
 # ---------------------------------------------------------------------------- tests --

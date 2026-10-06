@@ -93,6 +93,14 @@ typedef struct {
     int          agent_level;
     int          auto_approve;   /* 1: writes and commands run without asking  */
     unsigned     always;         /* tools the user allowed for the session (bit per tool) */
+    /* the conversation on disk and its compaction (lc_session.c) */
+    void        *sess;           /* the session file being written; NULL until the first message */
+    char        *preface;        /* opens the next message of a new context: a summary, or a
+                                  * conversation resumed from its transcript */
+    int          compactions;    /* summaries that replaced the context in this conversation */
+    int          base;           /* positions the context's opening takes (the agent's system block) */
+    const char  *resume;         /* set by the caller: resume this session (as /resume takes it) at start */
+    char        *start_note;     /* what that resume says, shown when the screen opens */
 } Glm53fChat;
 
 int glm53f_chat_run(Glm53fChat *s);
@@ -121,6 +129,7 @@ typedef struct {
     char *prompt;                /* MESSAGE: the text for the model, templated    */
     char *shown;                 /* MESSAGE: what the transcript shows            */
     char *note;                  /* NOTE, or a remark before a MESSAGE (/file)    */
+    int   compact;               /* MESSAGE from /compact: prompt is what to keep in focus */
 } Glm53fInput;
 
 enum { GLM53F_IN_NONE, GLM53F_IN_MESSAGE, GLM53F_IN_NOTE, GLM53F_IN_QUIT, GLM53F_IN_RESET };
@@ -139,6 +148,29 @@ volatile int *glm53f_chat_stop_flag(void);
 void glm53f_chat_log(Glm53fChat *s, const char *text);
 /* An agent turn (lc_agent.c); glm53f_chat_turn hands over to it when agent_level > 0. */
 int  lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k);
+
+/* ---- lc_session.c: conversations kept on disk, and compaction ----
+ * Every conversation is a JSONL file in %LOCALAPPDATA%\localcode\sessions (messages, answers,
+ * summaries); leaving localcode also keeps the engine state beside it, so /resume of the last
+ * conversations puts the context back exactly, and of older ones rebuilds it from the text.
+ * Near the end of the context the model writes a summary of the conversation, the context is
+ * emptied and the summary opens the next one: a conversation runs on past the context size,
+ * whatever that size is (32k, 128k, 256k). */
+void  lc_session_user(Glm53fChat *s, const char *shown);
+void  lc_session_answer(Glm53fChat *s, const char *answer, const char *actions, const char *stats);
+/* The conversation ends (/reset, /level, leaving); keep_state also keeps the engine state. */
+void  lc_session_end(Glm53fChat *s, int keep_state);
+char *lc_session_list(Glm53fChat *s);
+/* /resume [N]: the N-th latest conversation of this folder (default 1); returns the note.
+ * *ok is 1 when the conversation changed. */
+char *lc_session_resume(Glm53fChat *s, const char *arg, int *ok);
+/* 1 when a step of need positions calls for a compaction first: it would leave fewer free
+ * than a compaction needs, and the conversation holds enough to be worth summarising. */
+int   lc_compact_due(const Glm53fChat *s, int need);
+/* The model summarises the context (request: the request in progress, kept word for word;
+ * focus: what /compact asked to keep), the context is emptied and the summary waits in
+ * s->preface. Returns 0, 1 when there is no room even for the summary, -1 engine failure. */
+int   lc_compact(Glm53fChat *s, Glm53fTurnSink *k, const char *request, const char *focus);
 
 /* "context 88/2048 (4%)" and the settings line, for status rows. */
 void glm53f_chat_gauge(const Glm53fChat *s, char *buf, size_t cap);

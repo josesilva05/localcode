@@ -1556,6 +1556,7 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
     pthread_mutex_init(&g_mu, NULL);
     pthread_cond_init(&g_ask_cv, NULL);
     block_add(B_SPLASH, NULL);
+    if (s->start_note) block_add(B_NOTE, s->start_note);
 
     char in[4096];
     int quit = 0, eof = 0;

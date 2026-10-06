@@ -125,6 +125,7 @@ static int system_from_file(Glm53fChat *s, const Str *sys, Glm53fTurnSink *k)
     if (!e->state_save || !e->state_load || e->cached) return 0;
     const int n = e->encode(e, sys->p, (int)sys->n, s->ids, s->ids_cap);
     if (n <= 0 || n + ROOM >= e->cap) return 0;
+    s->base = n;
     unsigned long long h = 1469598103934665603ULL;            /* FNV-1a */
     const char *build = __DATE__ __TIME__;
     for (const char *p = build; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
@@ -152,6 +153,58 @@ static int system_from_file(Glm53fChat *s, const Str *sys, Glm53fTurnSink *k)
     e->state_save(e, path);
     k->status(k, NULL, 0.0);
     return 1;
+}
+
+/* The text that opens a new context: the system block (loaded from its file when kept) and
+ * the first user message, after what a compaction or a resume left in s->preface. */
+static void open_context(Glm53fChat *s, Glm53fTurnSink *k, Str *t, int level, const char *msg)
+{
+    Str sys = { 0 };
+    system_block(&sys, level);
+    if (!system_from_file(s, &sys, k)) s_add(t, sys.p, sys.n);
+    free(sys.p);
+    s_str(t, "<|im_start|>user\n");
+    if (s->preface) {
+        s_str(t, s->preface);
+        free(s->preface);
+        s->preface = NULL;
+    }
+    s_str(t, msg);
+    s_str(t, "<|im_end|>\n<|im_start|>assistant\n<think>\n");
+}
+
+/* A step's text that would not fit: the model summarises the context, which is emptied, and
+ * the step goes on in a new one that opens with the summary and carries the step's own text
+ * (the message, or the results of the last tool calls with the request they serve).
+ * Returns 0 with *t rebuilt, 1 when there was no room even to summarise, -1 engine failure. */
+static int compact_step(Glm53fChat *s, Glm53fTurnSink *k, Str *t, int level, const char *request)
+{
+    static const char HEAD[] = "<|im_end|>\n<|im_start|>user";
+    static const char TAIL[] = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    if (!t->p || strncmp(t->p, HEAD, sizeof HEAD - 1)) return 1;
+    const char *body = t->p + sizeof HEAD - 1, *end = NULL;
+    for (const char *q = body; (q = strstr(q, TAIL)); q++) end = q;
+    if (!end) return 1;
+    const int tools = !strncmp(body, "\n<tool_response>", 16);
+    Str b = { 0 };
+    if (tools) {
+        s_str(&b, "The request in progress, word for word:\n");
+        s_str(&b, request);
+        s_str(&b, "\n\nYour last tool calls returned:");
+        s_add(&b, body, (size_t)(end - body));
+        s_str(&b, "\n\nContinue the task from where you were.");
+    } else {
+        if (*body == '\n') body++;
+        s_add(&b, body, (size_t)(end - body));
+    }
+    const int rc = lc_compact(s, k, tools ? request : NULL, NULL);
+    if (rc != 0) { free(b.p); return rc; }
+    Str nt = { 0 };
+    open_context(s, k, &nt, level, b.p ? b.p : "");
+    free(b.p);
+    free(t->p);
+    *t = nt;
+    return 0;
 }
 
 /* ----------------------------------------------------------- tool calls ---- */
@@ -238,19 +291,16 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     *stop = 0;
 
     Str t = { 0 }, answer = { 0 }, actions = { 0 };
+    lc_session_user(s, in->shown ? in->shown : in->prompt);
     if (s->first) {
-        Str sys = { 0 };
-        system_block(&sys, level);
-        if (!system_from_file(s, &sys, k)) s_add(&t, sys.p, sys.n);
-        free(sys.p);
+        open_context(s, k, &t, level, in->prompt);
     } else {
-        s_str(&t, "<|im_end|>\n");
+        s_str(&t, "<|im_end|>\n<|im_start|>user\n");
+        s_str(&t, in->prompt);
+        s_str(&t, "<|im_end|>\n<|im_start|>assistant\n<think>\n");
     }
-    s_str(&t, "<|im_start|>user\n");
-    s_str(&t, in->prompt);
-    s_str(&t, "<|im_end|>\n<|im_start|>assistant\n<think>\n");
 
-    int steps = 0, calls_done = 0, fatal = 0, failed = 0, interrupted = 0;
+    int steps = 0, calls_done = 0, fatal = 0, failed = 0, interrupted = 0, compacted = 0;
     long pre_tok = 0, dec_tok = 0;
     double pre_s = 0.0, dec_s = 0.0;
     const double t_turn = now_s();
@@ -260,6 +310,12 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
         /* read what goes before the model's next answer */
         const int n = e->encode(e, t.p, (int)t.n, s->ids, s->ids_cap);
         if (n <= 0) { why_stop = "could not tokenise the step"; failed = 1; break; }
+        const int step_gen = s->gen < 4096 ? s->gen : 4096;
+        if (lc_compact_due(s, n + step_gen)) {
+            const int rc = compact_step(s, k, &t, level, in->prompt);
+            if (rc < 0) { why_stop = "the engine failed while compacting"; fatal = 1; break; }
+            if (rc == 0) { compacted++; continue; }   /* an esc stops at the next answer's start */
+        }
         if (e->cached + n + ROOM > e->cap) {
             snprintf(line, sizeof line, "the context is full (%d of %d positions): /reset to start a new conversation",
                      e->cached + n, e->cap);
@@ -424,9 +480,11 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     }
     char stats[400];
     const double total = now_s() - t_turn;
-    snprintf(stats, sizeof stats, "level %d · %d step%s · %d tool call%s · wrote %ld tokens at %.1f tok/s · read %ld in %.1f s · %.0f s%s",
+    snprintf(stats, sizeof stats, "level %d · %d step%s · %d tool call%s · wrote %ld tokens at %.1f tok/s · read %ld in %.1f s · %.0f s%s%s",
              level, steps + 1, steps ? "s" : "", calls_done, calls_done == 1 ? "" : "s", dec_tok,
-             dec_s > 0 ? dec_tok / dec_s : 0.0, pre_tok, pre_s, total, interrupted ? " · interrupted" : "");
+             dec_s > 0 ? dec_tok / dec_s : 0.0, pre_tok, pre_s, total, compacted ? " · compacted" : "",
+             interrupted ? " · interrupted" : "");
+    lc_session_answer(s, answer.p ? answer.p : (why_stop ? why_stop : ""), actions.p, stats);
     glm53f_chat_log(s, "## Você\n\n");
     glm53f_chat_log(s, in->shown ? in->shown : in->prompt);
     glm53f_chat_log(s, "\n\n## localcode\n\n");
