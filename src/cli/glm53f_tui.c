@@ -759,7 +759,8 @@ static void render_splash(Lines *L, const Glm53fChat *s, int W)
     for (int r = 0; r < 4; r++) { char m[64]; mascot_row(m, sizeof m, r); ADD(left, nl, C_BRIGHT, 1, "%s", m); }
     ADD(left, nl, "", 1, "%s", "");
     static const char *lv[] = { "chat", "nível 1 · rápido", "nível 2 · agente" };
-    ADD(left, nl, C_DIM, 1, "%s · %s", s->e->name, lv[s->agent_level > 0 && s->e->agent ? s->agent_level : 0]);
+    ADD(left, nl, C_DIM, 1, "%s%s%s · %s", s->e->name, s->e->variant ? " " : "", s->e->variant ? s->e->variant : "",
+        lv[s->agent_level > 0 && s->e->agent ? s->agent_level : 0]);
     {
         char cap[24];
         fmt_k(cap, sizeof cap, s->e->cap);
@@ -776,6 +777,7 @@ static void render_splash(Lines *L, const Glm53fChat *s, int W)
     ADD(right, nr, C_TEXT, 0, "Peça uma mudança: o agente lê, edita e testa");
     ADD(right, nr, C_TEXT, 0, "/level 0 chat · 1 rápido · 2 agente");
     ADD(right, nr, C_TEXT, 0, "/resume volta a uma conversa · /compact resume");
+    if (s->e->n_variants > 1) ADD(right, nr, C_TEXT, 0, "/model troca o modelo (%d nesta máquina)", s->e->n_variants);
     right[nr++].divider = 1;
     ADD(right, nr, C_BOLD C_BRIGHT, 0, "Conversas recentes nesta pasta");
     int nrec = 0;
@@ -1677,8 +1679,9 @@ static void draw(Glm53fChat *s)
         char left[400], right[160];
         static const char *mode[] = { "Chat", "Rápido", "Agente" };
         const int lvl = s->agent_level > 0 && s->e->agent ? s->agent_level : 0;
-        snprintf(left, sizeof left, C_BOLD C_BRIGHT "%s" C_NOBOLD C_DIM " · " C_TEXT "%s" C_DIM " local" C_DIM " · " C_YELLOW "%s",
-                 mode[lvl], s->e->name, lvl ? (lvl == 1 ? "low" : "medium") : s->reasoning);
+        snprintf(left, sizeof left, C_BOLD C_BRIGHT "%s" C_NOBOLD C_DIM " · " C_TEXT "%s" C_DIM " %s" C_DIM " · " C_YELLOW "%s",
+                 mode[lvl], s->e->name, s->e->variant ? s->e->variant : "local",
+                 lvl ? (lvl == 1 ? "low" : "medium") : s->reasoning);
         if (g_ask_state == 1)  snprintf(right, sizeof right, C_YELLOW "s sim · a sempre · n não");
         else if (g_busy)       snprintf(right, sizeof right, C_DIM "esc interrompe%s", g_nqueue ? " · na fila" : "");
         else if (lvl == 2)     snprintf(right, sizeof right, s->auto_approve ? C_YELLOW "⏵⏵ aprovação automática"

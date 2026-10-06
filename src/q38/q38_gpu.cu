@@ -2036,6 +2036,14 @@ extern "C" void q38_gpu_close(void *model)
     cudaDeviceSynchronize();
     if (G->snap) cudaFreeHost(G->snap);
     cudaDeviceReset();
+    /* the other device's expert pool too, or a model opened next (/model) finds its memory taken */
+    for (int pd = 1; pd < G->npd; pd++) {
+        if (G->pdev[pd] == G->dev) continue;
+        cudaSetDevice(G->pdev[pd]);
+        cudaDeviceSynchronize();
+        cudaDeviceReset();
+    }
+    cudaSetDevice(G->dev);
     free(G);
     G = NULL;
     m->gpu = NULL;

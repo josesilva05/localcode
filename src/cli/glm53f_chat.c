@@ -157,6 +157,7 @@ static char *save(Glm53fChat *s, const char *arg)
 const Glm53fCommand glm53f_commands[] = {
     { "/file",      "PATH [question]", "send a file's text, then the question (a path with spaces in quotes)", 2 },
     { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
+    { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 1 },
     { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
     { "/reasoning", "LEVEL",           "reasoning effort of level 0 chat (set when a conversation opens)", 2 },
     { "/gen",       "N",               "tokens to generate per answer", 2 },
@@ -209,6 +210,7 @@ void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char
     else if (!strcmp(n, "/save") && s->log_len) snprintf(buf, cap, "%.1f KB", (double)s->log_len / 1024.0);
     else if (!strcmp(n, "/reset"))    snprintf(buf, cap, "%d/%d", s->e->cached, s->e->cap);
     else if (!strcmp(n, "/compact") && s->compactions) snprintf(buf, cap, "%d so far", s->compactions);
+    else if (!strcmp(n, "/model") && s->e->variant) snprintf(buf, cap, "%s", s->e->variant);
     else if (!strcmp(n, "/file"))     snprintf(buf, cap, "%d left", s->e->cap - s->e->cached);
 }
 
@@ -359,6 +361,36 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
         in->compact = 1;
         in->prompt = dup_str(line[8] ? line + 9 : "");
         in->shown = dup_str(line);
+    } else if (!strcmp(line, "/model") || !strncmp(line, "/model ", 7)) {
+        Glm53fEngine *e = s->e;
+        const char *arg = line[6] ? line + 7 : "";
+        while (*arg == ' ') arg++;
+        int pick = -1;
+        if (*arg >= '1' && *arg <= '9' && !arg[1]) pick = *arg - '1';
+        for (int i = 0; i < e->n_variants && pick < 0 && *arg; i++) {   /* a name, or part of one */
+            const char *h = e->variant_name[i];
+            for (; *h && pick < 0; h++) {
+                const char *a = arg, *b = h;
+                while (*a && *b && (*a | 32) == (*b | 32)) { a++; b++; }
+                if (!*a) pick = i;
+            }
+        }
+        char buf[1200];
+        if (!*arg || pick < 0 || pick >= e->n_variants) {
+            int k = snprintf(buf, sizeof buf, "%s on this machine (/model N to switch):", e->name);
+            for (int i = 0; i < e->n_variants && k < (int)sizeof buf; i++)
+                k += snprintf(buf + k, sizeof buf - (size_t)k, "\n%d  %s · %s%s", i + 1, e->variant_name[i],
+                              e->variant_info[i], e->variant && !strcmp(e->variant, e->variant_name[i]) ? "  ← aberto" : "");
+            if (!e->n_variants) snprintf(buf + k, sizeof buf - (size_t)k, " none found in the models folder");
+            else if (*arg) snprintf(buf + k, sizeof buf - (size_t)k, "\nno model matches \"%s\"", arg);
+            in->note = dup_str(buf);
+        } else if (e->variant && !strcmp(e->variant, e->variant_name[pick])) {
+            in->note = fmt_str("%s is the one open%s", e->variant_name[pick], "");
+        } else {
+            s->switch_to = pick + 1;              /* the caller closes this one and opens that */
+            in->kind = GLM53F_IN_QUIT;
+            in->note = fmt_str("switching to %s%s", e->variant_name[pick], "");
+        }
     } else if (!strcmp(line, "/sessions")) {
         in->note = lc_session_list(s);
     } else if (!strcmp(line, "/resume") || !strncmp(line, "/resume ", 8)) {

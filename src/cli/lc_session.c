@@ -236,6 +236,8 @@ static LcSess *sess_open(Glm53fChat *s)
     json_put(&o, lc_tools_root() ? lc_tools_root() : "");
     s_str(&o, ",\"model\":");
     json_put(&o, s->e->name);
+    s_str(&o, ",\"variant\":");
+    json_put(&o, s->e->variant ? s->e->variant : "");
     s_fmt(&o, ",\"level\":%d,\"ctx\":%d,\"reasoning\":", s->agent_level, s->e->cap);
     json_put(&o, s->reasoning);
     s_str(&o, "}");
@@ -316,6 +318,8 @@ void lc_session_end(Glm53fChat *s, int keep_state)
                     char name[64];
                     snprintf(name, sizeof name, "%s.q38s", x->stamp);
                     json_put(&o, name);
+                    s_str(&o, ",\"variant\":");
+                    json_put(&o, e->variant ? e->variant : "");
                     s_fmt(&o, ",\"pos\":%d,\"level\":%d,\"ctx\":%d}", pos, s->agent_level, e->cap);
                     put_line(s, &o);
                     prune_states(dir);
@@ -611,6 +615,11 @@ char *lc_session_resume(Glm53fChat *s, const char *arg, int *ok)
             pos = json_int(line, "pos", -1);
             level = json_int(line, "level", level);
             ctx = json_int(line, "ctx", 0);
+            /* a state of another model file (or of before variants were recorded) does not fit
+             * this one, even with the same shapes: from the text instead */
+            char *v = json_get(line, "variant");
+            if (!v || !e->variant || strcmp(v, e->variant)) ctx = -1;
+            free(v);
         }
         free(t);
         free(line);

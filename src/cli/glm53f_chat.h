@@ -54,6 +54,12 @@ typedef struct Glm53fEngine {
      * load the state is undefined (reset). */
     int  (*state_save)(struct Glm53fEngine *e, const char *path);
     int  (*state_load)(struct Glm53fEngine *e, const char *path);
+    /* which file of the model is open ("UD-IQ4_XS"): saved states belong to it alone; and
+     * the variants on this machine that /model offers (name, "87 GB"), the open one first
+     * found by name */
+    const char *variant;
+    int         n_variants;
+    const char *variant_name[8], *variant_info[8];
 } Glm53fEngine;
 
 enum { GLM53F_DESC_BANNER, GLM53F_DESC_SETTINGS, GLM53F_DESC_STATS };
@@ -101,6 +107,7 @@ typedef struct {
     int          base;           /* positions the context's opening takes (the agent's system block) */
     const char  *resume;         /* set by the caller: resume this session (as /resume takes it) at start */
     char        *start_note;     /* what that resume says, shown when the screen opens */
+    int          switch_to;      /* /model: 1 + the variant to open next (the session ends), 0 none */
 } Glm53fChat;
 
 int glm53f_chat_run(Glm53fChat *s);

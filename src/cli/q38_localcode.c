@@ -26,6 +26,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
+#else
+#include <strings.h>
+#define _stricmp strcasecmp
 #endif
 
 typedef struct {
@@ -270,40 +273,125 @@ static void load_end(int ok)
 
 /* Without a model given: the first shard in %USERPROFILE%\models\Qwen3.8-Flash-Next\UD-Q4_K_XL
  * (where start.bat looks too), so `localcode` typed in any folder opens it there. */
-static int default_model(char *out, size_t cap)
+/* ----------------------------------------------------------------- variants ---- */
+/* The files of the model on this machine: every folder of LOCALCODE_MODELS_DIR (default
+ * %USERPROFILE%\models\Qwen3.8-Flash-Next) that holds a GGUF is one variant, named by its
+ * folder (UD-Q4_K_XL, UD-IQ4_XS), largest first. The one opened last is remembered in
+ * %LOCALAPPDATA%\localcode\model.txt and opens by default. */
+typedef struct { char name[96], path[1100], info[48]; double gb; } Variant;
+
+static int list_variants(Variant *v, int max)
 {
+    int n = 0;
 #ifdef _WIN32
-    const char *home = getenv("USERPROFILE");
-    if (!home) return 0;
-    static const char *pats[] = { "*-00001-of-*.gguf", "*.gguf" };
-    for (int i = 0; i < 2; i++) {
-        char dir[1024], pat[1100];
-        snprintf(dir, sizeof dir, "%s\\models\\Qwen3.8-Flash-Next\\UD-Q4_K_XL", home);
-        snprintf(pat, sizeof pat, "%s\\%s", dir, pats[i]);
-        WIN32_FIND_DATAA fd;
-        HANDLE h = FindFirstFileA(pat, &fd);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        FindClose(h);
-        snprintf(out, cap, "%s\\%s", dir, fd.cFileName);
-        return 1;
-    }
+    char base[1024];
+    const char *e = getenv("LOCALCODE_MODELS_DIR"), *home = getenv("USERPROFILE");
+    if (e && *e) snprintf(base, sizeof base, "%s", e);
+    else if (home) snprintf(base, sizeof base, "%s\\models\\Qwen3.8-Flash-Next", home);
+    else return 0;
+    char pat[1100];
+    snprintf(pat, sizeof pat, "%s\\*", base);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.' || n >= max) continue;
+        char dir[1100], gp[1200];
+        snprintf(dir, sizeof dir, "%s\\%s", base, fd.cFileName);
+        snprintf(gp, sizeof gp, "%s\\*.gguf", dir);
+        WIN32_FIND_DATAA g;
+        HANDLE hg = FindFirstFileA(gp, &g);
+        if (hg == INVALID_HANDLE_VALUE) continue;
+        Variant *x = &v[n];
+        memset(x, 0, sizeof *x);
+        snprintf(x->name, sizeof x->name, "%s", fd.cFileName);
+        do {
+            x->gb += ((double)g.nFileSizeHigh * 4294967296.0 + (double)g.nFileSizeLow) / 1073741824.0;   /* GiB, as Explorer shows */
+            /* the first shard of a split, else the first file */
+            if (!x->path[0] || strstr(g.cFileName, "-00001-of-")) snprintf(x->path, sizeof x->path, "%s\\%s", dir, g.cFileName);
+        } while (FindNextFileA(hg, &g));
+        FindClose(hg);
+        snprintf(x->info, sizeof x->info, "%.0f GB", x->gb);
+        n++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    for (int i = 0; i < n; i++)                  /* largest first */
+        for (int j = i + 1; j < n; j++)
+            if (v[j].gb > v[i].gb) { Variant t = v[i]; v[i] = v[j]; v[j] = t; }
 #else
-    (void)out;
-    (void)cap;
+    (void)v;
+    (void)max;
 #endif
-    return 0;
+    return n;
+}
+
+static void remembered_path(char *out, size_t cap)
+{
+    const char *base = getenv("LOCALAPPDATA");
+    snprintf(out, cap, "%s\\localcode\\model.txt", base ? base : ".");
+}
+
+/* the variant a name picks: exact, else the first whose name holds it (any case) */
+static int find_variant(const Variant *v, int n, const char *name)
+{
+    for (int i = 0; i < n; i++) if (!_stricmp(v[i].name, name)) return i;
+    for (int i = 0; i < n; i++) {
+        for (const char *h = v[i].name; *h; h++) {
+            const char *a = name, *b = h;
+            while (*a && *b && (*a | 32) == (*b | 32)) { a++; b++; }
+            if (!*a) return i;
+        }
+    }
+    return -1;
+}
+
+/* The variant name of a model file: its folder's name, else the file's without extension. */
+static void variant_of(const char *path, char *out, size_t cap)
+{
+    char p[1200];
+    snprintf(p, sizeof p, "%s", path);
+    char *slash = strrchr(p, '\\'), *s2 = strrchr(p, '/');
+    if (s2 > slash) slash = s2;
+    if (slash) {
+        *slash = 0;
+        char *up = strrchr(p, '\\'), *u2 = strrchr(p, '/');
+        if (u2 > up) up = u2;
+        snprintf(out, cap, "%s", up ? up + 1 : p);
+    } else {
+        snprintf(out, cap, "%s", p);
+        char *dot = strrchr(out, '.');
+        if (dot) *dot = 0;
+    }
+}
+
+/* /model asked for a file that does not open: say why (load_end showed the log) and open the
+ * previous one again. Returns 1 when there is one to go back to. */
+static int back_to_previous(q38_model *m, const char **path, char *prev)
+{
+    q38_model_close(m);
+    if (!prev[0]) return 0;
+    char name[128];
+    variant_of(prev, name, sizeof name);
+    printf("localcode · esse modelo não abre neste motor ainda; voltando para %s…\n", name);
+    fflush(stdout);
+    static char back[1200];
+    snprintf(back, sizeof back, "%s", prev);
+    *path = back;
+    prev[0] = 0;
+    return 1;
 }
 
 static void usage(void)
 {
     fprintf(stderr,
             "localcode - Qwen3.8-Flash-Next on this engine\n\n"
-            "  localcode [model.gguf] [--ctx N] [--gen N] [--level 0|1|2] [--continue] [--reasoning xhigh|medium|low] [--threads N]\n\n"
+            "  localcode [--model NAME|FILE] [--ctx N] [--gen N] [--level 0|1|2] [--continue] [--reasoning xhigh|medium|low]\n\n"
+            "--model: a variant by name (UD-IQ4_XS, or part of it: iq4) or any shard of a GGUF; the variants are the\n"
+            "         folders of %%USERPROFILE%%\\models\\Qwen3.8-Flash-Next (LOCALCODE_MODELS_DIR); without it, the one\n"
+            "         opened last (/model switches inside localcode), else LOCALCODE_MODEL, else the largest\n"
             "--level: 0 chat, 1 quick (reads the files of this folder), 2 agent (edits files, runs commands; default)\n"
             "--continue: go back to the latest conversation of this folder (as /resume)\n"
-            "The model is any shard of the split GGUF, or LOCALCODE_MODEL in the environment, or the first\n"
-            "shard in %%USERPROFILE%%\\models\\Qwen3.8-Flash-Next\\UD-Q4_K_XL. The folder it starts in is the\n"
-            "agent's working folder (install-cli.bat puts `localcode` on the PATH).\n");
+            "The folder it starts in is the agent's working folder (install-cli.bat puts `localcode` on the PATH).\n");
 }
 
 int main(int argc, char **argv)
@@ -312,7 +400,7 @@ int main(int argc, char **argv)
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
-    const char *path = getenv("LOCALCODE_MODEL");
+    const char *path = NULL, *want = NULL;
     int ctx = 0, gen = 2048, threads = 0, agent_level = 2;
     double cache_gb = 0;
     int gpu = -1;                       /* -1: try GPU 1 then 0; -2: --cpu */
@@ -329,13 +417,41 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--gpu") && i + 1 < argc) gpu = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cpu")) gpu = -2;
         else if (!strcmp(argv[i], "--continue") || !strcmp(argv[i], "-c")) resume = "1";
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) want = argv[++i];
         else if (!strcmp(argv[i], "--preload-gb") && i + 1 < argc) preload_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
         else if (argv[i][0] != '-') path = argv[i];
         else { usage(); return 2; }
     }
-    static char found[1200];
-    if (!path && default_model(found, sizeof found)) path = found;
+    /* which file: --model or a path given, else the one opened last, else LOCALCODE_MODEL,
+     * else the largest variant */
+    static Variant vars[8];
+    const int nvars = list_variants(vars, 8);
+    if (!path && want) {
+        FILE *f = fopen(want, "rb");
+        if (f) { fclose(f); path = want; }
+        else {
+            const int k = find_variant(vars, nvars, want);
+            if (k < 0) {
+                fprintf(stderr, "no model matches \"%s\"; on this machine:\n", want);
+                for (int i = 0; i < nvars; i++) fprintf(stderr, "  %s  %s\n", vars[i].name, vars[i].info);
+                return 2;
+            }
+            path = vars[k].path;
+        }
+    }
+    if (!path) {
+        char rp[1100], name[128] = "";
+        remembered_path(rp, sizeof rp);
+        FILE *f = fopen(rp, "rb");
+        if (f) {
+            if (fgets(name, sizeof name, f)) name[strcspn(name, "\r\n")] = 0;
+            fclose(f);
+        }
+        for (int i = 0; i < nvars && !path && name[0]; i++) if (!_stricmp(vars[i].name, name)) path = vars[i].path;
+    }
+    if (!path) path = getenv("LOCALCODE_MODEL");
+    if (!path && nvars) path = vars[0].path;
     if (!path) { usage(); return 2; }
     int li = -1;
     for (int i = 0; i < 3; i++) if (!strcmp(level, QWEN_LEVELS[i].name)) li = i;
@@ -349,10 +465,17 @@ int main(int argc, char **argv)
 #endif
 
     static q38_model m;
+    static char next_path[1200], prev_path[1200];
+    int rc = 1;
+    for (;;) {                          /* once per model: /model closes it and opens another */
+    memset(&m, 0, sizeof m);
+    memset(&g_dec, 0, sizeof g_dec);
+    char variant[128];
+    variant_of(path, variant, sizeof variant);
     const double t0 = now_s();
     load_begin();
     load_stage("abrindo o modelo");
-    if (q38_model_open(&m, path, ctx)) { load_end(0); return 1; }
+    if (q38_model_open(&m, path, ctx)) { load_end(0); if (back_to_previous(&m, &path, prev_path)) continue; return 1; }
     load_stage("levando o tronco para a GPU");
     int on_gpu = -1;
 #ifdef Q38_CUDA
@@ -365,7 +488,7 @@ int main(int argc, char **argv)
 #endif
     if (cache_gb > 0) q38_model_set_cache(&m, cache_gb);
     q38_tok *tok = q38_tok_load(&m.g);
-    if (!tok) { load_end(0); return 1; }
+    if (!tok) { load_end(0); if (back_to_previous(&m, &path, prev_path)) continue; return 1; }
 
     QwenEngine q;
     memset(&q, 0, sizeof q);
@@ -430,6 +553,15 @@ int main(int argc, char **argv)
 #ifdef Q38_CUDA
     if (on_gpu >= 0) { e.state_save = qw_state_save; e.state_load = qw_state_load; }
 #endif
+    e.variant = variant;
+    e.n_variants = nvars;
+    for (int i = 0; i < nvars; i++) { e.variant_name[i] = vars[i].name; e.variant_info[i] = vars[i].info; }
+    {   /* the one that opens next time */
+        char rp[1100];
+        remembered_path(rp, sizeof rp);
+        FILE *f = fopen(rp, "wb");
+        if (f) { fprintf(f, "%s\n", variant); fclose(f); }
+    }
 
     Glm53fChat s;
     memset(&s, 0, sizeof s);
@@ -448,7 +580,7 @@ int main(int argc, char **argv)
     s.text_cap = GLM53F_CHAT_MAX_GEN * 64 + 1;
     s.text = (char *)malloc((size_t)s.text_cap);
     s.logits = (float *)malloc((size_t)m.c.n_vocab * sizeof(float));
-    int rc = 1;
+    rc = 1;
     if (s.ids && s.out && s.text && s.logits) rc = glm53f_chat_run(&s);
     free(s.ids);
     free(s.out);
@@ -465,5 +597,15 @@ int main(int argc, char **argv)
     }
     q38_tok_free(tok);
     q38_model_close(&m);
+    if (rc != 0 || !s.switch_to || s.switch_to > nvars) break;
+    /* /model: the other file opens, and the conversation (when there was one) goes on in it
+     * from its transcript */
+    snprintf(prev_path, sizeof prev_path, "%s", path);
+    snprintf(next_path, sizeof next_path, "%s", vars[s.switch_to - 1].path);
+    path = next_path;
+    resume = s.turns > 0 ? "1" : NULL;
+    printf("localcode · trocando para %s…\n", vars[s.switch_to - 1].name);
+    fflush(stdout);
+    }
     return rc;
 }

@@ -132,6 +132,7 @@ static int system_from_file(Glm53fChat *s, const Str *sys, Glm53fTurnSink *k)
     const char *build = __DATE__ __TIME__;
     for (const char *p = build; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
     h ^= (unsigned)e->cap; h *= 1099511628211ULL;
+    for (const char *p = e->variant ? e->variant : ""; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
     for (int i = 0; i < n; i++) { h ^= (unsigned)s->ids[i]; h *= 1099511628211ULL; }
     const char *base = getenv("LOCALAPPDATA");
     if (!base) return 0;
