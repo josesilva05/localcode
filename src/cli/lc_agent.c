@@ -112,6 +112,8 @@ static void system_block(Str *t, int level)
                  "- The user may decline a change or a command; then take another way or ask.\n"
                  "- Finish with a short answer in the user's language: what you found or changed, and how you checked it.");
     }
+    s_str(t, "\nWhen the user writes in Portuguese, answer in Brazilian Portuguese (pt-BR: \"arquivo\", \"rodar\", "
+             "\"você\", \"me diga\"), never European Portuguese (\"ficheiro\", \"correr\", \"tu\", \"diz-me\").");
     s_str(t, "<|im_end|>\n");
 }
 

@@ -696,7 +696,7 @@ static const char COMPACT_PROMPT[] =
     "4. The current state: what works, what fails, what is in progress.\n"
     "5. The next steps, in order.\n"
     "Be complete but dense; leave out pleasantries and whatever no longer matters. Write in the language the "
-    "user writes in. Reply with the summary text only.";
+    "user writes in (Portuguese: Brazilian Portuguese). Reply with the summary text only.";
 
 static int summary_budget(int cap)
 {
