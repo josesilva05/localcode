@@ -133,7 +133,7 @@ static int bind(q38_model *m, q38_mat *w, const char *name, int64_t ne0, int64_t
     w->t = t;
     if (load) {
         w->data = (uint8_t *)malloc((size_t)t->nbytes);
-        if (!w->data || q38_gguf_read(&m->g, t, 0, w->data, t->nbytes)) {
+        if (!w->data || q38_gguf_read_tensor(&m->g, t, w->data)) {
             fprintf(stderr, "q38: cannot load %s (%.1f MB)\n", name, t->nbytes / 1e6);
             return -1;
         }

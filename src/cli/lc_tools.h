@@ -37,7 +37,11 @@ int  lc_tool_needs_approval(const char *name);
 /* One line saying what a call will do ("edit_file src/main.c", "run: cmake --build build"). */
 void lc_tool_title(const LcCall *c, char *buf, size_t cap);
 
-/* Carry out a call. Returns the text for the model (malloc'd, never NULL unless out of
+/* The skills found for this working directory, one "- name: description" line each, for the
+ * system prompt; "" when there are none (the skill tool is then not offered). */
+const char *lc_skills_block(void);
+
+/* Carry out a call (plan and test are the agent's own: lc_agent.c handles them). Returns the text for the model (malloc'd, never NULL unless out of
  * memory); summary gets one line for the screen; *ok 0 when the call failed. stop is
  * polled by long calls (run) and ends them early. */
 char *lc_tool_run(const LcCall *c, volatile int *stop, char *summary, size_t scap, int *ok);

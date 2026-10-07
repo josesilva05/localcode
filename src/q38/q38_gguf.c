@@ -27,7 +27,8 @@
  *    aims 20 points lower. While the disk is above that, every 250 ms starts with a quiet
  *    window in which no read of the model starts, the same window for every thread (a
  *    pause per thread lets the threads' reads overlap and the disk never goes idle); the
- *    window doubles at once past the ceiling and shortens below the aim. */
+ *    window doubles at once past the ceiling (up to a second, longer than the tick, so a
+ *    slowed SSD can drain) and shortens below the aim. */
 #ifdef _WIN32
 static volatile LONG g_disk_pause_ms;          /* the quiet window per 250 ms */
 static volatile LONG64 g_quiet_until;          /* GetTickCount64 at which reads may start again */
@@ -79,7 +80,10 @@ static DWORD WINAPI gov_main(LPVOID arg)
         if (busy >= ceiling)        d = d * 2 > 40 ? d * 2 : 40;       /* past the ceiling: at once */
         else if (busy > target)     d = d ? d * 3 / 2 + 1 : 8;
         else if (busy < target - 5) d = d * 2 / 3;
-        if (d > 150) d = 150;
+        /* up to a second, beyond the 250 ms tick: when the SSD slows down (heat: 57 MB/s at 100%
+         * active on 2026-10-07, against 900 MB/s at 78% hours earlier) a read in flight outlasts a
+         * short window and the disk never idles; reads then wait until it has */
+        if (d > 1000) d = 1000;
         InterlockedExchange(&g_disk_pause_ms, d);
         if (d > 0) InterlockedExchange64(&g_quiet_until, (LONG64)(GetTickCount64() + (ULONGLONG)d));
     }
@@ -598,6 +602,19 @@ int q38_gguf_pread_multi(q38_gguf *g, int n, const q38_tensor *const *t, const i
 int q38_gguf_pread_direct(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes)
 {
     return q38_gguf_pread_multi(g, 1, &t, &off, &dst, &nbytes);
+}
+
+/* A whole tensor, in 8 MB direct reads (each after the disk governor): read through the OS
+ * file cache, a cold trunk came in at 50 MB/s in the cache manager's small page-ins, which
+ * the governor cannot pace, with the disk at 100% (2026-10-07: 117 s for 5.5 GB). */
+int q38_gguf_read_tensor(q38_gguf *g, const q38_tensor *t, void *dst)
+{
+    const int64_t piece = (int64_t)8 << 20;
+    for (int64_t off = 0; off < t->nbytes; off += piece) {
+        const int64_t n = t->nbytes - off < piece ? t->nbytes - off : piece;
+        if (q38_gguf_pread_direct(g, t, off, (char *)dst + off, n)) return q38_gguf_read(g, t, 0, dst, t->nbytes);
+    }
+    return 0;
 }
 
 int q38_gguf_pread(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes)

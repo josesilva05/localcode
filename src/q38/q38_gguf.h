@@ -110,6 +110,8 @@ int  q38_gguf_pread_direct(q38_gguf *g, const q38_tensor *t, int64_t off, void *
 int  q38_gguf_pread_multi(q38_gguf *g, int n, const q38_tensor *const *t, const int64_t *off, void *const *dst,
                           const int64_t *nbytes);
 int  q38_gguf_pread(q38_gguf *g, const q38_tensor *t, int64_t off, void *dst, int64_t nbytes);
+/* A whole tensor into dst, past the OS file cache in 8 MB pieces paced by the governor. */
+int  q38_gguf_read_tensor(q38_gguf *g, const q38_tensor *t, void *dst);
 /* The disk governor (q38_gguf.c): the last measured active time of the model's disk in
  * percent (-1 unknown), and the pause it currently puts before each expert read. */
 int  q38_gguf_disk_busy(void);

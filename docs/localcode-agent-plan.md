@@ -40,3 +40,29 @@ Restrições do nosso hardware: um modelo só a ~10 tok/s → os subagentes roda
 3. Contextos de subagente + nível 3 para código com testes.
 4. Críticos de web (Playwright) e de documentos.
 5. Ajuste com tarefas reais: tempo, taxa de vitória na comparação cega, regressões.
+
+## O ciclo de programação do nível 2 (2026-10-07)
+
+Planejar → programar → testar → (depurar → corrigir → retestar)* → finalizar, conduzido pelo código (`lc_agent.c`, `Flow`), não pela palavra do modelo:
+
+- `plan(steps, test_command)` registra os passos e o comando que prova a tarefa (código de saída 0 = funciona); a tela mostra o plano numerado.
+- `test([command])` roda o comando; o código de saída decide. Uma falha **depois de uma mudança nova** é uma tentativa; no máximo **5** tentativas, ou **a mesma falha 3 vezes seguidas**: aí o controlador manda parar e responder o que tentou e o que falta, e não executa mais ferramentas.
+- Passou: o agente finaliza na hora (resposta curta: o que mudou e o teste que passou). Se passar de primeira, acabou.
+- Uma resposta final depois de mudar arquivos sem testar é devolvida para testar (no máximo 2 vezes).
+- Uma pergunta que não muda nada é respondida direto, sem plano nem teste. O agente segue direto, sem esperar aprovação do plano.
+
+**Skills**: pastas com `SKILL.md` (cabeçalho `name:` / `description:` entre `---`, depois as instruções) em `.localcode/skills` e `.claude/skills` da pasta de trabalho e em `%USERPROFILE%\.localcode\skills`. O agente vê nomes e descrições; `skill(name)` carrega as instruções (e `file` outros arquivos da pasta da skill). Quando uma skill cobre a tarefa, ela vale sobre o ciclo padrão.
+
+## Um motor que se ajusta a cada modelo (desenho, 2026-10-07)
+
+Sem clonar o projeto por modelo. Três camadas:
+
+| Camada | O quê | Onde |
+|---|---|---|
+| Núcleo comum | leitor GGUF, todos os tipos de quantização (CPU e GPU), cache de especialistas, monitor de disco, arquivos de estado, tokenizador, interface e agente | uma biblioteca (`lc_core`) |
+| Motor da família | a arquitetura (Qwen3.8: GDN + atenção com indexador + PLE + hyper-connections; GLM-5.3: MLA + DSA) | um módulo por família, escolhido por `general.architecture` do GGUF; compilados juntos, com registro |
+| Perfil do modelo | formato de chamada de ferramenta, marcas de raciocínio, níveis de esforço, contexto padrão, orçamento de compactação, ajustes de prompt (pt-BR), limites do agente, parâmetros de cache/VRAM | `perfil.json` por modelo/variante, editável sem recompilar |
+
+Calibração (`localcode --calibrar`): mede nesta máquina e grava no perfil — velocidade (cache de RAM, divisão de VRAM, lote, prefetch, sem passar de 95% de disco) e qualidade (um conjunto pequeno de tarefas de agente: acertos, passos, tempo).
+
+Ordem: (1) o ciclo do agente — feito; (2) perfil de modelo; (3) núcleo comum + registro por arquitetura (juntar o que está duplicado entre os motores GLM e Qwen); (4) calibração.

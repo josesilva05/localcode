@@ -106,11 +106,23 @@ static void system_block(Str *t, int level)
     } else {
         s_fmt(t, "You are localcode, a coding agent working in the folder %s on the user's Windows computer, "
                  "through the functions above (paths relative to that folder; run uses PowerShell).\n", lc_tools_root());
-        s_str(t, "- Look before you change: list, search and read the files involved.\n"
-                 "- Make the smallest correct change with edit_file; use write_file only for new files or full rewrites.\n"
-                 "- After a change, check it: build, run the tests or the program with run, and fix what fails.\n"
-                 "- The user may decline a change or a command; then take another way or ask.\n"
-                 "- Finish with a short answer in the user's language: what you found or changed, and how you checked it.");
+        s_str(t, "For a task that changes code, work in this order:\n"
+                 "1. Look: list, search and read the files involved.\n"
+                 "2. Plan: call plan with the steps and a test_command that proves the task works (the project's "
+                 "tests, a build, or running the program with a check; write a small check when there is none).\n"
+                 "3. Code: the smallest correct change with edit_file; write_file only for new files or full rewrites.\n"
+                 "4. Test: call test after the change.\n"
+                 "5. If it fails: debug (read the error, find its cause in the code), fix, and call test again. "
+                 "At most 5 failed attempts; then stop and say what still fails.\n"
+                 "6. When the test passes, finish at once: a short answer with what you changed and the test that passed.\n"
+                 "A question that changes nothing is answered directly, without plan or test. The user may decline a "
+                 "change or a command; then take another way or ask. Answer in the user's language.");
+    }
+    if (*lc_skills_block()) {
+        s_str(t, "\n\nSkills (instructions for kinds of tasks, written by the user):\n");
+        s_str(t, lc_skills_block());
+        s_str(t, "When a skill covers the task, call skill with its name first and follow it; where its steps differ "
+                 "from the workflow above, the skill's win.");
     }
     s_str(t, "\nWhen the user writes in Portuguese, answer in Brazilian Portuguese (pt-BR: \"arquivo\", \"rodar\", "
              "\"você\", \"me diga\"), never European Portuguese (\"ficheiro\", \"correr\", \"tu\", \"diz-me\").");
@@ -260,15 +272,133 @@ static int parse_calls(const char *post, LcCall *calls, int max)
 static int tool_bit(const char *name)
 {
     static const char *names[] = { "write_file", "edit_file", "run" };
+    if (!strcmp(name, "test")) return 1 << 2;           /* a command too: run's permission */
     for (int i = 0; i < 3; i++) if (!strcmp(name, names[i])) return 1 << i;
     return 0;
+}
+
+/* --------------------------------------------------------- the coding loop ---- */
+/* plan -> code -> test -> (debug -> fix -> test)* -> finish, held by the code, not by the
+ * model's word: test's exit code decides, a failure after a change is an attempt, MAX_FIX
+ * attempts or the same failure three times in a row stop the loop, and an answer given
+ * after a change that was never tested is sent back to test (twice at most). */
+#define MAX_FIX 5
+
+typedef struct {
+    char *test_cmd;          /* the plan's */
+    int   planned, plan_hint, edited, edits_since_test, attempts, same, stopped, stopped_calls, nudges, passed;
+    unsigned long long last_fail;
+} Flow;
+
+/* a failure's output without its last line ("[exit code N · 1.2 s]": the time varies) */
+static unsigned long long fail_hash(const char *out)
+{
+    const char *end = out + strlen(out), *tail = NULL;
+    for (const char *p = out; (p = strstr(p, "[exit code")); p++) tail = p;
+    if (tail) end = tail;
+    unsigned long long h = 1469598103934665603ULL;
+    for (const char *p = out; p < end; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* plan: the steps for the screen (numbered) and the test command kept */
+static char *flow_plan(Flow *fl, const LcCall *c, char *sum, size_t sc, int *ok)
+{
+    const char *steps = lc_call_arg(c, "steps"), *tc = lc_call_arg(c, "test_command");
+    free(fl->test_cmd);
+    fl->test_cmd = NULL;
+    if (tc && *tc) {
+        fl->test_cmd = (char *)malloc(strlen(tc) + 1);
+        if (fl->test_cmd) strcpy(fl->test_cmd, tc);
+    }
+    fl->planned = 1;
+    Str sm = { 0 };
+    int k = 0;
+    for (const char *p = steps ? steps : ""; *p;) {
+        const char *nl = strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : strlen(p);
+        const char *q = p;
+        while (n && (*q == ' ' || *q == '-' || *q == '*' || (*q >= '0' && *q <= '9') || *q == '.' || *q == ')')) { q++; n--; }
+        while (n && (q[n - 1] == '\r' || q[n - 1] == ' ')) n--;
+        if (n) { s_fmt(&sm, "%s%d. ", k ? "\n" : "", ++k); s_add(&sm, q, n); }
+        p = nl ? nl + 1 : p + strlen(p);
+    }
+    s_fmt(&sm, "%steste: %s", k ? "\n" : "", fl->test_cmd ? fl->test_cmd : "(nenhum)");
+    snprintf(sum, sc, "%s", sm.p ? sm.p : "");
+    free(sm.p);
+    *ok = 1;
+    Str r = { 0 };
+    s_fmt(&r, "Plan recorded, %d step%s; test: %s.\n", k, k == 1 ? "" : "s", fl->test_cmd ? fl->test_cmd : "none given");
+    s_str(&r, fl->test_cmd ? "Implement it step by step; after the change, call test."
+                           : "Give a test_command (call plan again): the task is checked by it.");
+    return r.p;
+}
+
+/* test: run the command, then the verdict that steers the next step */
+static char *flow_test(Flow *fl, const char *cmd, volatile int *stop, char *sum, size_t sc, int *ok)
+{
+    LcCall rc;
+    memset(&rc, 0, sizeof rc);
+    snprintf(rc.name, sizeof rc.name, "run");
+    rc.key[0] = (char *)"command";
+    rc.val[0] = (char *)cmd;
+    rc.key[1] = (char *)"timeout_s";
+    rc.val[1] = (char *)"600";
+    rc.n = 2;
+    char rsum[300];
+    int rok = 0;
+    char *out = lc_tool_run(&rc, stop, rsum, sizeof rsum, &rok);
+    Str r = { 0 };
+    s_str(&r, out ? out : "(no output)\n");
+    const int changed = fl->edits_since_test > 0;       /* an attempt is a test after a new change */
+    fl->edits_since_test = 0;
+    if (rok) {
+        fl->passed = 1;
+        s_str(&r, "[localcode] TEST PASSED. The task is done: finish now with a short answer (what you changed, and "
+                  "this test passing). Do not change anything else.");
+        snprintf(sum, sc, "passou ✓ · %s", rsum);
+    } else {
+        fl->passed = 0;
+        const unsigned long long h = out ? fail_hash(out) : 0;
+        fl->same = h == fl->last_fail ? fl->same + 1 : 0;
+        fl->last_fail = h;
+        if (changed) fl->attempts++;                 /* before any change it only shows the problem */
+        if (fl->attempts >= MAX_FIX || fl->same >= 2) {
+            fl->stopped = 1;
+            if (fl->same >= 2) {
+                s_str(&r, "[localcode] STOP: the same failure three times in a row. Do not call more functions: answer "
+                          "now with what you tried, what still fails (the error), and what would be needed.");
+                snprintf(sum, sc, "falhou · parou: a mesma falha 3 vezes · %s", rsum);
+            } else {
+                s_fmt(&r, "[localcode] STOP: the test still fails after %d attempts. Do not call more functions: answer "
+                          "now with what you tried, what still fails (the error), and what you would try next.", fl->attempts);
+                snprintf(sum, sc, "falhou · parou após %d tentativas · %s", fl->attempts, rsum);
+            }
+        } else if (fl->same == 1) {
+            s_fmt(&r, "[localcode] TEST FAILED with the same output as before%s. Re-read the error, question your "
+                      "assumption, and try a different fix (attempt %d of %d used).",
+                  changed ? ": your last change did not affect it" : " (nothing changed since)", fl->attempts, MAX_FIX);
+            snprintf(sum, sc, "falhou igual · %d de %d tentativas · %s", fl->attempts, MAX_FIX, rsum);
+        } else if (!fl->edited) {
+            s_str(&r, "[localcode] TEST FAILED (before any change: the problem, shown). Find its cause in the code, fix "
+                      "it with the smallest change, then call test again.");
+            snprintf(sum, sc, "falhou · antes da mudança · %s", rsum);
+        } else {
+            s_fmt(&r, "[localcode] TEST FAILED. Debug: read the error above, find its cause in the code, fix it with "
+                      "the smallest change, then call test again (attempt %d of %d used).", fl->attempts, MAX_FIX);
+            snprintf(sum, sc, "falhou · %d de %d tentativas · %s", fl->attempts, MAX_FIX, rsum);
+        }
+    }
+    free(out);
+    *ok = rok;
+    return r.p;
 }
 
 /* What the user sees before allowing a call: the change or the command. */
 static void call_detail(const LcCall *c, Str *d)
 {
     const char *v;
-    if (!strcmp(c->name, "run") && (v = lc_call_arg(c, "command"))) {
+    if ((!strcmp(c->name, "run") || !strcmp(c->name, "test")) && (v = lc_call_arg(c, "command"))) {
         s_str(d, v);
     } else if (!strcmp(c->name, "edit_file")) {
         const char *o = lc_call_arg(c, "old_string"), *nw = lc_call_arg(c, "new_string");
@@ -289,7 +419,9 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
 {
     Glm53fEngine *e = s->e;
     volatile int *stop = glm53f_chat_stop_flag();
-    const int level = s->agent_level, max_steps = level == 1 ? 12 : 40;
+    const int level = s->agent_level, max_steps = level == 1 ? 12 : 60;
+    Flow fl;
+    memset(&fl, 0, sizeof fl);
     char line[512];
     *stop = 0;
 
@@ -402,7 +534,26 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
             failed = 1;
             break;
         }
-        if (!nc) break;                          /* answered */
+        if (!nc) {                               /* answered */
+            if (level >= 2 && fl.edits_since_test > 0 && fl.planned && !fl.stopped && fl.nudges < 2) {
+                /* changed files, not tested since: back to test before finishing */
+                fl.nudges++;
+                answer.n = 0;
+                if (answer.p) answer.p[0] = 0;
+                if (k->tool) k->tool(k, "teste pendente", "mudou arquivos sem testar depois: o agente volta a testar", 1);
+                s_str(&t, "<|im_end|>\n<|im_start|>user\n[localcode] You changed files and have not called test since. "
+                          "Call test now (debug, fix and test again if it fails), then finish.<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\n");
+                if (++steps >= max_steps) { why_stop = "stopped: too many steps"; break; }
+                continue;
+            }
+            break;
+        }
+        if (fl.stopped && ++fl.stopped_calls > 1) {     /* past the limit, still calling: stop here */
+            for (int i = 0; i < nc; i++) lc_call_free(&calls[i]);
+            why_stop = "stopped: the fix limit was reached and the model kept calling functions";
+            break;
+        }
 
         /* carry out the calls; their results open the next step */
         s_str(&t, "<|im_end|>\n<|im_start|>user");
@@ -412,7 +563,21 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
             lc_tool_title(c, title, sizeof title);
             char *res = NULL;
             int ok = 0;
-            if (!lc_tool_allowed(c->name, level)) {
+            const char *test_cmd = !strcmp(c->name, "test") ? (lc_call_arg(c, "command") && *lc_call_arg(c, "command")
+                                                                   ? lc_call_arg(c, "command") : fl.test_cmd) : NULL;
+            if (!strcmp(c->name, "test")) snprintf(title, sizeof title, "test %s", test_cmd ? test_cmd : "");
+            if (!strcmp(c->name, "plan")) snprintf(title, sizeof title, "plano");
+            if (fl.stopped) {
+                snprintf(sum, sizeof sum, "not run: the fix limit was reached");
+                res = (char *)malloc(200);
+                if (res) snprintf(res, 200, "[localcode] The fix limit was reached: no more functions. Answer now.");
+            } else if (lc_tool_allowed(c->name, level) && !strcmp(c->name, "plan")) {
+                res = flow_plan(&fl, c, sum, sizeof sum, &ok);
+            } else if (lc_tool_allowed(c->name, level) && !strcmp(c->name, "test") && !test_cmd) {
+                snprintf(sum, sizeof sum, "sem comando de teste");
+                res = (char *)malloc(200);
+                if (res) snprintf(res, 200, "No test command: call plan with a test_command, or give command.");
+            } else if (!lc_tool_allowed(c->name, level)) {
                 snprintf(sum, sizeof sum, "not available at level %d", level);
                 res = (char *)malloc(200);
                 if (res) snprintf(res, 200, "%s is not available at this level (%d); use the reading functions, or answer.", c->name, level);
@@ -421,7 +586,7 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                 const int bit = tool_bit(c->name);
                 if (lc_tool_needs_approval(c->name) && !s->auto_approve && !(s->always & (unsigned)bit)) {
                     Str d = { 0 };
-                    call_detail(c, &d);
+                    if (test_cmd) s_str(&d, test_cmd); else call_detail(c, &d);
                     const int a = k->approve ? k->approve(k, title, d.p ? d.p : "") : 0;
                     free(d.p);
                     if (a == 2) s->always |= (unsigned)bit;
@@ -434,9 +599,25 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                 }
                 if (go && *stop) { interrupted = 1; go = 0; }
                 if (go) {
-                    snprintf(line, sizeof line, "%s", title);
+                    snprintf(line, sizeof line, "%s", test_cmd ? "Testing" : title);
                     k->status(k, line, now_s());
-                    res = lc_tool_run(c, stop, sum, sizeof sum, &ok);
+                    if (test_cmd) {
+                        res = flow_test(&fl, test_cmd, stop, sum, sizeof sum, &ok);
+                    } else {
+                        res = lc_tool_run(c, stop, sum, sizeof sum, &ok);
+                        if (ok && (!strcmp(c->name, "edit_file") || !strcmp(c->name, "write_file"))) {
+                            fl.edited = 1;
+                            fl.edits_since_test++;
+                            fl.passed = 0;
+                            if (!fl.planned && !fl.plan_hint && res) {   /* once: the loop needs its test */
+                                fl.plan_hint = 1;
+                                const size_t rl = strlen(res);
+                                static const char HINT[] = "\n[localcode] No plan recorded: call plan (steps and test_command) before more changes.";
+                                char *g = (char *)realloc(res, rl + sizeof HINT);
+                                if (g) { memcpy(g + rl, HINT, sizeof HINT); res = g; }
+                            }
+                        }
+                    }
                     k->status(k, NULL, 0.0);
                 }
             }
@@ -501,6 +682,7 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     answer.p = NULL;
     free(t.p);
     free(actions.p);
+    free(fl.test_cmd);
     if (why_stop && failed) { k->done(k, why_stop, 2); return 0; }
     if (why_stop) { char m[600]; snprintf(m, sizeof m, "%s · %s", stats, why_stop); k->done(k, m, interrupted); return fatal ? -1 : 0; }
     k->done(k, stats, interrupted);

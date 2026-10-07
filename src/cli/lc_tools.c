@@ -324,31 +324,42 @@ static int is_binary(const char *p, long n)
 #define T_EDIT  "{\"type\": \"function\", \"function\": {\"name\": \"edit_file\", \"description\": \"Replace an exact piece of text in a file. old_string must appear exactly once (copy it from read_file, without the line numbers, with enough surrounding lines to be unique), unless replace_all is true.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_string\": {\"type\": \"string\"}, \"new_string\": {\"type\": \"string\"}, \"replace_all\": {\"type\": \"boolean\"}}, \"required\": [\"path\", \"old_string\", \"new_string\"]}}}"
 #define T_RUN   "{\"type\": \"function\", \"function\": {\"name\": \"run\", \"description\": \"Run a PowerShell command in the working directory (builds, tests, git, scripts) and get its output and exit code. Not for interactive programs.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout_s\": {\"type\": \"integer\", \"description\": \"seconds before it is stopped, default 120, at most 1800\"}}, \"required\": [\"command\"]}}}"
 
+#define T_PLAN  "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"PowerShell command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
+#define T_TEST  "{\"type\": \"function\", \"function\": {\"name\": \"test\", \"description\": \"Run the plan's test command (or command, when given) and tell whether it passes (exit code 0), with its output. Call it after every change.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"another test command; default the plan's\"}}, \"required\": []}}}"
+#define T_SKILL "{\"type\": \"function\", \"function\": {\"name\": \"skill\", \"description\": \"Load a skill listed in the instructions: its steps for a kind of task, to follow. file reads another file of the skill's folder.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, \"file\": {\"type\": \"string\"}}, \"required\": [\"name\"]}}}"
+
 const char *lc_tools_json(int level)
 {
-    if (level <= 1) return T_READ "\n" T_LIST "\n" T_GLOB "\n" T_GREP;
-    return T_READ "\n" T_LIST "\n" T_GLOB "\n" T_GREP "\n" T_WRITE "\n" T_EDIT "\n" T_RUN;
+    static Str l1 = { 0 }, l2 = { 0 };
+    Str *s = level <= 1 ? &l1 : &l2;
+    if (s->p) return s->p;
+    s_str(s, T_READ "\n" T_LIST "\n" T_GLOB "\n" T_GREP);
+    if (level >= 2) s_str(s, "\n" T_WRITE "\n" T_EDIT "\n" T_RUN "\n" T_PLAN "\n" T_TEST);
+    if (*lc_skills_block()) s_str(s, "\n" T_SKILL);      /* only where there are skills */
+    return s->p;
 }
 
 int lc_tool_allowed(const char *name, int level)
 {
-    static const char *reading[] = { "read_file", "list_dir", "glob", "grep" };
-    static const char *all[] = { "write_file", "edit_file", "run" };
-    for (int i = 0; i < 4; i++) if (!strcmp(name, reading[i])) return level >= 1;
-    for (int i = 0; i < 3; i++) if (!strcmp(name, all[i])) return level >= 2;
+    static const char *reading[] = { "read_file", "list_dir", "glob", "grep", "skill" };
+    static const char *all[] = { "write_file", "edit_file", "run", "plan", "test" };
+    for (int i = 0; i < 5; i++) if (!strcmp(name, reading[i])) return level >= 1;
+    for (int i = 0; i < 5; i++) if (!strcmp(name, all[i])) return level >= 2;
     return 0;
 }
 
 int lc_tool_needs_approval(const char *name)
 {
-    return !strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "run");
+    return !strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "run") || !strcmp(name, "test");
 }
 
 void lc_tool_title(const LcCall *c, char *buf, size_t cap)
 {
     const char *a = lc_call_arg(c, "path");
-    if (!strcmp(c->name, "run")) a = lc_call_arg(c, "command");
+    if (!strcmp(c->name, "run") || !strcmp(c->name, "test")) a = lc_call_arg(c, "command");
     else if (!strcmp(c->name, "glob") || !strcmp(c->name, "grep")) a = lc_call_arg(c, "pattern");
+    else if (!strcmp(c->name, "skill")) a = lc_call_arg(c, "name");
+    else if (!strcmp(c->name, "plan")) a = "";
     char one[300];
     snprintf(one, sizeof one, "%s", a ? a : "");
     for (char *p = one; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
@@ -915,10 +926,149 @@ static char *t_run(const LcCall *c, volatile int *stop, char *sum, size_t sc, in
     return s_take(&res);
 }
 
+/* -------------------------------------------------------------------- skills ---- */
+/* A skill is a folder holding SKILL.md: a header between --- lines with name: and
+ * description:, then the instructions. They are looked for in the working directory's
+ * .localcode/skills and .claude/skills, then in %USERPROFILE%\.localcode\skills (the first
+ * of a name wins). The model sees the names and descriptions; skill(name) gives it the
+ * instructions, skill(name, file) another file of that folder. */
+#define MAX_SKILLS 40
+
+typedef struct { char name[96], desc[320], dir[4096]; } Skill;
+static Skill g_skills[MAX_SKILLS];
+static int   g_nskills = -1;
+
+static void header_value(const char *text, const char *key, char *out, size_t cap)
+{
+    const size_t kl = strlen(key);
+    for (const char *p = text; p && *p;) {
+        const char *nl = strchr(p, '\n');
+        if (!strncmp(p, key, kl) && p[kl] == ':') {
+            const char *v = p + kl + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t n = nl ? (size_t)(nl - v) : strlen(v);
+            while (n && (v[n - 1] == '\r' || v[n - 1] == ' ')) n--;
+            if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) { v++; n -= 2; }
+            snprintf(out, cap, "%.*s", (int)(n < cap ? n : cap - 1), v);
+            return;
+        }
+        p = nl ? nl + 1 : NULL;
+    }
+}
+
+static void skills_from(const char *base)
+{
+    int n = 0;
+    Ent *v = read_dir(base, &n);
+    for (int i = 0; i < n && g_nskills < MAX_SKILLS; i++) {
+        if (!v[i].dir) continue;
+        char dir[4096], file[4200];
+        snprintf(dir, sizeof dir, "%s" SEP "%s", base, v[i].name);
+        snprintf(file, sizeof file, "%s" SEP "SKILL.md", dir);
+        long len = 0;
+        const char *err = NULL;
+        char *text = slurp(file, &len, &err);
+        if (!text) continue;
+        Skill sk;
+        memset(&sk, 0, sizeof sk);
+        snprintf(sk.dir, sizeof sk.dir, "%s", dir);
+        if (!strncmp(text, "---", 3)) {
+            header_value(text + 3, "name", sk.name, sizeof sk.name);
+            header_value(text + 3, "description", sk.desc, sizeof sk.desc);
+        }
+        if (!sk.name[0]) snprintf(sk.name, sizeof sk.name, "%s", v[i].name);
+        free(text);
+        int dup = 0;
+        for (int j = 0; j < g_nskills; j++) if (!strcmp(g_skills[j].name, sk.name)) dup = 1;
+        if (!dup) g_skills[g_nskills++] = sk;
+    }
+    ents_free(v, n);
+}
+
+static void skills_scan(void)
+{
+    if (g_nskills >= 0) return;
+    g_nskills = 0;
+    if (!g_root[0]) lc_tools_init(NULL);
+    char base[4200];
+    snprintf(base, sizeof base, "%s" SEP ".localcode" SEP "skills", g_root);
+    skills_from(base);
+    snprintf(base, sizeof base, "%s" SEP ".claude" SEP "skills", g_root);
+    skills_from(base);
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+#else
+    const char *home = getenv("HOME");
+#endif
+    if (home) {
+        snprintf(base, sizeof base, "%s" SEP ".localcode" SEP "skills", home);
+        skills_from(base);
+    }
+}
+
+const char *lc_skills_block(void)
+{
+    static Str b = { 0 };
+    static int built = 0;
+    if (built) return b.p ? b.p : "";
+    built = 1;
+    skills_scan();
+    for (int i = 0; i < g_nskills; i++)
+        s_fmt(&b, "- %s: %s\n", g_skills[i].name, g_skills[i].desc[0] ? g_skills[i].desc : "(no description)");
+    return b.p ? b.p : "";
+}
+
+static char *t_skill(const LcCall *c, char *sum, size_t sc, int *ok)
+{
+    skills_scan();
+    const char *name = lc_call_arg(c, "name"), *file = lc_call_arg(c, "file");
+    const Skill *sk = NULL;
+    for (int i = 0; name && i < g_nskills; i++) if (!strcmp(g_skills[i].name, name)) sk = &g_skills[i];
+    if (!sk) {
+        snprintf(sum, sc, "no skill %s", name ? name : "");
+        return dup_fmt("There is no skill named \"%s\". The skills are listed in the instructions.", name ? name : "");
+    }
+    if (file && (strstr(file, "..") || file[0] == '/' || file[0] == '\\' || strchr(file, ':'))) {
+        snprintf(sum, sc, "outside the skill");
+        return dup_str("file must be a path inside the skill's folder");
+    }
+    char path[4400];
+    snprintf(path, sizeof path, "%s" SEP "%s", sk->dir, file && *file ? file : "SKILL.md");
+    long len = 0;
+    const char *err = NULL;
+    char *text = slurp(path, &len, &err);
+    if (!text) { snprintf(sum, sc, "%s: %s", file ? file : "SKILL.md", err ? err : "unreadable"); return dup_fmt("cannot read it: %s", err ? err : "?"); }
+    Str r = { 0 };
+    const char *body = text;
+    if (!file && !strncmp(text, "---", 3)) {            /* the instructions after the header */
+        const char *end = strstr(text + 3, "\n---");
+        if (end) { body = end + 4; while (*body == '\r' || *body == '\n') body++; }
+    }
+    s_fmt(&r, "Skill %s%s%s. Follow it for this task; where it differs from your usual workflow, it wins.\n\n",
+          sk->name, file ? ", file " : "", file ? file : "");
+    s_str(&r, body);
+    if (!file) {                                          /* what else the folder holds */
+        int n = 0;
+        Ent *v = read_dir(sk->dir, &n);
+        int any = 0;
+        for (int i = 0; i < n; i++) {
+            if (!strcmp(v[i].name, "SKILL.md")) continue;
+            s_fmt(&r, "%s%s%s", any ? ", " : "\n\nOther files of this skill (skill with file=...): ", v[i].name, v[i].dir ? "/" : "");
+            any = 1;
+        }
+        ents_free(v, n);
+    }
+    free(text);
+    snprintf(sum, sc, "%s%s%s", sk->name, file ? " · " : "", file ? file : "");
+    *ok = 1;
+    return capped(&r);
+}
+
 char *lc_tool_run(const LcCall *c, volatile int *stop, char *summary, size_t scap, int *ok)
 {
     *ok = 0;
     summary[0] = 0;
+    if (!strcmp(c->name, "skill"))      return t_skill(c, summary, scap, ok);
     if (!strcmp(c->name, "read_file"))  return t_read(c, summary, scap, ok);
     if (!strcmp(c->name, "list_dir"))   return t_list(c, summary, scap, ok);
     if (!strcmp(c->name, "glob"))       return t_glob(c, summary, scap, ok);
