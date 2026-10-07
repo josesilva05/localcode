@@ -1767,6 +1767,20 @@ extern "C" int q38_gpu_open(void *model, int device)
         fprintf(stderr, "q38_gpu: no CUDA device %d (%d found)\n", device, n_dev);
         return -1;
     }
+    /* the expert kernels (lane_dot, lane_dot_rp, the tiles) know these types; another one
+     * would add nothing there, silently: such a model runs on the CPU, which has them all */
+    for (int il = 0; il < c->n_layer; il++) {
+        const int ty[3] = { m->L[il].ex_gate.type, m->L[il].ex_up.type, m->L[il].ex_down.type };
+        for (int k = 0; k < 3; k++) {
+            const int t = ty[k];
+            if (t != Q38_Q4_K && t != Q38_Q5_K && t != Q38_Q5_1 && t != Q38_Q8_0 && t != Q38_IQ4_NL && t != Q38_IQ4_XS &&
+                t != Q38_IQ3_S) {
+                fprintf(stderr, "q38_gpu: the experts of layer %d are %s, which the device kernels do not compute; "
+                                "running on the CPU\n", il, q38_type_name(t));
+                return -1;
+            }
+        }
+    }
     CK(cudaSetDevice(device));
     Gpu *g = (Gpu *)calloc(1, sizeof(Gpu));
     G = g;
