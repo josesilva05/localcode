@@ -66,3 +66,18 @@ Sem clonar o projeto por modelo. Três camadas:
 Calibração (`localcode --calibrar`): mede nesta máquina e grava no perfil — velocidade (cache de RAM, divisão de VRAM, lote, prefetch, sem passar de 95% de disco) e qualidade (um conjunto pequeno de tarefas de agente: acertos, passos, tempo).
 
 Ordem: (1) o ciclo do agente — feito; (2) perfil de modelo; (3) núcleo comum + registro por arquitetura (juntar o que está duplicado entre os motores GLM e Qwen); (4) calibração.
+
+### Os modelos desta máquina (2026-10-07)
+
+| Modelo | Arquitetura | Estado | Velocidade (localcode, GPU) |
+|---|---|---|---|
+| Qwen3.8-Flash-Next UD-Q4_K_XL / UD-IQ4_XS | `qwen4exp` | validado (float64) | ~12 tok/s (limitado por RAM/disco) |
+| Qwen3.6-35B-A3B-MTP | `qwen35moe` | validado (float64: CPU 3e-6, GPU 5e-7) | 32,8 tok/s; agente 29,9 tok/s |
+| Qwen3.6-35B-A3B-Uncensored | `qwen35moe` | roda | 35,5 tok/s |
+| Qwen3.8-27B | `qwen35` (denso) | próximo: FFN densa + camadas divididas entre as GPUs | — |
+
+Depois: MTP (geração especulativa com a camada multi-token do 35B-MTP e do 27B).
+
+## Próxima implementação: a API em Lua (pedido de 2026-10-07)
+
+Reescrever a API (hoje `tools/q38_server.py`, Python sobre `q38api.dll`) em Lua integrada ao C, na linha do Kong (OpenResty/LuaJIT): o servidor HTTP e o roteamento em C ou LuaJIT, as rotas, o formato OpenAI/llama-server, os prefixos e o estacionamento de conversas em Lua, o motor chamado direto pela FFI do LuaJIT (sem processo Python no meio). Também candidato: perfis de modelo e ferramentas do agente escritos em Lua (plugins sem recompilar).
