@@ -59,7 +59,7 @@ typedef struct Glm53fEngine {
      * found by name */
     const char *variant;
     int         n_variants;
-    const char *variant_name[8], *variant_info[8];
+    const char *variant_name[16], *variant_info[16];
 } Glm53fEngine;
 
 enum { GLM53F_DESC_BANNER, GLM53F_DESC_SETTINGS, GLM53F_DESC_STATS };

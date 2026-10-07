@@ -1,4 +1,5 @@
-/* q38_model.h - Qwen3.8-Flash-Next (GGUF arch qwen4exp) forward pass, one token at a time.
+/* q38_model.h - Qwen3.8-Flash-Next (GGUF arch qwen4exp) forward pass, one token at a time;
+ * also the plain members of the family (qwen35moe: Qwen3.5/3.6 MoE), see q38_cfg.plain.
  *
  * The graph follows llama.cpp's src/models/qwen4exp.cpp; tools/q38_reference.py is the same
  * graph in float64 numpy and is what this file is checked against (tools/q38_compare.py).
@@ -42,6 +43,13 @@ typedef struct {
     int     ple_eos;
     uint64_t ple_mult[8];
     int64_t ple_off[Q38_MAX_PLE_HEADS], ple_voc[Q38_MAX_PLE_HEADS];
+    /* the family member: qwen4exp (Qwen3.8-Flash-Next) has hyper-connections, PLE and the
+     * indexer; qwen35moe (Qwen3.5/3.6 MoE) is "plain": one residual stream, a pre-norm block
+     * x + mixer(norm(x)), then + moe(norm(x)), and a silu (not sigmoid) DeltaNet output gate */
+    char    arch[32], name[96];
+    int     plain;                           /* hc is 1 then */
+    int     gdn_silu;
+    int     n_nextn;                         /* MTP blocks after the n_layer ones (not run yet) */
 } q38_cfg;
 
 /* A weight matrix as it sits in the GGUF: rows of ne0 elements of one ggml type. */
@@ -65,6 +73,7 @@ typedef struct {
     /* MoE */
     q38_mat router, shexp_gate_inp, sh_gate, sh_up, sh_down;
     q38_mat ex_gate, ex_up, ex_down;     /* data NULL: read per expert */
+    q38_mat attn_norm, post_norm;        /* plain members: the block's two RMSNorms */
     int     recurrent;
 } q38_layer;
 
@@ -105,6 +114,7 @@ typedef struct {
     float     *moe_gu, *moe_h, *moe_dn, *moe_bsum;
     q38_layer L[Q38_MAX_LAYERS];
     q38_mat   tok_embd, output, out_hc_norm, out_hc_down, out_hc_up, ple_table;
+    q38_mat   output_norm;               /* plain members */
     int64_t   trunk_bytes;
 
     /* state for one sequence */

@@ -1767,6 +1767,12 @@ extern "C" int q38_gpu_open(void *model, int device)
         fprintf(stderr, "q38_gpu: no CUDA device %d (%d found)\n", device, n_dev);
         return -1;
     }
+    /* the device path is qwen4exp's (hyper-connections, PLE, indexer); a plain member of the
+     * family runs on the CPU until its device segments exist */
+    if (c->plain) {
+        fprintf(stderr, "q38_gpu: %s runs on the CPU for now (the device path is qwen4exp's)\n", c->arch);
+        return -1;
+    }
     /* the expert kernels (lane_dot, lane_dot_rp, the tiles) know these types; another one
      * would add nothing there, silently: such a model runs on the CPU, which has them all */
     for (int il = 0; il < c->n_layer; il++) {

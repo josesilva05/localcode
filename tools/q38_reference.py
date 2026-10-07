@@ -46,9 +46,13 @@ class Model:
             if i == 0:
                 for k, f in r.fields.items():
                     self.kv[k] = f.contents()
-        a = "qwen4exp."
+        self.arch = str(self.kv.get("general.architecture", "qwen4exp"))
+        a = self.arch + "."
         kv = self.kv
-        self.n_layer = kv[a + "block_count"]
+        # qwen35moe (Qwen3.5/3.6 MoE): one residual stream, pre-norm blocks, silu DeltaNet gate,
+        # its MTP block(s) after the decoder ones
+        self.plain = self.arch != "qwen4exp"
+        self.n_layer = kv[a + "block_count"] - (kv.get(a + "nextn_predict_layers", 0) if self.plain else 0)
         self.E = kv[a + "embedding_length"]
         self.n_head = kv[a + "attention.head_count"]
         self.n_head_kv = kv[a + "attention.head_count_kv"]
@@ -59,7 +63,7 @@ class Model:
         self.n_rot = kv[a + "rope.dimension_count"]
         self.rope_base = float(kv[a + "rope.freq_base"])
         self.interval = kv[a + "full_attention_interval"]
-        self.hc = kv[a + "hyper_connection.count"]
+        self.hc = 1 if self.plain else kv[a + "hyper_connection.count"]
         self.conv_k = kv[a + "ssm.conv_kernel"]
         self.d_state = kv[a + "ssm.state_size"]          # head dim of keys and values
         self.n_kh = kv[a + "ssm.group_count"]            # key heads
@@ -242,7 +246,8 @@ class Ref:
             state[h] = Sm
         st.ssm[il] = state
         self.tap(f"attn_output-{il}", o)
-        o = rms(o, m.eps) * m.vec(p + "ssm_norm.weight")[None, :] * sigmoid(z.reshape(Hv, S))
+        gate = silu(z.reshape(Hv, S)) if m.plain else sigmoid(z.reshape(Hv, S))
+        o = rms(o, m.eps) * m.vec(p + "ssm_norm.weight")[None, :] * gate
         return m.w(p + "ssm_out.weight") @ o.reshape(-1)
 
     def rope(self, x, pos):
@@ -310,6 +315,24 @@ class Ref:
         self.taps = {}
         x = m.rows("token_embd.weight", [tok])[0]
         st.toks.append(tok)
+        if m.plain:
+            for il in range(m.n_layer):
+                p = f"blk.{il}."
+                h = rms(x, m.eps) * m.vec(p + "attn_norm.weight")
+                out = self.gdn(il, h) if m.is_recr(il) else self.attn(il, h, pos)
+                if m.is_recr(il):
+                    self.tap(f"linear_attn_out-{il}", out)
+                x = x + out
+                h = rms(x, m.eps) * m.vec(p + "post_attention_norm.weight")
+                out = self.ffn(il, h)
+                self.tap(f"ffn_out-{il}", out)
+                x = x + out
+                self.tap(f"l_out-{il}", x)
+            final = rms(x, m.eps) * m.vec("output_norm.weight")
+            self.tap("result_norm", final)
+            logits = m.w("output.weight") @ final
+            self.tap("logits", logits)
+            return logits
         res = np.tile(x, (m.hc, 1))
         for il in range(m.n_layer):
             if il in m.ple_layers:
@@ -378,8 +401,9 @@ def main():
         logits = r.forward(tok, i)
         dt = time.time() - t0
         errs = []
+        lname = "l_out" if m.plain else "l_last"
         for il in range(m.n_layer):
-            e = rel(r.taps[f"l_last-{il}"], ref_row(args.ref_dir, idx, f"l_last-{il}", i))
+            e = rel(r.taps[f"{lname}-{il}"], ref_row(args.ref_dir, idx, f"{lname}-{il}", i))
             errs.append(e)
         lref = ref_row(args.ref_dir, idx, "logits", i)
         el = rel(logits, lref)

@@ -37,32 +37,57 @@ static int64_t need_int(const q38_gguf *g, const char *key, int *bad)
 static int read_cfg(q38_cfg *c, const q38_gguf *g)
 {
     const char *arch = q38_gguf_str(g, "general.architecture");
-    if (!arch || strcmp(arch, "qwen4exp")) {
-        fprintf(stderr, "q38: architecture %s, expected qwen4exp\n", arch ? arch : "(none)");
+    if (!arch || (strcmp(arch, "qwen4exp") && strcmp(arch, "qwen35moe"))) {
+        fprintf(stderr, "q38: architecture %s is not supported yet (qwen4exp, qwen35moe)\n", arch ? arch : "(none)");
         return -1;
     }
     int bad = 0;
     memset(c, 0, sizeof *c);
-    c->n_layer    = (int)need_int(g, "qwen4exp.block_count", &bad);
-    c->n_embd     = (int)need_int(g, "qwen4exp.embedding_length", &bad);
-    c->n_head     = (int)need_int(g, "qwen4exp.attention.head_count", &bad);
-    c->n_head_kv  = (int)need_int(g, "qwen4exp.attention.head_count_kv", &bad);
-    c->head_dim   = (int)need_int(g, "qwen4exp.attention.key_length", &bad);
-    c->n_rot      = (int)need_int(g, "qwen4exp.rope.dimension_count", &bad);
-    c->rope_base  = q38_gguf_float(g, "qwen4exp.rope.freq_base", 10000.0);
-    c->eps        = (float)q38_gguf_float(g, "qwen4exp.attention.layer_norm_rms_epsilon", 1e-6);
-    c->n_exp      = (int)need_int(g, "qwen4exp.expert_count", &bad);
-    c->n_exp_used = (int)need_int(g, "qwen4exp.expert_used_count", &bad);
-    c->ff_exp     = (int)need_int(g, "qwen4exp.expert_feed_forward_length", &bad);
-    c->ff_shexp   = (int)need_int(g, "qwen4exp.expert_shared_feed_forward_length", &bad);
-    c->interval   = (int)q38_gguf_int(g, "qwen4exp.full_attention_interval", 4);
+    snprintf(c->arch, sizeof c->arch, "%s", arch);
+    const char *gn = q38_gguf_str(g, "general.name");
+    snprintf(c->name, sizeof c->name, "%s", gn ? gn : arch);
+    char kk[160];
+#define K(s) (snprintf(kk, sizeof kk, "%s.%s", arch, s), kk)
+    c->n_layer    = (int)need_int(g, K("block_count"), &bad);
+    c->n_embd     = (int)need_int(g, K("embedding_length"), &bad);
+    c->n_head     = (int)need_int(g, K("attention.head_count"), &bad);
+    c->n_head_kv  = (int)need_int(g, K("attention.head_count_kv"), &bad);
+    c->head_dim   = (int)need_int(g, K("attention.key_length"), &bad);
+    c->n_rot      = (int)need_int(g, K("rope.dimension_count"), &bad);
+    c->rope_base  = q38_gguf_float(g, K("rope.freq_base"), 10000.0);
+    c->eps        = (float)q38_gguf_float(g, K("attention.layer_norm_rms_epsilon"), 1e-6);
+    c->n_exp      = (int)need_int(g, K("expert_count"), &bad);
+    c->n_exp_used = (int)need_int(g, K("expert_used_count"), &bad);
+    c->ff_exp     = (int)need_int(g, K("expert_feed_forward_length"), &bad);
+    c->ff_shexp   = (int)need_int(g, K("expert_shared_feed_forward_length"), &bad);
+    c->interval   = (int)q38_gguf_int(g, K("full_attention_interval"), 4);
+    c->conv_k     = (int)need_int(g, K("ssm.conv_kernel"), &bad);
+    c->d_state    = (int)need_int(g, K("ssm.state_size"), &bad);
+    c->n_kh       = (int)need_int(g, K("ssm.group_count"), &bad);
+    c->n_vh       = (int)need_int(g, K("ssm.time_step_rank"), &bad);
+    if (strcmp(arch, "qwen4exp")) {
+        /* Qwen3.5/3.6 MoE: no hyper-connections, PLE or indexer; the MTP block(s) follow the
+         * decoder ones in block_count */
+        c->plain = 1;
+        c->gdn_silu = 1;
+        c->hc = 1;
+        c->n_nextn = (int)q38_gguf_int(g, K("nextn_predict_layers"), 0);
+        c->n_layer -= c->n_nextn;
+        c->ple_layer = -1;
+        c->max_dense_ctx = 1 << 30;
+        const q38_kv *voc = q38_gguf_kv(g, "tokenizer.ggml.tokens");
+        c->n_vocab = voc ? (int)voc->n : 0;
+        if (bad || c->n_layer > Q38_MAX_LAYERS || c->n_vh % c->n_kh || c->n_head % c->n_head_kv ||
+            c->n_rot > c->head_dim || c->n_rot % 2) {
+            fprintf(stderr, "q38: unsupported shape\n");
+            return -1;
+        }
+        return 0;
+    }
     c->hc         = (int)need_int(g, "qwen4exp.hyper_connection.count", &bad);
     c->hc_rank    = (int)need_int(g, "qwen4exp.hyper_connection.low_rank", &bad);
-    c->conv_k     = (int)need_int(g, "qwen4exp.ssm.conv_kernel", &bad);
-    c->d_state    = (int)need_int(g, "qwen4exp.ssm.state_size", &bad);
-    c->n_kh       = (int)need_int(g, "qwen4exp.ssm.group_count", &bad);
-    c->n_vh       = (int)need_int(g, "qwen4exp.ssm.time_step_rank", &bad);
     c->idx_top_k  = (int)q38_gguf_int(g, "qwen4exp.attention.indexer.top_k", 0);
+#undef K
     if (bad) return -1;
 
     /* dense attention == the indexer's choice while n_kv <= top_k + ratio - 1 */
@@ -155,22 +180,31 @@ static int bind_all(q38_model *m)
     char name[128];
     if (bind(m, &m->tok_embd, "token_embd.weight", E, c->n_vocab, 1)) return -1;
     if (bind(m, &m->output, "output.weight", E, c->n_vocab, 1)) return -1;
-    if (bind(m, &m->out_hc_norm, "output_hc_norm.weight", hcE, 1, 1)) return -1;
-    if (bind(m, &m->out_hc_down, "output_hc_down.weight", hcE, R, 1)) return -1;
-    if (bind(m, &m->out_hc_up, "output_hc_up.weight", R, hcE, 1)) return -1;
+    if (c->plain) {
+        if (bind(m, &m->output_norm, "output_norm.weight", E, 1, 1)) return -1;
+    } else {
+        if (bind(m, &m->out_hc_norm, "output_hc_norm.weight", hcE, 1, 1)) return -1;
+        if (bind(m, &m->out_hc_down, "output_hc_down.weight", hcE, R, 1)) return -1;
+        if (bind(m, &m->out_hc_up, "output_hc_up.weight", R, hcE, 1)) return -1;
+    }
     if (c->ple_layer >= 0 &&
         bind(m, &m->ple_table, "per_layer_token_embd.weight", c->ple_dim, -1, 0)) return -1;
     for (int il = 0; il < c->n_layer; il++) {
         q38_layer *l = &m->L[il];
         l->recurrent = (il + 1) % c->interval != 0;
-        B(hc_attn_norm, "blk.%d.hc_attn_norm.weight", hcE, 1);
-        B(hc_attn_down, "blk.%d.hc_attn_down.weight", hcE, R);
-        B(hc_attn_up, "blk.%d.hc_attn_up.weight", R, hcE);
-        B(hc_attn_inject, "blk.%d.hc_attn_inject.weight", hcE, c->hc);
-        B(hc_ffn_norm, "blk.%d.hc_ffn_norm.weight", hcE, 1);
-        B(hc_ffn_down, "blk.%d.hc_ffn_down.weight", hcE, R);
-        B(hc_ffn_up, "blk.%d.hc_ffn_up.weight", R, hcE);
-        B(hc_ffn_inject, "blk.%d.hc_ffn_inject.weight", hcE, c->hc);
+        if (c->plain) {
+            B(attn_norm, "blk.%d.attn_norm.weight", E, 1);
+            B(post_norm, "blk.%d.post_attention_norm.weight", E, 1);
+        } else {
+            B(hc_attn_norm, "blk.%d.hc_attn_norm.weight", hcE, 1);
+            B(hc_attn_down, "blk.%d.hc_attn_down.weight", hcE, R);
+            B(hc_attn_up, "blk.%d.hc_attn_up.weight", R, hcE);
+            B(hc_attn_inject, "blk.%d.hc_attn_inject.weight", hcE, c->hc);
+            B(hc_ffn_norm, "blk.%d.hc_ffn_norm.weight", hcE, 1);
+            B(hc_ffn_down, "blk.%d.hc_ffn_down.weight", hcE, R);
+            B(hc_ffn_up, "blk.%d.hc_ffn_up.weight", R, hcE);
+            B(hc_ffn_inject, "blk.%d.hc_ffn_inject.weight", hcE, c->hc);
+        }
         if (l->recurrent) {
             B(qkv, "blk.%d.attn_qkv.weight", E, 2 * key_dim + val_dim);
             B(gate, "blk.%d.attn_gate.weight", E, val_dim);
@@ -533,10 +567,11 @@ static void gdn(q38_model *m, int il, const float *x, float *y)
         snprintf(nm, sizeof nm, "attn_output-%d", il);
         m->tap(m->tap_ctx, nm, o, (int64_t)Hv * S);
     }
-    /* build_norm_gated: rmsnorm(o) * ssm_norm * sigmoid(z) */
+    /* build_norm_gated: rmsnorm(o) * ssm_norm * sigmoid(z) (qwen4exp), * silu(z) (Qwen3.5/3.6) */
     for (int h = 0; h < Hv; h++) {
         rmsnorm(o + h * S, o + h * S, vecf(&l->ssm_norm), S, c->eps);
-        for (int j = 0; j < S; j++) o[h * S + j] *= sigmoidf_(z[h * S + j]);
+        if (c->gdn_silu) for (int j = 0; j < S; j++) o[h * S + j] *= siluf_(z[h * S + j]);
+        else             for (int j = 0; j < S; j++) o[h * S + j] *= sigmoidf_(z[h * S + j]);
     }
     matvec(&l->ssm_out, o, y);
 }
@@ -1561,6 +1596,31 @@ const float *q38_model_forward(q38_model *m, int token)
         return m->logits;
     }
 #endif
+    if (c->plain) {
+        /* qwen35moe: x += mixer(norm(x)); x += moe(norm(x)); logits = output(norm(x)) */
+        float *x = m->res, *y = m->tmp2 + 4 * 4096;
+        q38_dequant_row(m->tok_embd.type, m->tok_embd.data + (int64_t)token * m->tok_embd.row_bytes, x, E);
+        for (int il = 0; il < c->n_layer; il++) {
+            q38_layer *l = &m->L[il];
+            rmsnorm(m->mixed, x, vecf(&l->attn_norm), E, c->eps);
+            if (l->recurrent) gdn(m, il, m->mixed, y);
+            else attn(m, il, m->mixed, y);
+            if (m->tap && l->recurrent) { snprintf(nm, sizeof nm, "linear_attn_out-%d", il); m->tap(m->tap_ctx, nm, y, E); }
+            for (int i = 0; i < E; i++) x[i] += y[i];
+            rmsnorm(m->mixed, x, vecf(&l->post_norm), E, c->eps);
+            if (moe(m, il, m->mixed, y)) return NULL;
+            if (m->tap) { snprintf(nm, sizeof nm, "ffn_out-%d", il); m->tap(m->tap_ctx, nm, y, E); }
+            for (int i = 0; i < E; i++) x[i] += y[i];
+            if (m->tap) { snprintf(nm, sizeof nm, "l_out-%d", il); m->tap(m->tap_ctx, nm, x, E); }
+        }
+        rmsnorm(m->mixed, x, vecf(&m->output_norm), E, c->eps);
+        if (m->tap) m->tap(m->tap_ctx, "result_norm", m->mixed, E);
+        matvec(&m->output, m->mixed, m->logits);
+        if (m->tap) m->tap(m->tap_ctx, "logits", m->logits, c->n_vocab);
+        m->toks[m->n_past++] = token;
+        m->t_trunk += now_s() - t0;
+        return m->logits;
+    }
     float *x = m->mixed;
     q38_dequant_row(m->tok_embd.type, m->tok_embd.data + (int64_t)token * m->tok_embd.row_bytes, x, E);
     for (int s = 0; s < hc; s++) memcpy(m->res + s * E, x, (size_t)E * sizeof(float));
@@ -1717,7 +1777,7 @@ void q38_model_close(q38_model *m)
 #ifdef Q38_CUDA
     if (m->gpu) q38_gpu_close(m);
 #endif
-    q38_mat *all[] = { &m->tok_embd, &m->output, &m->out_hc_norm, &m->out_hc_down, &m->out_hc_up };
+    q38_mat *all[] = { &m->tok_embd, &m->output, &m->out_hc_norm, &m->out_hc_down, &m->out_hc_up, &m->output_norm };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) free(all[i]->data);
     for (int il = 0; il < Q38_MAX_LAYERS; il++) {
         q38_mat *w = (q38_mat *)&m->L[il];

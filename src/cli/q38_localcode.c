@@ -237,7 +237,7 @@ static void load_begin(void)
         return;
     }
 #endif
-    printf("  loading Qwen3.8-Flash-Next…");
+    printf("  loading the model…");
     fflush(stdout);
 }
 
@@ -271,15 +271,39 @@ static void load_end(int ok)
     (void)ok;
 }
 
-/* Without a model given: the first shard in %USERPROFILE%\models\Qwen3.8-Flash-Next\UD-Q4_K_XL
- * (where start.bat looks too), so `localcode` typed in any folder opens it there. */
 /* ----------------------------------------------------------------- variants ---- */
-/* The files of the model on this machine: every folder of LOCALCODE_MODELS_DIR (default
- * %USERPROFILE%\models\Qwen3.8-Flash-Next) that holds a GGUF is one variant, named by its
- * folder (UD-Q4_K_XL, UD-IQ4_XS), largest first. The one opened last is remembered in
- * %LOCALAPPDATA%\localcode\model.txt and opens by default. */
+/* The models on this machine (list_variants: the folders of %USERPROFILE%\models), named by
+ * their folders (Qwen3.6-35B-A3B-MTP, Qwen3.8-Flash-Next/UD-IQ4_XS). The one opened last is
+ * remembered in %LOCALAPPDATA%\localcode\model.txt and opens by default. */
 typedef struct { char name[96], path[1100], info[48]; double gb; } Variant;
 
+#ifdef _WIN32
+/* A folder holding a model's GGUF (its vision projector, mmproj*.gguf, aside) becomes variant
+ * name; returns 1 when it held one. */
+static int variant_dir(const char *dir, const char *name, Variant *x)
+{
+    char gp[1200];
+    snprintf(gp, sizeof gp, "%s\\*.gguf", dir);
+    WIN32_FIND_DATAA g;
+    HANDLE hg = FindFirstFileA(gp, &g);
+    if (hg == INVALID_HANDLE_VALUE) return 0;
+    memset(x, 0, sizeof *x);
+    snprintf(x->name, sizeof x->name, "%s", name);
+    do {
+        if (!_strnicmp(g.cFileName, "mmproj", 6)) continue;
+        x->gb += ((double)g.nFileSizeHigh * 4294967296.0 + (double)g.nFileSizeLow) / 1073741824.0;   /* GiB, as Explorer shows */
+        /* the first shard of a split, else the first file */
+        if (!x->path[0] || strstr(g.cFileName, "-00001-of-")) snprintf(x->path, sizeof x->path, "%s\\%s", dir, g.cFileName);
+    } while (FindNextFileA(hg, &g));
+    FindClose(hg);
+    snprintf(x->info, sizeof x->info, "%.0f GB", x->gb);
+    return x->path[0] != 0;
+}
+#endif
+
+/* The models on this machine: every folder of LOCALCODE_MODELS_DIR (default %USERPROFILE%\models)
+ * holding a GGUF, or each of its subfolders that does (a model with several quantisations:
+ * Qwen3.8-Flash-Next/UD-IQ4_XS), largest first. */
 static int list_variants(Variant *v, int max)
 {
     int n = 0;
@@ -287,7 +311,7 @@ static int list_variants(Variant *v, int max)
     char base[1024];
     const char *e = getenv("LOCALCODE_MODELS_DIR"), *home = getenv("USERPROFILE");
     if (e && *e) snprintf(base, sizeof base, "%s", e);
-    else if (home) snprintf(base, sizeof base, "%s\\models\\Qwen3.8-Flash-Next", home);
+    else if (home) snprintf(base, sizeof base, "%s\\models", home);
     else return 0;
     char pat[1100];
     snprintf(pat, sizeof pat, "%s\\*", base);
@@ -296,23 +320,22 @@ static int list_variants(Variant *v, int max)
     if (h == INVALID_HANDLE_VALUE) return 0;
     do {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.' || n >= max) continue;
-        char dir[1100], gp[1200];
+        char dir[1100];
         snprintf(dir, sizeof dir, "%s\\%s", base, fd.cFileName);
-        snprintf(gp, sizeof gp, "%s\\*.gguf", dir);
-        WIN32_FIND_DATAA g;
-        HANDLE hg = FindFirstFileA(gp, &g);
-        if (hg == INVALID_HANDLE_VALUE) continue;
-        Variant *x = &v[n];
-        memset(x, 0, sizeof *x);
-        snprintf(x->name, sizeof x->name, "%s", fd.cFileName);
+        if (variant_dir(dir, fd.cFileName, &v[n])) { n++; continue; }
+        char sp[1200];                           /* one level down: the quantisations */
+        snprintf(sp, sizeof sp, "%s\\*", dir);
+        WIN32_FIND_DATAA sd;
+        HANDLE hs = FindFirstFileA(sp, &sd);
+        if (hs == INVALID_HANDLE_VALUE) continue;
         do {
-            x->gb += ((double)g.nFileSizeHigh * 4294967296.0 + (double)g.nFileSizeLow) / 1073741824.0;   /* GiB, as Explorer shows */
-            /* the first shard of a split, else the first file */
-            if (!x->path[0] || strstr(g.cFileName, "-00001-of-")) snprintf(x->path, sizeof x->path, "%s\\%s", dir, g.cFileName);
-        } while (FindNextFileA(hg, &g));
-        FindClose(hg);
-        snprintf(x->info, sizeof x->info, "%.0f GB", x->gb);
-        n++;
+            if (!(sd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || sd.cFileName[0] == '.' || n >= max) continue;
+            char sub[1400], nm[200];
+            snprintf(sub, sizeof sub, "%s\\%s", dir, sd.cFileName);
+            snprintf(nm, sizeof nm, "%s/%s", fd.cFileName, sd.cFileName);
+            if (variant_dir(sub, nm, &v[n])) n++;
+        } while (FindNextFileA(hs, &sd));
+        FindClose(hs);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
     for (int i = 0; i < n; i++)                  /* largest first */
@@ -384,11 +407,11 @@ static int back_to_previous(q38_model *m, const char **path, char *prev)
 static void usage(void)
 {
     fprintf(stderr,
-            "localcode - Qwen3.8-Flash-Next on this engine\n\n"
+            "localcode - the Qwen hybrid models on this engine (Qwen3.8-Flash-Next, Qwen3.6-35B-A3B)\n\n"
             "  localcode [--model NAME|FILE] [--ctx N] [--gen N] [--level 0|1|2] [--continue] [--reasoning xhigh|medium|low]\n\n"
-            "--model: a variant by name (UD-IQ4_XS, or part of it: iq4) or any shard of a GGUF; the variants are the\n"
-            "         folders of %%USERPROFILE%%\\models\\Qwen3.8-Flash-Next (LOCALCODE_MODELS_DIR); without it, the one\n"
-            "         opened last (/model switches inside localcode), else LOCALCODE_MODEL, else the largest\n"
+            "--model: a model by name (Qwen3.6-35B-A3B-MTP, or part of it: 35b, iq4) or any shard of a GGUF; the models\n"
+            "         are the folders of %%USERPROFILE%%\\models (LOCALCODE_MODELS_DIR); without it, the one opened last\n"
+            "         (/model switches inside localcode), else LOCALCODE_MODEL, else the largest\n"
             "--level: 0 chat, 1 quick (reads the files of this folder), 2 agent (edits files, runs commands; default)\n"
             "--continue: go back to the latest conversation of this folder (as /resume)\n"
             "The folder it starts in is the agent's working folder (install-cli.bat puts `localcode` on the PATH).\n");
@@ -425,8 +448,8 @@ int main(int argc, char **argv)
     }
     /* which file: --model or a path given, else the one opened last, else LOCALCODE_MODEL,
      * else the largest variant */
-    static Variant vars[8];
-    const int nvars = list_variants(vars, 8);
+    static Variant vars[16];
+    const int nvars = list_variants(vars, 16);
     if (!path && want) {
         FILE *f = fopen(want, "rb");
         if (f) { fclose(f); path = want; }
@@ -448,7 +471,9 @@ int main(int argc, char **argv)
             if (fgets(name, sizeof name, f)) name[strcspn(name, "\r\n")] = 0;
             fclose(f);
         }
-        for (int i = 0; i < nvars && !path && name[0]; i++) if (!_stricmp(vars[i].name, name)) path = vars[i].path;
+        /* by name, or a name it holds (model.txt from before the models folder was one up) */
+        const int k = name[0] ? find_variant(vars, nvars, name) : -1;
+        if (k >= 0) path = vars[k].path;
     }
     if (!path) path = getenv("LOCALCODE_MODEL");
     if (!path && nvars) path = vars[0].path;
@@ -470,8 +495,9 @@ int main(int argc, char **argv)
     for (;;) {                          /* once per model: /model closes it and opens another */
     memset(&m, 0, sizeof m);
     memset(&g_dec, 0, sizeof g_dec);
-    char variant[128];
+    char variant[200];
     variant_of(path, variant, sizeof variant);
+    for (int i = 0; i < nvars; i++) if (!_stricmp(vars[i].path, path)) snprintf(variant, sizeof variant, "%s", vars[i].name);
     const double t0 = now_s();
     load_begin();
     load_stage("abrindo o modelo");
@@ -510,7 +536,12 @@ int main(int argc, char **argv)
 #ifdef _WIN32
             CreateDirectoryA(dir, NULL);
 #endif
-            snprintf(prof, sizeof prof, "%s\\qwen38_expert_profile.bin", dir);
+            /* one per model shape (the experts' numbering is the model's); Flash-Next's from
+             * before keeps its old name */
+            snprintf(prof, sizeof prof, "%s\\expert_profile-%s-%dx%d.bin", dir, m.c.arch, m.c.n_layer, m.c.n_exp);
+            FILE *pf = fopen(prof, "rb");
+            if (pf) fclose(pf);
+            else if (!strcmp(m.c.arch, "qwen4exp")) snprintf(prof, sizeof prof, "%s\\qwen38_expert_profile.bin", dir);
         }
     }
     if (*prof && q38_model_profile_load(&m, prof) == 0 && preload_gb > 0) {
@@ -535,7 +566,7 @@ int main(int argc, char **argv)
 
     Glm53fEngine e;
     memset(&e, 0, sizeof e);
-    e.name = "Qwen3.8-Flash-Next";
+    e.name = m.c.name;                   /* general.name: Qwen3.8-Flash-Next, Qwen3.6-35B-A3B ... */
     e.levels = QWEN_LEVELS;
     e.n_levels = 3;
     e.n_vocab = m.c.n_vocab;
