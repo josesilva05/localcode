@@ -813,7 +813,7 @@ static int bat_open(q38_model *m, int nb)
     cudaSetDevice(G->dev);
 #define DA(p, n) do { if (!((p) = dalloc((size_t)(n), G))) return -1; } while (0)
     DA(b->res, (int64_t)nb * hcE); DA(b->xn, (int64_t)nb * hcE); DA(b->gate, (int64_t)nb * hcE);
-    DA(b->mixed, (int64_t)nb * E); DA(b->lo, (int64_t)nb * c->hc_rank); DA(b->inject, (int64_t)nb * hc);
+    DA(b->mixed, (int64_t)nb * E); DA(b->lo, (int64_t)nb * (c->hc_rank > 0 ? c->hc_rank : 1)); DA(b->inject, (int64_t)nb * hc);
     DA(b->y, (int64_t)nb * E); DA(b->routed, (int64_t)nb * E); DA(b->ygpu, (int64_t)nb * E);
     DA(b->qkv, (int64_t)nb * ch); DA(b->z, (int64_t)nb * c->n_vh * S); DA(b->o, (int64_t)nb * c->n_vh * S);
     DA(b->beta, (int64_t)nb * c->n_vh); DA(b->g, (int64_t)nb * c->n_vh);
@@ -895,6 +895,11 @@ static int hc_mix_b(q38_model *m, const float *res, int N, const DMat *norm, con
     const q38_cfg *c = &m->c;
     const int E = c->n_embd, hc = c->hc, hcE = hc * E, R = c->hc_rank;
     cudaStream_t st = G->st;
+    if (c->plain) {                                 /* RMSNorm per token; inject 0: res += out */
+        k_rmsnorm_rows_w<<<N, 256, 0, st>>>(res, (const float *)norm->d, mixed, E, c->eps, 1);
+        if (inject) CK(cudaMemsetAsync(inject, 0, (size_t)N * sizeof(float), st));
+        return 0;
+    }
     k_rmsnorm_rows_w<<<N * hc, 256, 0, st>>>(res, (const float *)norm->d, GB->xn, E, c->eps, hc);
     if (mm(down, GB->xn, hcE, GB->lo, R, N, st)) return -1;
     k_silu_scale_b<<<nblocks((int64_t)N * R, 256), 256, 0, st>>>(GB->lo, (int64_t)N * R, 1.0f / hc);
@@ -1120,7 +1125,7 @@ static int forward_batch_chunk(q38_model *m, const int *toks, int N, int want_la
                                                            (const float *)LM(il, ple_conv).d, G->d_pos, hcE, c->ple_kern,
                                                            c->ple_ngram, hist, N);
         }
-        if (hc_mix_b(m, b->res, N, &LM(il, hc_attn_norm), &LM(il, hc_attn_down), &LM(il, hc_attn_up), &LM(il, hc_attn_inject),
+        if (hc_mix_b(m, b->res, N, NORM_ATTN(il), &LM(il, hc_attn_down), &LM(il, hc_attn_up), &LM(il, hc_attn_inject),
                      b->mixed, b->inject)) return -1;
         if (l->recurrent) {
             if (mm(&LM(il, qkv), b->mixed, E, b->qkv, ch, N, st) || mm(&LM(il, gate), b->mixed, E, b->z, Hv * S, N, st) ||
@@ -1130,7 +1135,7 @@ static int forward_batch_chunk(q38_model *m, const int *toks, int N, int want_la
             k_conv_silu_b<<<nblocks(ch, 256), 256, 0, st>>>(b->qkv, ch, G->conv[il], (const float *)LM(il, conv).d, ch, c->conv_k, N);
             k_l2norm_b<<<N * 2 * Hk, 32, 0, st>>>(b->qkv, S, 2 * Hk, ch, c->eps);
             k_gdn_step_b<<<Hv, dim3(S, 4), 6 * S * sizeof(float), st>>>(G->ssm[il], b->qkv, ch, b->g, b->beta, b->o, S, Hk, Hv, N);
-            k_norm_gate<<<N * Hv, 128, 0, st>>>(b->o, b->z, (const float *)LM(il, ssm_norm).d, S, c->eps);
+            k_norm_gate<<<N * Hv, 128, 0, st>>>(b->o, b->z, (const float *)LM(il, ssm_norm).d, S, c->eps, c->gdn_silu);
             if (mm(&LM(il, ssm_out), b->o, Hv * S, b->y, E, N, st)) return -1;
         } else {
             const int H = c->n_head, Hkv = c->n_head_kv, D = c->head_dim, W = c->max_dense_ctx;
@@ -1162,7 +1167,7 @@ static int forward_batch_chunk(q38_model *m, const int *toks, int N, int want_la
             if (mm(&LM(il, wo), b->aout, H * D, b->y, E, N, st)) return -1;
         }
         k_hc_combine_b<<<nblocks((int64_t)N * hcE, 256), 256, 0, st>>>(b->res, b->y, b->inject, E, hc, N);
-        if (hc_mix_b(m, b->res, N, &LM(il, hc_ffn_norm), &LM(il, hc_ffn_down), &LM(il, hc_ffn_up), &LM(il, hc_ffn_inject),
+        if (hc_mix_b(m, b->res, N, NORM_FFN(il), &LM(il, hc_ffn_down), &LM(il, hc_ffn_up), &LM(il, hc_ffn_inject),
                      b->mixed, b->inject)) return -1;
 
         /* MoE: router and x to the host; the shared expert meanwhile */
@@ -1252,7 +1257,7 @@ static int forward_batch_chunk(q38_model *m, const int *toks, int N, int want_la
     }
     /* the head, for the last token */
     if (want_last) {
-        if (hc_mix_b(m, b->res + (int64_t)(N - 1) * hcE, 1, &G->out_hc_norm, &G->out_hc_down, &G->out_hc_up, NULL, b->mixed, NULL))
+        if (hc_mix_b(m, b->res + (int64_t)(N - 1) * hcE, 1, NORM_OUT, &G->out_hc_down, &G->out_hc_up, NULL, b->mixed, NULL))
             return -1;
         if (mm(&G->output, b->mixed, E, b->logits, c->n_vocab, 1, st)) return -1;
         CK(cudaMemcpyAsync(b->h_logits, b->logits, (size_t)c->n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st));

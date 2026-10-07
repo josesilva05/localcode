@@ -240,6 +240,42 @@ static inline __m256i iq4_values(const uint8_t *qs, __m128i tab)
     return _mm256_set_m128i(hi, lo);
 }
 
+/* sum of q[0..16) * x[0..16), q as 16 signed bytes */
+static inline __m256 dot16_s8(__m128i q, const float *x)
+{
+    __m256 a = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q)), _mm256_loadu_ps(x));
+    return _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q, 8))), _mm256_loadu_ps(x + 8), a);
+}
+
+/* Q6_K: ql[128], qh[64], int8 scales[16], fp16 d at 208. In each half (128) quarter q holds
+ * elements 32q + l: ql[l (+32 for q odd)] low (q < 2) or high nibble, 2 bits of qh[l] at 2q,
+ * minus 32, scale d * scales[l / 16 + 2q] */
+static float dot_q6_K(const uint8_t *row, const q38_xvec *v)
+{
+    const int64_t nb = v->n / 256;
+    const __m128i m4 = _mm_set1_epi8(0x0F), m3 = _mm_set1_epi8(3), k32 = _mm_set1_epi8(32);
+    __m256 acc = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; b++, row += 210) {
+        const float d = h2f(row + 208);
+        for (int n = 0; n < 2; n++) {
+            const uint8_t *ql = row + 64 * n, *qh = row + 128 + 32 * n;
+            const int8_t *sc = (const int8_t *)(row + 192 + 8 * n);
+            const float *x = v->x + b * 256 + 128 * n;
+            for (int q = 0; q < 4; q++) {
+                for (int hlf = 0; hlf < 2; hlf++) {             /* l = 16 hlf .. 16 hlf + 15 */
+                    const __m128i lo = _mm_loadu_si128((const __m128i *)(ql + ((q & 1) ? 32 : 0) + 16 * hlf));
+                    const __m128i hb = _mm_loadu_si128((const __m128i *)(qh + 16 * hlf));
+                    const __m128i nib = q < 2 ? _mm_and_si128(lo, m4) : _mm_and_si128(_mm_srli_epi16(lo, 4), m4);
+                    const __m128i hi2 = _mm_and_si128(_mm_srli_epi16(hb, 2 * q), m3);
+                    const __m128i val = _mm_sub_epi8(_mm_or_si128(nib, _mm_slli_epi16(hi2, 4)), k32);
+                    acc = _mm256_fmadd_ps(_mm256_set1_ps(d * sc[hlf + 2 * q]), dot16_s8(val, x + 32 * q + 16 * hlf), acc);
+                }
+            }
+        }
+    }
+    return hsum8(acc);
+}
+
 /* IQ4_NL: fp16 d, qs[16] */
 static float dot_iq4_nl(const uint8_t *row, const q38_xvec *v)
 {
@@ -525,6 +561,7 @@ float q38_dot(int type, const uint8_t *row, const q38_xvec *v)
     case Q38_Q5_1: return dot_q5_1(row, v);
     case Q38_Q4_K: return dot_q4_K(row, v);
     case Q38_Q5_K: return dot_q5_K(row, v);
+    case Q38_Q6_K: return dot_q6_K(row, v);
     case Q38_IQ4_NL: return dot_iq4_nl(row, v);
     case Q38_IQ4_XS: return dot_iq4_xs(row, v);
     case Q38_IQ3_S: return dot_iq3_s(row, v);

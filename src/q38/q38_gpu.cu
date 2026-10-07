@@ -66,7 +66,7 @@ typedef struct {
     cudaStream_t st;
     cudaEvent_t  ev;
     DMat      L[Q38_MAX_LAYERS][64];
-    DMat      output, out_hc_norm, out_hc_down, out_hc_up;
+    DMat      output, out_hc_norm, out_hc_down, out_hc_up, output_norm;
     /* activations */
     float    *res, *xn, *mixed, *lo, *gate, *inject, *y, *routed;
     float    *qkv, *z, *o, *beta, *g, *qf, *aout;
@@ -467,8 +467,8 @@ __global__ void k_gdn_step(float *state, const float *q, const float *k, const f
     }
 }
 
-/* build_norm_gated: rmsnorm(o) * w * sigmoid(z), one block per head */
-__global__ void k_norm_gate(float *o, const float *z, const float *w, int S, float eps)
+/* build_norm_gated: rmsnorm(o) * w * sigmoid(z) (qwen4exp) or * silu(z) (qwen35moe), one block per head */
+__global__ void k_norm_gate(float *o, const float *z, const float *w, int S, float eps, int silu)
 {
     __shared__ float part[8];
     float *oh = o + (int64_t)blockIdx.x * S;
@@ -477,7 +477,8 @@ __global__ void k_norm_gate(float *o, const float *z, const float *w, int S, flo
     for (int i = threadIdx.x; i < S; i += blockDim.x) ss += oh[i] * oh[i];
     ss = block_sum(ss, part);
     const float sc = 1.0f / sqrtf(ss / S + eps);
-    for (int i = threadIdx.x; i < S; i += blockDim.x) oh[i] = oh[i] * sc * w[i] * sigmoidf_(zh[i]);
+    for (int i = threadIdx.x; i < S; i += blockDim.x)
+        oh[i] = oh[i] * sc * w[i] * (silu ? siluf_(zh[i]) : sigmoidf_(zh[i]));
 }
 
 /* rmsnorm with weight then NeoX rope on the first n_rot dims, one block per head row */
@@ -587,18 +588,45 @@ __device__ const uint32_t d_iq3s_grid[512] = {
 #include "q38_iq3s_grid.inc"
 };
 
-__device__ __forceinline__ bool is_iq(int type) { return type == Q38_IQ4_NL || type == Q38_IQ4_XS || type == Q38_IQ3_S; }
+/* (Q6_K, Qwen3.6-35B-A3B's gate/up experts, goes the same way) */
+__device__ __forceinline__ bool is_iq(int type)
+{
+    return type == Q38_IQ4_NL || type == Q38_IQ4_XS || type == Q38_IQ3_S || type == Q38_Q6_K;
+}
 
 __device__ __forceinline__ int64_t iq_row_bytes(int type, int ne0)
 {
-    return type == Q38_IQ4_NL ? (int64_t)(ne0 / 32) * 18 : (int64_t)(ne0 / 256) * (type == Q38_IQ4_XS ? 136 : 110);
+    if (type == Q38_IQ4_NL) return (int64_t)(ne0 / 32) * 18;
+    return (int64_t)(ne0 / 256) * (type == Q38_IQ4_XS ? 136 : type == Q38_Q6_K ? 210 : 110);
 }
 
 __device__ __forceinline__ int iq_chunks(int type, int ne0) { return type == Q38_IQ4_NL ? (ne0 / 32) * 4 : (ne0 / 256) * 32; }
 
 __device__ __forceinline__ void iq_chunk(int type, const uint8_t *w, int c, float *wt, int *o0, int *o1)
 {
-    if (type == Q38_IQ4_NL) {                       /* block of 32: bytes p..p+3 -> elements p.., 16+p.. */
+    if (type == Q38_Q6_K) {
+        /* super-block sb, half n (128), quarter q (32): runs of 4 at l0 and l0 + 16; element l of
+         * a quarter is ql[l (+32 for q odd)] low (q < 2) or high nibble, 2 bits of qh[l] at 2q,
+         * minus 32, times d * scale[l / 16 + 2q] (q38_dequant_row's dequant_q6_K) */
+        const int sb = c >> 5, n = (c >> 4) & 1, q = (c >> 2) & 3, l0 = (c & 3) * 4;
+        const uint8_t *blk = w + (int64_t)sb * 210;
+        const float d = __half2float(__ushort_as_half((unsigned short)(blk[208] | (blk[209] << 8))));
+        const uint8_t *ql = blk + 64 * n + ((q & 1) ? 32 : 0), *qh = blk + 128 + 32 * n;
+        const int8_t *sc = (const int8_t *)(blk + 192 + 8 * n);
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const int lb = l0 + 16 * r;
+            const float ds = d * sc[lb / 16 + 2 * q];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const int l = lb + k;
+                const int nib = q < 2 ? (ql[l] & 0xF) : (ql[l] >> 4);
+                wt[4 * r + k] = ds * (float)((nib | (((qh[l] >> (2 * q)) & 3) << 4)) - 32);
+            }
+        }
+        *o0 = 256 * sb + 128 * n + 32 * q + l0;
+        *o1 = *o0 + 16;
+    } else if (type == Q38_IQ4_NL) {                /* block of 32: bytes p..p+3 -> elements p.., 16+p.. */
         const int b = c >> 2, p = (c & 3) * 4;
         const uint8_t *blk = w + (int64_t)b * 18;
         const float d = __half2float(__ushort_as_half((unsigned short)(blk[0] | (blk[1] << 8))));
@@ -1611,11 +1639,23 @@ static void tap(q38_model *m, const char *name, const float *d, int64_t n)
     free(h);
 }
 
+/* the norms in front of the mixer, the MoE and the head: the hyper-connection mix (qwen4exp),
+ * or the plain members' RMSNorm (attn_norm, post_attention_norm, output_norm) */
+#define NORM_ATTN(il) (m->c.plain ? &LM(il, attn_norm) : &LM(il, hc_attn_norm))
+#define NORM_FFN(il)  (m->c.plain ? &LM(il, post_norm) : &LM(il, hc_ffn_norm))
+#define NORM_OUT      (m->c.plain ? &G->output_norm : &G->out_hc_norm)
+
 static int hc_mix(q38_model *m, const DMat *norm, const DMat *down, const DMat *up, const DMat *inj, float *mixed,
                   float *inject)
 {
     const q38_cfg *c = &m->c;
     const int E = c->n_embd, hc = c->hc;
+    if (c->plain) {
+        /* mixed = rmsnorm(res) * norm; inject 0 makes k_hc_combine (hc = 1) res += out */
+        k_rmsnorm_rows<<<1, 256, 0, G->st>>>(G->res, (const float *)norm->d, mixed, E, c->eps);
+        if (inject) CK(cudaMemsetAsync(inject, 0, sizeof(float), G->st));
+        return 0;
+    }
     k_rmsnorm_rows<<<hc, 256, 0, G->st>>>(G->res, (const float *)norm->d, G->xn, E, c->eps);
     if (mv(down, G->xn, G->lo, G->st)) return -1;
     k_silu_scale<<<(c->hc_rank + 255) / 256, 256, 0, G->st>>>(G->lo, c->hc_rank, 1.0f / hc);
@@ -1767,19 +1807,13 @@ extern "C" int q38_gpu_open(void *model, int device)
         fprintf(stderr, "q38_gpu: no CUDA device %d (%d found)\n", device, n_dev);
         return -1;
     }
-    /* the device path is qwen4exp's (hyper-connections, PLE, indexer); a plain member of the
-     * family runs on the CPU until its device segments exist */
-    if (c->plain) {
-        fprintf(stderr, "q38_gpu: %s runs on the CPU for now (the device path is qwen4exp's)\n", c->arch);
-        return -1;
-    }
     /* the expert kernels (lane_dot, lane_dot_rp, the tiles) know these types; another one
      * would add nothing there, silently: such a model runs on the CPU, which has them all */
     for (int il = 0; il < c->n_layer; il++) {
         const int ty[3] = { m->L[il].ex_gate.type, m->L[il].ex_up.type, m->L[il].ex_down.type };
         for (int k = 0; k < 3; k++) {
             const int t = ty[k];
-            if (t != Q38_Q4_K && t != Q38_Q5_K && t != Q38_Q5_1 && t != Q38_Q8_0 && t != Q38_IQ4_NL && t != Q38_IQ4_XS &&
+            if (t != Q38_Q4_K && t != Q38_Q5_K && t != Q38_Q5_1 && t != Q38_Q8_0 && t != Q38_IQ4_NL && t != Q38_IQ4_XS && t != Q38_Q6_K &&
                 t != Q38_IQ3_S) {
                 fprintf(stderr, "q38_gpu: the experts of layer %d are %s, which the device kernels do not compute; "
                                 "running on the CPU\n", il, q38_type_name(t));
@@ -1799,13 +1833,13 @@ extern "C" int q38_gpu_open(void *model, int device)
         for (int i = 0; i < NMAT; i++)
             if (upload(&g->L[il][i], &w[i], g)) return -1;
     }
-    if (upload(&g->output, &m->output, g) || upload(&g->out_hc_norm, &m->out_hc_norm, g) ||
+    if (upload(&g->output, &m->output, g) || upload(&g->output_norm, &m->output_norm, g) || upload(&g->out_hc_norm, &m->out_hc_norm, g) ||
         upload(&g->out_hc_down, &m->out_hc_down, g) || upload(&g->out_hc_up, &m->out_hc_up, g))
         return -1;
 
     const int E = c->n_embd, hcE = c->hc * E, S = c->d_state;
     const int ch = 2 * c->n_kh * S + c->n_vh * S;
-    g->res = dalloc(hcE, g); g->xn = dalloc(hcE, g); g->mixed = dalloc(E, g); g->lo = dalloc(c->hc_rank, g);
+    g->res = dalloc(hcE, g); g->xn = dalloc(hcE, g); g->mixed = dalloc(E, g); g->lo = dalloc(c->hc_rank > 0 ? c->hc_rank : 1, g);   /* 0 without hyper-connections: a NULL that reads as a failure */
     g->gate = dalloc(hcE, g); g->inject = dalloc(64, g); g->y = dalloc(E, g); g->routed = dalloc(E, g);
     g->qkv = dalloc(ch, g); g->z = dalloc((size_t)c->n_vh * S, g); g->o = dalloc((size_t)c->n_vh * S, g);
     g->beta = dalloc(256, g); g->g = dalloc(256, g);
@@ -2229,7 +2263,7 @@ static int seg_front(q38_model *m, int il, int capturing)
     const int ch = 2 * Hk * S + Hv * S;
     cudaStream_t st = G->st;
     char nm[64];
-    if (hc_mix(m, &LM(il, hc_attn_norm), &LM(il, hc_attn_down), &LM(il, hc_attn_up), &LM(il, hc_attn_inject),
+    if (hc_mix(m, NORM_ATTN(il), &LM(il, hc_attn_down), &LM(il, hc_attn_up), &LM(il, hc_attn_inject),
                G->mixed, G->inject)) return -1;
     if (m->tap && !capturing) { snprintf(nm, sizeof nm, "hc_mixed_attn-%d", il); tap(m, nm, G->mixed, E); }
     if (l->recurrent) {
@@ -2241,7 +2275,7 @@ static int seg_front(q38_model *m, int il, int capturing)
         k_gdn_step<<<Hv, dim3(S, 4), 6 * S * sizeof(float), st>>>(G->ssm[il], G->qkv, G->qkv + Hk * S, G->qkv + 2 * Hk * S,
                                                                  G->g, G->beta, G->o, S, Hk);
         if (m->tap && !capturing) { snprintf(nm, sizeof nm, "attn_output-%d", il); tap(m, nm, G->o, (int64_t)Hv * S); }
-        k_norm_gate<<<Hv, 128, 0, st>>>(G->o, G->z, (const float *)LM(il, ssm_norm).d, S, c->eps);
+        k_norm_gate<<<Hv, 128, 0, st>>>(G->o, G->z, (const float *)LM(il, ssm_norm).d, S, c->eps, c->gdn_silu);
         if (mv(&LM(il, ssm_out), G->o, G->y, st)) return -1;
     } else {
         const int H = c->n_head, Hkv = c->n_head_kv, D = c->head_dim;
@@ -2277,7 +2311,7 @@ static int seg_front(q38_model *m, int il, int capturing)
         if (m->tap && !capturing) { snprintf(nm, sizeof nm, "attn_output-%d", il); tap(m, nm, G->y, E); }
     }
     k_hc_combine<<<(hcE + 255) / 256, 256, 0, st>>>(G->res, G->y, G->inject, E, hc);
-    if (hc_mix(m, &LM(il, hc_ffn_norm), &LM(il, hc_ffn_down), &LM(il, hc_ffn_up), &LM(il, hc_ffn_inject),
+    if (hc_mix(m, NORM_FFN(il), &LM(il, hc_ffn_down), &LM(il, hc_ffn_up), &LM(il, hc_ffn_inject),
                G->mixed, G->inject)) return -1;
     if (m->tap && !capturing) { snprintf(nm, sizeof nm, "hc_mixed_ffn-%d", il); tap(m, nm, G->mixed, E); }
     /* router on the device; x and the logits to the host; the shared expert meanwhile */
@@ -2364,7 +2398,7 @@ static int run_aux(q38_model *m, int il)
 static int seg_head(q38_model *m, int capturing)
 {
     const q38_cfg *c = &m->c;
-    if (hc_mix(m, &G->out_hc_norm, &G->out_hc_down, &G->out_hc_up, NULL, G->mixed, NULL)) return -1;
+    if (hc_mix(m, NORM_OUT, &G->out_hc_down, &G->out_hc_up, NULL, G->mixed, NULL)) return -1;
     if (m->tap && !capturing) tap(m, "result_norm", G->mixed, c->n_embd);
     if (mv(&G->output, G->mixed, G->logits, G->st)) return -1;
     CK(cudaMemcpyAsync(G->h_logits, G->logits, (size_t)c->n_vocab * sizeof(float), cudaMemcpyDeviceToHost, G->st));
