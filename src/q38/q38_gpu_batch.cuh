@@ -270,54 +270,6 @@ __global__ void k_norm_rope_b(float *x, int64_t stride, int rows, int64_t tok_st
     }
 }
 
-__global__ void k_kv_store_b(const float *k, const float *v, float *kc, float *vc, const int *ppos, int n, int N)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n * N) return;
-    const int t = i / n, e = i % n;
-    kc[(int64_t)(*ppos + t) * n + e] = k[i];
-    vc[(int64_t)(*ppos + t) * n + e] = v[i];
-}
-
-/* causal attention of token blockIdx.y (position p0 + t) for head blockIdx.x */
-__global__ void k_attn_b(const float *qf, const float *kc, const float *vc, float *out, const int *ppos, int H, int Hkv, int D,
-                         const int *sel, int W)
-{
-    const int t = blockIdx.y;
-    const int T0 = *ppos + t + 1, use_sel = sel && T0 > W, T = use_sel ? W : T0;
-    const int *sl = sel ? sel + (int64_t)t * W : NULL;
-    extern __shared__ float sc[];
-    __shared__ float part[8];
-    const int h = blockIdx.x, kvh = h / (H / Hkv), lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    const float *q = qf + (int64_t)t * H * 2 * D + (int64_t)h * 2 * D, *gate = q + D;
-    const float scale = 1.0f / sqrtf((float)D);
-    for (int c = wp; c < T; c += nw) {
-        const float *kk = kc + ((int64_t)(use_sel ? sl[c] : c) * Hkv + kvh) * D;
-        float s = 0.0f;
-        for (int i = lane; i < D; i += 32) s += q[i] * kk[i];
-        s = warp_sum(s);
-        if (lane == 0) sc[c] = s * scale;
-    }
-    __syncthreads();
-    float mx = -1e30f;
-    for (int c = threadIdx.x; c < T; c += blockDim.x) mx = fmaxf(mx, sc[c]);
-    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-    if (lane == 0) part[wp] = mx;
-    __syncthreads();
-    if (threadIdx.x == 0) { float m2 = -1e30f; for (int i = 0; i < nw; i++) m2 = fmaxf(m2, part[i]); part[0] = m2; }
-    __syncthreads();
-    mx = part[0];
-    __syncthreads();
-    float sum = 0.0f;
-    for (int c = threadIdx.x; c < T; c += blockDim.x) { const float e = expf(sc[c] - mx); sc[c] = e; sum += e; }
-    const float tot = block_sum(sum, part);
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float a2 = 0.0f;
-        for (int c = 0; c < T; c++) a2 += sc[c] * vc[((int64_t)(use_sel ? sl[c] : c) * Hkv + kvh) * D + i];
-        out[(int64_t)t * H * D + (int64_t)h * D + i] = a2 / tot * sigmoidf_(gate[i]);
-    }
-}
-
 /* indexer keys of N tokens in order: store raw, pool each block its last member completes */
 __global__ void k_idx_store_b(const float *kraw, float *raw, float *pool, const float *kn, const int *ppos,
                               int DI, int R, int n_rot, double base, float eps, int N)
@@ -664,6 +616,117 @@ __global__ void k_ext_down(const ExTile *tl, int td, int F, int E, const float *
     }
 }
 
+/* ---- experts of a long batch as tensor-core GEMMs: each expert's weights dequantised once
+ * to fp16, its pairs' inputs gathered in fp16, fp32 accumulation (cuBLAS). The tiles above
+ * decode the weights again for every 8 tokens and multiply in fp32 on the CUDA cores: 93 ms
+ * per layer for 1024 tokens of the 35B. */
+
+/* row r of a repacked matrix (the layouts lane_dot_rp_t reads) as fp16; a warp per row */
+__device__ __forceinline__ void deq_row(int type, const uint8_t *base, int rows, int r, int ne0, int lane, __half *o)
+{
+    if (is_iq(type)) {
+        const uint8_t *w = base + (int64_t)r * iq_row_bytes(type, ne0);
+        const int nch = iq_chunks(type, ne0);
+        for (int c = lane; c < nch; c += 32) {
+            float wt[8];
+            int o0, o1;
+            iq_chunk(type, w, c, wt, &o0, &o1);
+#pragma unroll
+            for (int k = 0; k < 4; k++) { o[o0 + k] = __float2half(wt[k]); o[o1 + k] = __float2half(wt[4 + k]); }
+        }
+    } else if (type == Q38_Q4_K || type == Q38_Q5_K) {
+        const int nsb = ne0 / 256, five = type == Q38_Q5_K;
+        const uint8_t *qs = base + (int64_t)r * (ne0 / 2);
+        const uint8_t *qh = base + (int64_t)rows * (ne0 / 2) + (int64_t)r * nsb * 32;
+        const uint8_t *hd = base + (int64_t)rows * (ne0 / 2) + (five ? (int64_t)rows * nsb * 32 : 0) + (int64_t)r * nsb * 16;
+        for (int c = lane; c < nsb * 8; c += 32) {
+            const int sb = c >> 3, bo = (c & 7) * 16, j = bo >> 5, p = bo & 31;
+            const uint8_t *h = hd + sb * 16;
+            const float2 dd = __half22float2(*(const __half2 *)(const void *)h);
+            float s1, m1, s2, m2;
+            kscales(h, j, &s1, &m1, &s2, &m2);
+            const int4 q4 = *(const int4 *)(const void *)(qs + sb * 128 + bo);
+            int4 h4 = make_int4(0, 0, 0, 0);
+            if (five) h4 = *(const int4 *)(const void *)(qh + sb * 32 + p);
+            const uint32_t qw[4] = { (uint32_t)q4.x, (uint32_t)q4.y, (uint32_t)q4.z, (uint32_t)q4.w };
+            const uint32_t hw[4] = { (uint32_t)h4.x, (uint32_t)h4.y, (uint32_t)h4.z, (uint32_t)h4.w };
+            __half *ol = o + sb * 256 + 64 * j + p, *oh = ol + 32;
+#pragma unroll
+            for (int u = 0; u < 16; u++) {
+                const int qb = (qw[u >> 2] >> (8 * (u & 3))) & 0xFF;
+                const int hb = (hw[u >> 2] >> (8 * (u & 3))) & 0xFF;
+                const float lo = (float)((qb & 15) + (five ? (((hb >> (2 * j)) & 1) << 4) : 0));
+                const float hi = (float)((qb >> 4) + (five ? (((hb >> (2 * j + 1)) & 1) << 4) : 0));
+                ol[u] = __float2half(dd.x * s1 * lo - dd.y * m1);
+                oh[u] = __float2half(dd.x * s2 * hi - dd.y * m2);
+            }
+        }
+    } else if (type == Q38_Q5_1) {
+        const int nb = ne0 / 32;
+        const uint8_t *qs = base + (int64_t)r * (ne0 / 2);
+        const uint32_t *qh = (const uint32_t *)(const void *)(base + (int64_t)rows * (ne0 / 2)) + (int64_t)r * nb;
+        const __half2 *dm = (const __half2 *)(const void *)(base + (int64_t)rows * (ne0 / 2) + (int64_t)rows * nb * 4) + (int64_t)r * nb;
+        for (int b = lane; b < nb; b += 32) {
+            const int4 q4 = *(const int4 *)(const void *)(qs + b * 16);
+            const uint32_t h = qh[b];
+            const float2 f = __half22float2(dm[b]);
+            const uint32_t qw[4] = { (uint32_t)q4.x, (uint32_t)q4.y, (uint32_t)q4.z, (uint32_t)q4.w };
+#pragma unroll
+            for (int u = 0; u < 16; u++) {
+                const int qb = (qw[u >> 2] >> (8 * (u & 3))) & 0xFF;
+                o[b * 32 + u] = __float2half(f.x * (float)((qb & 15) | (((h >> u) & 1) << 4)) + f.y);
+                o[b * 32 + 16 + u] = __float2half(f.x * (float)((qb >> 4) | (((h >> (u + 16)) & 1) << 4)) + f.y);
+            }
+        }
+    } else if (type == Q38_Q8_0) {
+        const int nb = ne0 / 32;
+        const int8_t *qs = (const int8_t *)(base + (int64_t)r * ne0);
+        const __half *d = (const __half *)(const void *)(base + (int64_t)rows * ne0) + (int64_t)r * nb;
+        for (int c = lane; c < nb * 2; c += 32) {
+            const int4 q4 = *(const int4 *)(const void *)(qs + c * 16);
+            const int8_t *q = (const int8_t *)&q4;
+            const float dc = __half2float(d[c >> 1]);
+#pragma unroll
+            for (int k = 0; k < 16; k++) o[c * 16 + k] = __float2half(dc * (float)q[k]);
+        }
+    }
+}
+
+#define XG_EXP 8                    /* experts dequantised per launch */
+typedef struct {
+    const uint8_t *base[3 * XG_EXP];
+    __half *out[3 * XG_EXP];
+    int type[3 * XG_EXP], rows[3 * XG_EXP], ne0[3 * XG_EXP];
+} XgJobs;
+
+/* matrix blockIdx.y of the group, a warp per row */
+__global__ void __launch_bounds__(256) k_deq_jobs(XgJobs J)
+{
+    const int y = blockIdx.y, r = blockIdx.x * 8 + threadIdx.y;
+    if (r >= J.rows[y]) return;
+    deq_row(J.type[y], J.base[y], J.rows[y], r, J.ne0[y], threadIdx.x, J.out[y] + (int64_t)r * J.ne0[y]);
+}
+
+/* the pairs' inputs, in pair order, as fp16 (the token of pair p is ex[p].pad) */
+__global__ void k_gather_h(const ExDesc *ex, const int *pn, const float *X, int E, __half *xh, int maxp)
+{
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)maxp * E) return;
+    const int p = (int)(i / E), e = (int)(i % E);
+    if (p >= *pn) return;
+    xh[i] = __float2half(X[(int64_t)ex[p].pad * E + e]);
+}
+
+/* SwiGLU of pairs [p0, p1) into fp16 (clamped to its range) */
+__global__ void k_swiglu_h(const float *gu, __half *h, int F, int p0, int p1)
+{
+    const int64_t i = (int64_t)p0 * F + (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)p1 * F) return;
+    const int k = (int)(i / F), j = (int)(i % F);
+    const float v = siluf_(gu[(int64_t)k * 2 * F + j]) * gu[(int64_t)k * 2 * F + F + j];
+    h[i] = __float2half(fminf(fmaxf(v, -65504.0f), 65504.0f));
+}
+
 /* each token's routed sum over its pairs, in the order the host listed them */
 __global__ void k_exb_reduce(const int *tp, const float *tw, int KT, const float *dn, int E, float *y, int N)
 {   /* accumulates: y is cleared once per layer, then each group of pairs adds its share */
@@ -761,6 +824,8 @@ static int mm(const DMat *w, const float *X, int ldx, float *Y, int ldy, int N, 
     return 0;
 }
 
+static void xg_open(int k, int dev, const q38_cfg *c, int maxp);   /* below */
+
 static int bat_open(q38_model *m, int nb)
 {
     const q38_cfg *c = &m->c;
@@ -854,6 +919,8 @@ static int bat_open(q38_model *m, int nb)
     CK(cudaMallocHost(&b->h_logits, (size_t)c->n_vocab * sizeof(float)));
     CK(cudaMallocHost(&b->h_pos, sizeof(int)));
 #undef DA
+    xg_open(0, G->dev, c, b->maxp);
+    cudaSetDevice(G->dev);
     GB = b;
     return 0;
 }
@@ -883,6 +950,7 @@ static int bat_open_aux(q38_model *m)
         CK(cudaMallocHost(&b->h_tp2, (size_t)nb * K * sizeof(int)));
         CK(cudaMallocHost(&b->h_tw2, (size_t)nb * K * sizeof(float)));
         CK(cudaMallocHost(&b->h_y2, (size_t)nb * E * sizeof(float)));
+        xg_open(1, G->pdev[1], c, b->maxp);
         CK(cudaSetDevice(G->dev));
     }
     return 0;
@@ -907,6 +975,84 @@ static int hc_mix_b(q38_model *m, const float *res, int N, const DMat *norm, con
     k_hc_mean_b<<<nblocks((int64_t)N * E, 256), 256, 0, st>>>(GB->xn, GB->gate, mixed, E, hc, N);
     if (inj && mm(inj, GB->xn, hcE, inject, hc, N, st)) return -1;
     return 0;
+}
+
+/* the expert GEMMs' buffers on each pool device ([0] the trunk's, [1] the other) */
+typedef struct { cublasHandle_t h; __half *w, *xh, *hh; int ok; } XGemm;
+static XGemm g_xg[2];
+static int g_xg_min = -1;           /* pairs from which a layer's experts go through GEMMs */
+
+static void xg_open(int k, int dev, const q38_cfg *c, int maxp)
+{
+    XGemm *x = &g_xg[k];
+    if (g_xg_min < 0) {
+        const char *e = getenv("Q38_XGEMM_MIN");
+        g_xg_min = e ? atoi(e) : 256;
+    }
+    if (g_xg_min <= 0 || x->ok) return;                 /* Q38_XGEMM_MIN=0: the tiles only */
+    const int64_t E = c->n_embd, F = c->ff_exp;
+    cudaSetDevice(dev);
+    if (cudaMalloc(&x->w, (size_t)XG_EXP * 3 * F * E * sizeof(__half)) != cudaSuccess ||
+        cudaMalloc(&x->xh, (size_t)maxp * E * sizeof(__half)) != cudaSuccess ||
+        cudaMalloc(&x->hh, (size_t)maxp * F * sizeof(__half)) != cudaSuccess ||
+        cublasCreate(&x->h) != CUBLAS_STATUS_SUCCESS) {
+        cudaGetLastError();
+        cudaFree(x->w); cudaFree(x->xh); cudaFree(x->hh);
+        x->w = NULL; x->xh = x->hh = NULL;
+        fprintf(stderr, "q38_gpu: no room for the expert GEMMs on GPU %d: tiles instead\n", dev);
+        return;
+    }
+    x->ok = 1;
+}
+
+/* a layer's np pairs (sorted by expert) on device k: gate/up and down of each expert's run of
+ * pairs as two GEMMs, XG_EXP experts dequantised per launch; egu [np][2F], edn [np][E] */
+static int xg_run(const q38_layer *L, const q38_cfg *c, int k, int np, const ExDesc *hp, const ExDesc *dp, const int *dn,
+                  const float *X, float *egu, float *edn, cudaStream_t st)
+{
+    XGemm *x = &g_xg[k];
+    const int E = c->n_embd, F = c->ff_exp;
+    const int64_t wsz = (int64_t)3 * F * E;
+    const float one = 1.0f, zero = 0.0f;
+    k_gather_h<<<nblocks((int64_t)np * E, 256), 256, 0, st>>>(dp, dn, X, E, x->xh, np);
+    cublasSetStream(x->h, st);
+    for (int i = 0; i < np;) {
+        XgJobs J;
+        int rs[XG_EXP], rn[XG_EXP], nr = 0, j = i;
+        while (j < np && nr < XG_EXP) {
+            int k2 = j + 1;
+            while (k2 < np && hp[k2].g == hp[j].g) k2++;
+            __half *w = x->w + nr * wsz;
+            const uint8_t *src[3] = { hp[j].g, hp[j].u, hp[j].d };
+            const int ty[3] = { L->ex_gate.type, L->ex_up.type, L->ex_down.type };
+            for (int q = 0; q < 3; q++) {
+                J.base[3 * nr + q] = src[q];
+                J.out[3 * nr + q] = w + (int64_t)q * F * E;
+                J.type[3 * nr + q] = ty[q];
+                J.rows[3 * nr + q] = q < 2 ? F : E;
+                J.ne0[3 * nr + q] = q < 2 ? E : F;
+            }
+            rs[nr] = j;
+            rn[nr] = k2 - j;
+            nr++;
+            j = k2;
+        }
+        k_deq_jobs<<<dim3(nblocks(F > E ? F : E, 8), 3 * nr), dim3(32, 8), 0, st>>>(J);
+        for (int r = 0; r < nr; r++)       /* gate and up rows are adjacent: one product of 2F */
+            if (cublasGemmEx(x->h, CUBLAS_OP_T, CUBLAS_OP_N, 2 * F, rn[r], E, &one, x->w + r * wsz, CUDA_R_16F, E,
+                             x->xh + (int64_t)rs[r] * E, CUDA_R_16F, E, &zero, egu + (int64_t)rs[r] * 2 * F, CUDA_R_32F,
+                             2 * F, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) goto fail;
+        k_swiglu_h<<<nblocks((int64_t)(j - i) * F, 256), 256, 0, st>>>(egu, x->hh, F, i, j);
+        for (int r = 0; r < nr; r++)
+            if (cublasGemmEx(x->h, CUBLAS_OP_T, CUBLAS_OP_N, E, rn[r], F, &one, x->w + r * wsz + 2 * (int64_t)F * E, CUDA_R_16F,
+                             F, x->hh + (int64_t)rs[r] * F, CUDA_R_16F, F, &zero, edn + (int64_t)rs[r] * E, CUDA_R_32F, E,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) goto fail;
+        i = j;
+    }
+    return 0;
+fail:
+    fprintf(stderr, "q38_gpu: cublasGemmEx failed (experts)\n");
+    return -1;
 }
 
 /* routed experts of one layer for N tokens on one device: pairs in h_pairs, per-token lists */
@@ -958,7 +1104,9 @@ static int run_pairs(q38_model *m, int il, int dev2, int np, const float *X, flo
     CK(cudaMemcpyAsync(dtw, htw, (size_t)N * K * sizeof(float), cudaMemcpyHostToDevice, st));
     if (!dev2 && G->ev_pup) CK(cudaEventRecord(G->ev_pup, st));   /* the host may rewrite its lists after this */
     const dim3 blk(32, ROWS_PER_BLOCK);
-    if (tiled) {
+    if (tiled && np >= g_xg_min && g_xg[dev2].ok) {
+        if (xg_run(L, c, dev2, np, hp, dp, dn, X, egu, edn, st)) return -1;
+    } else if (tiled) {
         k_ext_gu<<<dim3(nblocks(2 * F, ROWS_PER_BLOCK), nt), blk, 0, st>>>(dt, dp, L->ex_gate.type, L->ex_up.type, E, F, X, egu);
         k_exb_swiglu<<<nblocks((int64_t)np * F, 256), 256, 0, st>>>(dn, egu, eh, F, np);
         k_ext_down<<<dim3(nblocks(E, ROWS_PER_BLOCK), nt), blk, 0, st>>>(dt, L->ex_down.type, F, E, eh, edn);
@@ -1145,7 +1293,7 @@ static int forward_batch_chunk(q38_model *m, const int *toks, int N, int want_la
                                                 c->n_rot, G->d_pos, c->rope_base, c->eps);
             k_norm_rope_b<<<N * Hkv, 256, 0, st>>>(b->knew, D, Hkv, (int64_t)Hkv * D, (const float *)LM(il, k_norm).d, D,
                                                   c->n_rot, G->d_pos, c->rope_base, c->eps);
-            k_kv_store_b<<<nblocks(Hkv * D * N, 256), 256, 0, st>>>(b->knew, b->vnew, G->kc[il], G->vc[il], G->d_pos, Hkv * D, N);
+            kv_store(G, il, b->knew, b->vnew, Hkv * D, N, st);
             const int *sel = NULL;
             if (G->idx_raw[il] && b->isel) {
                 const int DI = c->idx_dim, R = c->idx_ratio, NH = c->idx_heads;
@@ -1162,8 +1310,11 @@ static int forward_batch_chunk(q38_model *m, const int *toks, int N, int want_la
                     sel = b->isel;
                 }
             }
-            k_attn_b<<<dim3(H, N), 256, (size_t)(m->max_ctx < W ? m->max_ctx : W) * sizeof(float), st>>>(
-                b->qf, G->kc[il], G->vc[il], b->aout, G->d_pos, H, Hkv, D, sel, W);
+            static int aprof = -1;
+            if (aprof < 0) aprof = getenv("Q38_ATT_PROF") ? atoi(getenv("Q38_ATT_PROF")) : 0;
+            const double ta = aprof ? (cudaStreamSynchronize(st), now_s()) : 0.0;
+            attn(G, il, b->qf, b->aout, H, Hkv, D, sel, W, N, st);
+            if (aprof) { cudaStreamSynchronize(st); G->t_attn += now_s() - ta; }
             if (mm(&LM(il, wo), b->aout, H * D, b->y, E, N, st)) return -1;
         }
         k_hc_combine_b<<<nblocks((int64_t)N * hcE, 256), 256, 0, st>>>(b->res, b->y, b->inject, E, hc, N);
@@ -1278,12 +1429,13 @@ extern "C" int q38_gpu_forward_batch(void *model, const int *toks, int n)
     G->warm_want = 1;
     for (int i = 0; i < n; i += GB->nb) {
         const int k = n - i < GB->nb ? n - i : GB->nb;
-        const double t0 = now_s(), r0 = m->t_read;
-        const int64_t b0 = m->expert_bytes_read;
+        const double t0 = now_s(), r0 = m->t_read, s0 = G->t_stream, w0 = m->t_gpu_wait, a0 = G->t_attn;
+        const int64_t b0 = m->expert_bytes_read, sb0 = G->stream_bytes;
         if (forward_batch_chunk(m, toks + i, k, i + k == n)) return -1;
         if (getenv("Q38_BATCH_VERBOSE"))
-            fprintf(stderr, "q38: batch of %d tokens at %d: %.1f s, %.2f GB read in %.1f s\n", k, m->n_past - k,
-                    now_s() - t0, (m->expert_bytes_read - b0) / 1e9, m->t_read - r0);
+            fprintf(stderr, "q38: batch of %d tokens at %d: %.1f s, %.2f GB read in %.1f s, %.2f GB to the device in %.1f s,"
+                    " attention %.2f s, gpu wait %.1f s\n", k, m->n_past - k, now_s() - t0, (m->expert_bytes_read - b0) / 1e9, m->t_read - r0,
+                    (G->stream_bytes - sb0) / 1e9, G->t_stream - s0, G->t_attn - a0, m->t_gpu_wait - w0);
     }
     return 0;
 }

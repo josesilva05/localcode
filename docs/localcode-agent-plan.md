@@ -36,7 +36,20 @@ Restrições do nosso hardware: um modelo só a ~10 tok/s → os subagentes roda
 1. Ferramentas + loop do agente + níveis 1 e 2 no TUI (chamadas de ferramenta visíveis, aprovação).
 2. Sessões em disco + compactação.
    - 2a: `lc_session.c`, `/compact [foco]`, `/sessions`, `/resume [N]`, `--continue`; limite proporcional ao contexto.
-   - 2b: contexto maior no motor — hoje 32k na GPU (limite da ordenação do indexador) e 64k na CPU; o modelo vai a 262.144. KV em fp32 custa ~54 KB/posição (12 camadas de atenção, 2 cabeças KV × 256, mais o indexador): 1,8 GB em 32k, 7 GB em 128k, 14 GB em 256k. Caminho: KV em fp16 (metade), ordenação do indexador sem o teto de 8192 blocos, e medir VRAM tirada do cache de especialistas × velocidade. Preferido: 128k; topo: 256k.
+   - 2b: contexto maior no motor.
+     - **Feito para o Qwen3.6-35B-A3B (2026-10-08): 128k por padrão** (o teto é o `context_length` do GGUF, 262.144).
+       - Atenção da GPU reescrita no estilo flash: blocos de posições com softmax incremental; nada mais guarda as notas de todas as posições na memória compartilhada (isso limitava a ~12k).
+       - Acima de 32k posições, K/V em fp16 (`Q38_KV=16|32`; 128k custam 2,7 GB de VRAM) e atenção nos tensor cores (`mma.sync`, fp16 com acumulação fp32, a precisão do FlashAttention do llama.cpp):
+         - decodificação: 128 segmentos de um warp por cabeça K/V, juntados depois;
+         - prompt: 16 tokens × 8 cabeças por bloco, a saída nos registradores.
+       - Até 32k, K/V e atenção continuam em fp32, exatos contra a referência (decodificação em 32 segmentos).
+       - Especialistas de lotes grandes viram GEMMs do cuBLAS (pesos desquantizados uma vez para fp16; `Q38_XGEMM_MIN=0` desliga).
+       - Validação contra float64: caminhos fp32 a 5e-7; modo fp16 ~1e-4, com o mesmo top-5. Flash-Next sem regressão (9,7e-7 contra a versão anterior).
+       - Teste da agulha (uma senha no meio do texto, pergunta no fim): achada a 16k e a 118k tokens.
+       - Medidas no 35B-A3B (pools de VRAM pré-carregados como no localcode):
+         - prompt de 118,6k tokens em 501 s (237 tok/s; ~3,3 s por 1024 tokens no começo e 5,3 s perto de 115k);
+         - decodificação a 118k de profundidade: ~13,5 tok/s; no início do contexto, 31–33 tok/s.
+     - Falta: Flash-Next acima de 32k (ordenação do indexador limitada a 8192 blocos; continua com 8k por padrão).
 3. Contextos de subagente + nível 3 para código com testes.
 4. Críticos de web (Playwright) e de documentos.
 5. Ajuste com tarefas reais: tempo, taxa de vitória na comparação cega, regressões.
@@ -72,7 +85,7 @@ Ordem: (1) o ciclo do agente — feito; (2) perfil de modelo; (3) núcleo comum 
 | Modelo | Arquitetura | Estado | Velocidade (localcode, GPU) |
 |---|---|---|---|
 | Qwen3.8-Flash-Next UD-Q4_K_XL / UD-IQ4_XS | `qwen4exp` | validado (float64) | ~12 tok/s (limitado por RAM/disco) |
-| Qwen3.6-35B-A3B-MTP | `qwen35moe` | validado (float64: CPU 3e-6, GPU 5e-7) | 32,8 tok/s; agente 29,9 tok/s |
+| Qwen3.6-35B-A3B-MTP | `qwen35moe` | validado (float64: CPU 3e-6, GPU 5e-7); contexto 128k | 32,8 tok/s; agente 31,2 tok/s; 13,5 tok/s a 118k |
 | Qwen3.6-35B-A3B-Uncensored | `qwen35moe` | roda | 35,5 tok/s |
 | Qwen3.8-27B | `qwen35` (denso) | próximo: FFN densa + camadas divididas entre as GPUs | — |
 

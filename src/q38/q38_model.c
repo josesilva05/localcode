@@ -61,6 +61,7 @@ static int read_cfg(q38_cfg *c, const q38_gguf *g)
     c->ff_exp     = (int)need_int(g, K("expert_feed_forward_length"), &bad);
     c->ff_shexp   = (int)need_int(g, K("expert_shared_feed_forward_length"), &bad);
     c->interval   = (int)q38_gguf_int(g, K("full_attention_interval"), 4);
+    c->ctx_train  = (int)q38_gguf_int(g, K("context_length"), 262144);
     c->conv_k     = (int)need_int(g, K("ssm.conv_kernel"), &bad);
     c->d_state    = (int)need_int(g, K("ssm.state_size"), &bad);
     c->n_kh       = (int)need_int(g, K("ssm.group_count"), &bad);
@@ -1711,9 +1712,11 @@ int q38_model_open(q38_model *m, const char *path, int max_ctx)
         c->idx_top_k = 0;
         c->max_dense_ctx = 1 << 30;
     }
-    if (max_ctx <= 0) max_ctx = 8192;
+    /* default: 128k for the plain models (their K/V is small: 10 attention layers of 2 heads,
+     * half precision on the device above 32k); 8k for Flash-Next, whose VRAM goes to expert slots */
+    if (max_ctx <= 0) max_ctx = c->plain ? 131072 : 8192;
     if (c->idx_top_k <= 0 && max_ctx > c->max_dense_ctx) max_ctx = c->max_dense_ctx;
-    if (max_ctx > (1 << 16)) max_ctx = 1 << 16;
+    if (max_ctx > c->ctx_train) max_ctx = c->ctx_train;
     m->max_ctx = max_ctx;
     double t0 = now_s();
     if (bind_all(m)) { q38_model_close(m); return -1; }

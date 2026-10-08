@@ -77,7 +77,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <model.gguf> <tokens.txt> [--dump dir] [--gen N] [--gpu N] [--cache-gb G]\n", argv[0]);
         return 2;
     }
-    int gen = 0;
+    int gen = 0, ctx = 0;             /* --ctx: the context size (long-prompt tests) */
     double cache_gb = 0;
     int gpu = -1;
     const char *logits_dir = NULL;
@@ -87,6 +87,7 @@ int main(int argc, char **argv)
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--dump") && i + 1 < argc) g_dump = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gpu") && i + 1 < argc) gpu = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--logits") && i + 1 < argc) logits_dir = argv[++i];
@@ -102,17 +103,19 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--preload") && i + 1 < argc) preload = atof(argv[++i]);
         else if (!strcmp(argv[i], "--names") && i + 1 < argc) g_names = argv[++i];
     }
-    static int toks[8192];
+    const int ntok = ctx > 8192 ? ctx : 8192;
+    int *toks = (int *)malloc((size_t)ntok * sizeof(int));
     int n = 0;
+    if (!toks) return 1;
     if (!text) {
         FILE *f = fopen(argv[2], "r");
         if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-        while (n < 8192 && fscanf(f, "%d", &toks[n]) == 1) n++;
+        while (n < ntok && fscanf(f, "%d", &toks[n]) == 1) n++;
         fclose(f);
     }
 
     static q38_model m;
-    if (q38_model_open(&m, argv[1], text || n + gen > 4000 ? 8192 : 4096)) return 1;
+    if (q38_model_open(&m, argv[1], ctx > 0 ? ctx : text || n + gen > 4000 ? 8192 : 4096)) return 1;
     if (text) {                       /* tokens.txt is plain text: encode it, up to 8000 tokens */
         FILE *f = fopen(argv[2], "rb");
         if (!f) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
@@ -125,7 +128,7 @@ int main(int argc, char **argv)
         buf[len] = 0;
         q38_tok *tk = q38_tok_load(&m.g);
         if (!tk) return 1;
-        n = q38_tok_encode(tk, buf, (int)len, toks, 8000 - gen);
+        n = q38_tok_encode(tk, buf, (int)len, toks, (ctx > 0 ? ctx - 192 : 8000) - gen);
         q38_tok_free(tk);
         free(buf);
         fprintf(stderr, "%d tokens from the text\n", n);
@@ -136,9 +139,14 @@ int main(int argc, char **argv)
     if (cache_gb > 0) q38_model_set_cache(&m, cache_gb);
     if (g_dump) m.tap = tap;
     if (preload > 0) {
+        /* localcode's usage profile for this model's shape (Flash-Next's under its old name) */
         char prof[1024];
         const char *base = getenv("LOCALAPPDATA");
-        snprintf(prof, sizeof prof, "%s/localcode/qwen38_expert_profile.bin", base ? base : ".");
+        snprintf(prof, sizeof prof, "%s/localcode/expert_profile-%s-%dx%d.bin", base ? base : ".", m.c.arch, m.c.n_layer,
+                 m.c.n_exp);
+        FILE *pf = fopen(prof, "rb");
+        if (pf) fclose(pf);
+        else snprintf(prof, sizeof prof, "%s/localcode/qwen38_expert_profile.bin", base ? base : ".");
         const double tp = now_s();
         if (q38_model_profile_load(&m, prof) == 0) {
             const int nr = q38_model_preload(&m, preload);
@@ -162,6 +170,7 @@ int main(int argc, char **argv)
         int t5[5];
         top5(lg, m.c.n_vocab, t5);
         next = t5[0];
+        gtoks[0] = next;
         printf("prompt of %d tokens in one batch: %.3fs (%.1f tok/s), top5 %d %d %d %d %d\n", n, now_s() - tb,
                n / (now_s() - tb), t5[0], t5[1], t5[2], t5[3], t5[4]);
         if (logits_dir) {
@@ -193,6 +202,19 @@ int main(int argc, char **argv)
                i < n ? "prompt" : "gen   ", i, tok, now_s() - t0, m.t_read - r0, m.t_experts - e0, m.t_gpu_wait - w0,
                m.t_ple - p0, m.t_tail - l0, t5[0], t5[1], t5[2], t5[3], t5[4]);
         fflush(stdout);
+    }
+    if (text && gen > 0) {            /* what it wrote, readable (long-context recall tests) */
+        q38_tok *tk = q38_tok_load(&m.g);
+        if (tk) {
+            char piece[256];
+            printf("text:");
+            for (int i = 0; i < gen && i < 8192; i++) {
+                q38_tok_piece(tk, gtoks[i], piece, sizeof piece);
+                printf("%s", piece);
+            }
+            printf("\n");
+            q38_tok_free(tk);
+        }
     }
 #ifdef Q38_CUDA
     if (mvbench && gpu >= 0) q38_gpu_mvbench(&m);

@@ -36,6 +36,7 @@ typedef struct {
     int     hc, hc_rank;
     int     conv_k, d_state, n_kh, n_vh;     /* Gated DeltaNet */
     int     idx_top_k, max_dense_ctx;        /* indexer budget; dense attention limit */
+    int     ctx_train;                       /* the model's context_length */
     int     idx_heads, idx_dim, idx_ratio;   /* lightning indexer: query heads, key length, block size */
     /* PLE */
     int     ple_layer;                       /* -1 when absent */
