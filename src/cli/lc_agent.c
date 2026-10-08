@@ -62,6 +62,25 @@ static void s_fmt(Str *s, const char *fmt, ...)
     if (n > 0) s_add(s, buf, (size_t)(n < (int)sizeof buf ? n : (int)sizeof buf - 1));
 }
 
+/* A tool result within what the context has left: at most half of the free positions
+ * (about 3 characters each, after what this step already holds and the answer's budget),
+ * never under 1500 characters; cut at a line start with a note on how to read the rest.
+ * Three files of 4000 lines filled an 8k context in one step and stopped the turn. */
+static void fit_result(const Glm53fEngine *e, size_t pending, int gen, const char *res, Str *t)
+{
+    const long free_tok = (long)e->cap - e->cached - ROOM - gen - (long)(pending / 3);
+    size_t lim = free_tok > 0 ? (size_t)free_tok * 3 / 2 : 0;
+    if (lim < 1500) lim = 1500;
+    const size_t n = strlen(res);
+    if (n <= lim) { s_add(t, res, n); return; }
+    size_t cut = lim;
+    while (cut > lim / 2 && res[cut - 1] != '\n') cut--;
+    if (res[cut - 1] != '\n') { cut = lim; while (cut > 0 && ((unsigned char)res[cut] & 0xC0) == 0x80) cut--; }
+    s_add(t, res, cut);
+    s_fmt(t, "\n[localcode] cut to fit the context: %zu of %zu characters shown. Read the rest in smaller pieces "
+             "(read_file with a line range, grep for what you need).", cut, n);
+}
+
 static int utf8_complete(const char *s, int n)
 {
     int i = n, back = 0;
@@ -625,7 +644,7 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                 if (k->tool) k->tool(k, title, sum, ok);
                 s_fmt(&actions, "- `%s` — %s\n", title, sum);
                 s_str(&t, "\n<tool_response>\n");
-                s_str(&t, res ? res : "(out of memory)");
+                fit_result(e, t.n, step_gen, res ? res : "(out of memory)", &t);
                 s_str(&t, "\n</tool_response>");
                 calls_done++;
             }

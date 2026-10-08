@@ -1147,6 +1147,32 @@ static void menu_reasoning(const char *typed)
     }
 }
 
+/* /model: the models on this machine; enter opens the chosen one */
+static void menu_models(const char *typed)
+{
+    const Glm53fEngine *e = g_s->e;
+    snprintf(M.title, sizeof M.title, "Models on this machine (enter switches; the conversation goes on in it)");
+    for (int i = 0; i < e->n_variants; i++) {
+        const char *name = e->variant_name[i];
+        int hit = !*typed, digits = *typed != 0;     /* the typed text anywhere in the name, or its number */
+        for (const char *d = typed; *d; d++) if (*d < '0' || *d > '9') digits = 0;
+        if (digits) hit = atoi(typed) == i + 1;
+        for (const char *h = name; *h && !hit && !digits; h++) {
+            const char *a = typed, *b = h;
+            while (*a && *b && (*a | 32) == (*b | 32)) { a++; b++; }
+            if (!*a) hit = 1;
+        }
+        if (!hit) continue;
+        MenuItem *it = menu_add();
+        if (!it) return;
+        snprintf(it->tab, sizeof it->tab, "/model %d", i + 1);
+        snprintf(it->label, sizeof it->label, "%s", name);
+        snprintf(it->hint, sizeof it->hint, "%s", e->variant_info[i]);
+        if (e->variant && !strcmp(e->variant, name)) snprintf(it->value, sizeof it->value, "open");
+        it->submits = 1;
+    }
+}
+
 static void menu_gen(const char *typed)
 {
     static const int v[] = { 256, 512, 1024, 2048, 4096 };
@@ -1315,6 +1341,7 @@ static void menu_build(void)
     const char *sp = strchr(t, ' ');
     if (!sp)                              menu_commands(t);
     else if (!strncmp(t, "/reasoning ", 11)) menu_reasoning(t + 11);
+    else if (!strncmp(t, "/model ", 7))     menu_models(t + 7);
     else if (!strncmp(t, "/gen ", 5))       menu_gen(t + 5);
     else if (!strncmp(t, "/file ", 6))      menu_files(t + 6);
     if (M.sel >= M.n) M.sel = M.n ? M.n - 1 : 0;

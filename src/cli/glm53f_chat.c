@@ -157,7 +157,7 @@ static char *save(Glm53fChat *s, const char *arg)
 const Glm53fCommand glm53f_commands[] = {
     { "/file",      "PATH [question]", "send a file's text, then the question (a path with spaces in quotes)", 2 },
     { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
-    { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 1 },
+    { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 2 },
     { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
     { "/reasoning", "LEVEL",           "reasoning effort of level 0 chat (set when a conversation opens)", 2 },
     { "/gen",       "N",               "tokens to generate per answer", 2 },
