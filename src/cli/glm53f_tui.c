@@ -973,8 +973,9 @@ static void render_blocks(Lines *L, const Glm53fChat *s, int W)
             while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
             if (!*q) continue;
         }
-        /* consecutive tools stay together */
-        if (i > 0 && !(b->kind == B_TOOL && g_blocks[i - 1].kind == B_TOOL)) push_text(L, "");
+        /* consecutive tools stay together; what a "thought for" line introduces follows it closely */
+        if (i > 0 && !(b->kind == B_TOOL && g_blocks[i - 1].kind == B_TOOL) && g_blocks[i - 1].kind != B_THOUGHT)
+            push_text(L, "");
         switch (b->kind) {
         case B_SPLASH: render_splash(L, s, W); break;
         case B_USER:   render_bubble(L, t, b->text.n, W); break;
@@ -995,7 +996,10 @@ static void render_blocks(Lines *L, const Glm53fChat *s, int W)
         }
         case B_ANSWER: {
             const int from = L->n;
-            render_markdown(L, t, b->text.n, W);
+            size_t n = b->text.n;                /* the blank lines the model leaves around its text: none */
+            while (n > 0 && (t[n - 1] == '\n' || t[n - 1] == '\r' || t[n - 1] == ' ' || t[n - 1] == '\t')) n--;
+            while (n > 0 && (*t == '\n' || *t == '\r')) { t++; n--; }
+            render_markdown(L, t, n, W);
             mark_first(L, from, C_BRIGHT "●");
             break;
         }

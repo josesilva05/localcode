@@ -16,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define GLM53F_CHAT_MAX_GEN 8192
+#define GLM53F_CHAT_MAX_GEN 32768     /* an agent answer: a whole file in one tool call */
 
 /* Expert-cache counters (they only grow in a session); zero when the engine has none. */
 typedef struct { uint64_t hits, misses, ahead, bytes; double wait; } Glm53fCounters;

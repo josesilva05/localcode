@@ -474,7 +474,9 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
         /* read what goes before the model's next answer */
         const int n = e->encode(e, t.p, (int)t.n, s->ids, s->ids_cap);
         if (n <= 0) { why_stop = "could not tokenise the step"; failed = 1; break; }
-        const int step_gen = s->gen < 4096 ? s->gen : 4096;
+        /* room kept for the answer before compacting: a quarter of the context up to 8192 for the
+         * agent (a file written in one call), /gen up to 4096 for a chat answer */
+        const int step_gen = level >= 1 ? (e->cap / 4 < 8192 ? e->cap / 4 : 8192) : (s->gen < 4096 ? s->gen : 4096);
         if (lc_compact_due(s, n + step_gen)) {
             const int rc = compact_step(s, k, &t, level, prompt);
             if (rc < 0) { why_stop = "the engine failed while compacting"; fatal = 1; break; }
@@ -499,12 +501,30 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
         if (t.p) t.p[0] = 0;
 
         /* the model's answer: reasoning, then text, then maybe tool calls */
-        int gen = s->gen;
+        /* the agent's answer may take the whole free context: a tool call writing a file runs past
+         * /gen (2048), and was cut in the middle; /gen stays the limit of a plain chat answer */
+        int gen = level >= 1 ? e->cap - e->cached - 64 : s->gen;
         if (gen > e->cap - e->cached - 64) gen = e->cap - e->cached - 64;
-        int nout = 0, printed = 0, in_think = 1, eos = 0;
+        if (gen > GLM53F_CHAT_MAX_GEN - 32) gen = GLM53F_CHAT_MAX_GEN - 32;   /* s->out's room */
+        int nout = 0, printed = 0, in_think = 1, eos = 0, closed = 0;
+        /* the reasoning's budget (/gen, at least 4096): past it the engine closes the thinking itself
+         * and the model goes on to answer, as llama.cpp's reasoning budget does; without one a
+         * reasoning that loops runs until the context is full (20 minutes on the 27B) */
+        const int think_cap = s->gen > 4096 ? s->gen : 4096;
         const double td = now_s();
         for (int step = 0; step < gen; step++) {
             if (*stop) { interrupted = 1; break; }
+            if (in_think && !closed && nout >= think_cap && nout + 16 < s->ids_cap) {
+                int ids[16];
+                const int k2 = e->encode(e, "\n</think>\n\n", 11, ids, 16);
+                if (k2 > 0 && nout + k2 < GLM53F_CHAT_MAX_GEN) {
+                    for (int i = 0; i < k2; i++) s->out[nout++] = ids[i];
+                    closed = 1;
+                    if (e->forward(e, ids, k2, s->logits) != 0) { fatal = 1; break; }
+                    if (k->tool) k->tool(k, "raciocínio", "chegou ao limite: o motor fechou o raciocínio e o modelo responde", 1);
+                    continue;
+                }
+            }
             int best = 0;
             for (int i = 1; i < e->n_vocab; i++) if (s->logits[i] > s->logits[best]) best = i;
             if (e->is_eos(e, best)) { eos = 1; break; }
