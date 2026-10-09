@@ -37,6 +37,13 @@ int  lc_tool_needs_approval(const char *name);
 /* One line saying what a call will do ("edit_file src/main.c", "run: cmake --build build"). */
 void lc_tool_title(const LcCall *c, char *buf, size_t cap);
 
+/* For lc_plugins.c: the entries of a folder (absolute path, without . and .., folders first,
+ * then by name), and a whole file (NUL-terminated; NULL when it cannot be read, up to 8 MB). */
+typedef struct { char *name; int dir; long long size; } LcEnt;
+LcEnt *lc_read_dir(const char *dir, int *n);
+void   lc_ents_free(LcEnt *v, int n);
+char  *lc_slurp(const char *path, long *n);
+
 /* The skills found for this working directory, one "- name: description" line each, for the
  * system prompt; "" when there are none (the skill tool is then not offered). */
 const char *lc_skills_block(void);

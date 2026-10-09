@@ -131,8 +131,12 @@ static void system_block(Str *t, int level)
     } else {
         s_fmt(t, "You are localcode, a coding agent working in the folder %s on the user's Windows computer, "
                  "through the functions above (paths relative to that folder; run uses PowerShell).\n", lc_tools_root());
-        s_str(t, "For a task that changes code, work in this order:\n"
-                 "1. Look: list, search and read the files involved.\n"
+        s_str(t, "For a task that changes code, work in this order:\n");
+        if (*lc_skills_block())
+            s_str(t, "0. Skills: when a skill listed below covers the task, or a method the user names (TDD, a spec, a plan, "
+                     "a review, a design ...), call skill with its name before anything else, and follow it through the "
+                     "steps below.\n");
+        s_str(t, "1. Look: list, search and read the files involved.\n"
                  "2. Plan: call plan with the steps and a test_command that proves the task works (the project's "
                  "tests, a build, or running the program with a check; write a small check when there is none).\n"
                  "3. Code: the smallest correct change with edit_file; write_file only for new files or full rewrites.\n"
@@ -144,10 +148,11 @@ static void system_block(Str *t, int level)
                  "change or a command; then take another way or ask. Answer in the user's language.");
     }
     if (*lc_skills_block()) {
-        s_str(t, "\n\nSkills (instructions for kinds of tasks, written by the user):\n");
+        s_str(t, "\n\nSkills (instructions for kinds of tasks, from the plugins that are on):\n");
         s_str(t, lc_skills_block());
         s_str(t, "When a skill covers the task, call skill with its name first and follow it; where its steps differ "
-                 "from the workflow above, the skill's win.");
+                 "from the workflow above, the skill's win. When none listed fits but one might exist, skill_search "
+                 "with a few words of the task finds more.");
     }
     s_str(t, "\nWhen the user writes in Portuguese, answer in Brazilian Portuguese (pt-BR: \"arquivo\", \"rodar\", "
              "\"você\", \"me diga\"), never European Portuguese (\"ficheiro\", \"correr\", \"tu\", \"diz-me\").");

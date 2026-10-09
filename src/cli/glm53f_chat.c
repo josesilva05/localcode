@@ -28,6 +28,7 @@
 
 #include "glm53f_chat.h"
 #include "lc_tools.h"
+#include "lc_plugins.h"
 
 static double now_s(void)
 {
@@ -160,6 +161,7 @@ const Glm53fCommand glm53f_commands[] = {
     { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
     { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 2 },
     { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
+    { "/plugin",    "[on|off NAME]",   "the plugins (skills, commands, hooks, mods), or one plugin or skill (plugin:name) on or off", 2 },
     { "/auto",      "[off]",           "this folder, remembered: the agent goes from start to finish without asking anything", 1 },
     { "/reasoning", "LEVEL",           "reasoning effort of level 0 chat (set when a conversation opens)", 2 },
     { "/gen",       "N",               "tokens to generate per answer", 2 },
@@ -448,6 +450,16 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
                                            : "writes and commands ask first");
     } else if (!strncmp(line, "/approve", 8)) {
         in->note = dup_str("/approve takes ask or auto");
+    } else if (!strcmp(line, "/plugin") || !strcmp(line, "/plugins")) {
+        lc_plugins_load(lc_tools_root());
+        in->note = lc_plugins_report();
+    } else if (!strncmp(line, "/plugin on ", 11) || !strncmp(line, "/plugin off ", 12)) {
+        const int on = line[9] == 'n';
+        const char *what = line + (on ? 11 : 12);
+        lc_plugins_load(lc_tools_root());
+        in->note = lc_plugin_switch(what, on)
+                       ? fmt_str("no plugin or skill named %s%s (/plugin lists them; a skill is plugin:name)", what, "")
+                       : fmt_str("%s %s: the next conversation (/reset) sees it", what, on ? "on" : "off");
     } else if (!strcmp(line, "/save") || !strncmp(line, "/save ", 6)) {
         in->note = save(s, line[5] ? line + 6 : NULL);
     } else if (!strncmp(line, "/temp ", 6)) {
