@@ -216,14 +216,22 @@ __global__ void k_gdn_step_b(float *state, const float *qkv, int ld, const float
     float *ks = sh, *qs = sh + S, *red = sh + 2 * S;
     const int h = blockIdx.x, j = threadIdx.x, p = threadIdx.y, P = blockDim.y, kh = h % Hk;
     float *St = state + (int64_t)h * S * S;
-    const int i0 = p * (S / P), i1 = i0 + S / P;
+    const int i0 = p * (S / P), n = S / P;
+    /* this thread's column piece of the state, in registers for all N tokens (read and written once,
+     * not at every token); the arithmetic and its order are the same. S / P <= GDN_REG. */
+#define GDN_REG 32
+    if (n > GDN_REG) __trap();                  /* a larger state than any model here: refuse */
+    float sr[GDN_REG];
+#pragma unroll
+    for (int k = 0; k < GDN_REG; k++) if (k < n) sr[k] = St[(int64_t)(i0 + k) * S + j];
     for (int t = 0; t < N; t++) {
         const float *row = qkv + (int64_t)t * ld;
         if (p == 0) { qs[j] = row[kh * S + j]; ks[j] = row[Hk * S + kh * S + j]; }
         __syncthreads();
         const float eg = expf(g[t * Hv + h]);
         float sk = 0.0f;
-        for (int i = i0; i < i1; i++) sk += St[(int64_t)i * S + j] * eg * ks[i];
+#pragma unroll
+        for (int k = 0; k < GDN_REG; k++) if (k < n) sk += sr[k] * eg * ks[i0 + k];
         red[p * S + j] = sk;
         __syncthreads();
         float skt = 0.0f;
@@ -231,9 +239,12 @@ __global__ void k_gdn_step_b(float *state, const float *qkv, int ld, const float
         const float d = (row[2 * Hk * S + h * S + j] - skt) * beta[t * Hv + h];
         __syncthreads();
         float acc = 0.0f;
-        for (int i = i0; i < i1; i++) {
-            const float s2 = St[(int64_t)i * S + j] * eg + ks[i] * d;
-            St[(int64_t)i * S + j] = s2;
+#pragma unroll
+        for (int k = 0; k < GDN_REG; k++) {
+            if (k >= n) break;
+            const int i = i0 + k;
+            const float s2 = sr[k] * eg + ks[i] * d;
+            sr[k] = s2;
             if (snap && t < N - 1) snap[(int64_t)t * Hv * S * S + ((int64_t)h * S + i) * S + j] = s2;   /* after token t */
             acc += s2 * qs[i];
         }
@@ -246,6 +257,8 @@ __global__ void k_gdn_step_b(float *state, const float *qkv, int ld, const float
         }
         __syncthreads();
     }
+#pragma unroll
+    for (int k = 0; k < GDN_REG; k++) if (k < n) St[(int64_t)(i0 + k) * S + j] = sr[k];
 }
 
 /* rmsnorm + rope of head rows: block = token * rows + head; the token's position is p0 + token */

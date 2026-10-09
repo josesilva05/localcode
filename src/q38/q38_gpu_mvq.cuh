@@ -318,6 +318,113 @@ __global__ void __launch_bounds__(128) k_mvq_nc(const uint8_t *__restrict__ W, i
     }
 }
 
+/* A Q4_K/Q5_K unit's raw bytes, loaded one unit ahead of its arithmetic (the loop below): with 4
+ * columns of work between two loads, a warp kept too few reads in flight and 4 columns cost 1.6x one */
+struct Q45Raw { int4 q0, q1, h0, h1; uint32_t dm, w0, w1, w2; };
+
+template <int FIVE>
+__device__ __forceinline__ void q45_load(const uint8_t *row, int u, Q45Raw &w)
+{
+    const uint8_t *blk = row + (int64_t)(u >> 2) * (FIVE ? 176 : 144);
+    const uint32_t *hw = (const uint32_t *)(const void *)blk;
+    w.dm = hw[0]; w.w0 = hw[1]; w.w1 = hw[2]; w.w2 = hw[3];
+    const uint8_t *qs = blk + (FIVE ? 48 : 16) + 32 * (u & 3);
+    w.q0 = *(const int4 *)(const void *)qs;
+    w.q1 = *(const int4 *)(const void *)(qs + 16);
+    if (FIVE) { w.h0 = *(const int4 *)(const void *)(blk + 16); w.h1 = *(const int4 *)(const void *)(blk + 32); }
+}
+
+template <int FIVE, int NC>
+__device__ __forceinline__ void q45_math(const Q45Raw &w, int u, const int8_t *xq, const float *xd, const float *xs, int ne0,
+                                         float *acc)
+{
+    const int sb = u >> 2, j = u & 3, nb = ne0 / 32;
+    const float2 dm = __half22float2(*(const __half2 *)&w.dm);
+    int s1, m1, s2, m2;
+    {
+        const int i1 = 2 * j, i2 = 2 * j + 1;
+        if (i1 < 4) { s1 = scb(w.w0, w.w1, w.w2, i1) & 63; m1 = scb(w.w0, w.w1, w.w2, i1 + 4) & 63; }
+        else { s1 = (scb(w.w0, w.w1, w.w2, i1 + 4) & 0xF) | ((scb(w.w0, w.w1, w.w2, i1 - 4) >> 6) << 4);
+               m1 = (scb(w.w0, w.w1, w.w2, i1 + 4) >> 4) | ((scb(w.w0, w.w1, w.w2, i1) >> 6) << 4); }
+        if (i2 < 4) { s2 = scb(w.w0, w.w1, w.w2, i2) & 63; m2 = scb(w.w0, w.w1, w.w2, i2 + 4) & 63; }
+        else { s2 = (scb(w.w0, w.w1, w.w2, i2 + 4) & 0xF) | ((scb(w.w0, w.w1, w.w2, i2 - 4) >> 6) << 4);
+               m2 = (scb(w.w0, w.w1, w.w2, i2 + 4) >> 4) | ((scb(w.w0, w.w1, w.w2, i2) >> 6) << 4); }
+    }
+    const int q[8] = { w.q0.x, w.q0.y, w.q0.z, w.q0.w, w.q1.x, w.q1.y, w.q1.z, w.q1.w };
+    const int h[8] = { w.h0.x, w.h0.y, w.h0.z, w.h0.w, w.h1.x, w.h1.y, w.h1.z, w.h1.w };
+    int lo4[8], hi4[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        lo4[i] = q[i] & 0x0F0F0F0F;
+        hi4[i] = (q[i] >> 4) & 0x0F0F0F0F;
+        if (FIVE) {
+            lo4[i] |= ((h[i] >> (2 * j)) & 0x01010101) << 4;
+            hi4[i] |= ((h[i] >> (2 * j + 1)) & 0x01010101) << 4;
+        }
+    }
+    const int b0 = sb * 8 + 2 * j, b1 = b0 + 1;
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const int8_t *x = xq + (int64_t)c * ne0;
+        int xa[8], xb[8];
+        *(int4 *)&xa[0] = *(const int4 *)(x + b0 * 32); *(int4 *)&xa[4] = *(const int4 *)(x + b0 * 32 + 16);
+        *(int4 *)&xb[0] = *(const int4 *)(x + b1 * 32); *(int4 *)&xb[4] = *(const int4 *)(x + b1 * 32 + 16);
+        int lo = 0, hi = 0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) { lo = __dp4a(lo4[i], xa[i], lo); hi = __dp4a(hi4[i], xb[i], hi); }
+        const float *d = xd + c * nb, *s = xs + c * nb;
+        acc[c] += dm.x * ((float)s1 * d[b0] * (float)lo + (float)s2 * d[b1] * (float)hi) - dm.y * ((float)m1 * s[b0] + (float)m2 * s[b1]);
+    }
+}
+
+/* The same with the NC quantised vectors in shared memory, loaded once per block of 32 rows (8 warps,
+ * 4 rows each): from L1/L2 for every unit, x (4 x 64 bytes against Q5_K's 80 of weights) made 4
+ * columns cost 1.5x one. Shared: NC * ne0 bytes, then the scales and sums (NC * ne0 / 32 floats each). */
+template <int TYPE, int NC>
+__global__ void __launch_bounds__(256) k_mvq_ncs(const uint8_t *__restrict__ W, int64_t rb, int ne0, int rows,
+                                                 const int8_t *__restrict__ xq, const float *__restrict__ xd,
+                                                 const float *__restrict__ xs, float *__restrict__ y, int ldy)
+{
+    extern __shared__ __align__(16) unsigned char sx[];
+    const int nb = ne0 / 32, tid = threadIdx.y * 32 + threadIdx.x;
+    int8_t *q = (int8_t *)sx;
+    float *d = (float *)(sx + NC * ne0), *s = d + NC * nb;
+    for (int i = tid * 16; i < NC * ne0; i += 256 * 16) *(int4 *)(q + i) = *(const int4 *)(xq + i);
+    for (int i = tid; i < NC * nb; i += 256) { d[i] = xd[i]; s[i] = xs[i]; }
+    __syncthreads();
+    const int units = TYPE == Q38_Q4_K || TYPE == Q38_Q5_K ? ne0 / 64 : ne0 / 32;
+#pragma unroll 1
+    for (int k = 0; k < 4; k++) {
+        const int r = blockIdx.x * 32 + threadIdx.y * 4 + k;
+        if (r >= rows) return;
+        const uint8_t *row = W + (int64_t)r * rb;
+        float acc[NC];
+#pragma unroll
+        for (int c = 0; c < NC; c++) acc[c] = 0.0f;
+        if (TYPE == Q38_Q4_K || TYPE == Q38_Q5_K) {      /* one unit's bytes ahead of its arithmetic */
+            Q45Raw cur, nxt;
+            int u = threadIdx.x;
+            if (u < units) q45_load<TYPE == Q38_Q5_K>(row, u, cur);
+            for (; u < units; u += 32) {
+                if (u + 32 < units) q45_load<TYPE == Q38_Q5_K>(row, u + 32, nxt);
+                q45_math<TYPE == Q38_Q5_K, NC>(cur, u, q, d, s, ne0, acc);
+                cur = nxt;
+            }
+        } else {
+            for (int u = threadIdx.x; u < units; u += 32) {
+                if (TYPE == Q38_Q6_K) unit_q6k<NC>(row, u, q, d, ne0, acc);
+                else if (TYPE == Q38_IQ4_XS) unit_iq4<1, NC>(row, u, q, d, ne0, acc);
+                else unit_iq4<0, NC>(row, u, q, d, ne0, acc);
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+            const float v = warp_sum(acc[c]);
+            if (threadIdx.x == 0) y[(int64_t)c * ldy + r] = v;
+        }
+    }
+}
+
 /* NC rows of x (stride ldx) into blocks of 32: as k_q8x, the row c's blocks after row c-1's */
 __global__ void k_q8x_nc(const float *__restrict__ x, int ldx, int n, int NC, int8_t *__restrict__ q, float *__restrict__ d,
                          float *__restrict__ s)

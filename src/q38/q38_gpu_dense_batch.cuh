@@ -60,17 +60,67 @@ __global__ void k_rows_h(const float *__restrict__ X, int ldx, int ne0, int N, _
     }
 }
 
+/* repacked Q8_0 times NC float vectors (rows ldx apart): a warp per row, each 16 quants and their
+ * scale read once for all the vectors (a vector at a time, the Q8_0 matrices cost 4x in a verification) */
+template <int NC>
+__global__ void k_mv_q8r_nc(const int8_t *__restrict__ Q, const float *__restrict__ D, int ne0, int rows,
+                            const float *__restrict__ X, int ldx, float *__restrict__ Y, int ldy)
+{
+    const int r = blockIdx.x * 8 + threadIdx.y;
+    if (r >= rows) return;
+    const int nb = ne0 / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; c++) acc[c] = 0.0f;
+    for (int i = threadIdx.x * 16; i < ne0; i += 32 * 16) {
+        const int4 v = __ldg((const int4 *)(Q + (int64_t)r * ne0 + i));
+        const int8_t *b = (const int8_t *)&v;
+        const float sc = __ldg(D + (int64_t)r * nb + i / 32);
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+            const float *x = X + (int64_t)c * ldx + i;
+            const float4 x0 = __ldg((const float4 *)x), x1 = __ldg((const float4 *)(x + 4));
+            const float4 x2 = __ldg((const float4 *)(x + 8)), x3 = __ldg((const float4 *)(x + 12));
+            float t = b[0] * x0.x + b[1] * x0.y + b[2] * x0.z + b[3] * x0.w;
+            t += b[4] * x1.x + b[5] * x1.y + b[6] * x1.z + b[7] * x1.w;
+            t += b[8] * x2.x + b[9] * x2.y + b[10] * x2.z + b[11] * x2.w;
+            t += b[12] * x3.x + b[13] * x3.y + b[14] * x3.z + b[15] * x3.w;
+            acc[c] += sc * t;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const float s = warp_sum(acc[c]);
+        if (threadIdx.x == 0) Y[(int64_t)c * ldy + r] = s;
+    }
+}
+
 /* Y [N][rows] for N <= 4 tokens (a verification): the 8-bit products, weights read once for all;
  * other types a vector at a time */
 static int mvn(const DMat *w, const float *X, int ldx, float *Y, int ldy, int N, cudaStream_t st)
 {
+    if (w->type == Q38_Q8R && N > 1 && w->ne0 % 512 == 0 && ldx % 4 == 0) {
+        const dim3 b8(32, 8);
+        const int g8 = (int)((w->rows + 7) / 8);
+        const int8_t *Q = (const int8_t *)w->d;
+        if (N == 2) k_mv_q8r_nc<2><<<g8, b8, 0, st>>>(Q, w->scale, (int)w->ne0, (int)w->rows, X, ldx, Y, ldy);
+        else if (N == 3) k_mv_q8r_nc<3><<<g8, b8, 0, st>>>(Q, w->scale, (int)w->ne0, (int)w->rows, X, ldx, Y, ldy);
+        else k_mv_q8r_nc<4><<<g8, b8, 0, st>>>(Q, w->scale, (int)w->ne0, (int)w->rows, X, ldx, Y, ldy);
+        return 0;
+    }
     if (mvq_ok(w->type) && G->q8x && w->ne0 % 256 == 0 && w->ne0 <= 32768) {
         const int nb = (int)(w->ne0 / 32);
         k_q8x_nc<<<(nb * N + 3) / 4, 128, 0, st>>>(X, ldx, (int)w->ne0, N, G->q8x, G->q8d, G->q8s);
-        const dim3 b4(32, 4);
-        const int g4 = (int)((w->rows + 3) / 4);
+        const dim3 b4(32, 4), b8(32, 8);
+        const int g4 = (int)((w->rows + 3) / 4), g32 = (int)((w->rows + 31) / 32);
         const uint8_t *W = (const uint8_t *)w->d;
-#define MVN_CASE(T, NC) k_mvq_nc<T, NC><<<g4, b4, 0, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, Y, ldy)
+        /* x in shared memory (up to the 99 KB mvq_setup allows; Q38_MVN_SH=0: never) */
+        static int shx = -1;
+        if (shx < 0) shx = !(getenv("Q38_MVN_SH") && !atoi(getenv("Q38_MVN_SH")));
+        const size_t smem = (size_t)N * w->ne0 + (size_t)2 * N * (w->ne0 / 32) * sizeof(float);
+        const int sh = shx && N > 1 && smem <= 99 * 1024;
+#define MVN_CASE(T, NC) do { if (sh) k_mvq_ncs<T, NC><<<g32, b8, smem, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, Y, ldy); \
+                             else k_mvq_nc<T, NC><<<g4, b4, 0, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, Y, ldy); } while (0)
 #define MVN_TYPE(T) switch (N) { case 1: MVN_CASE(T, 1); break; case 2: MVN_CASE(T, 2); break; \
                                  case 3: MVN_CASE(T, 3); break; default: MVN_CASE(T, 4); break; }
         switch (w->type) {

@@ -67,7 +67,7 @@ static int dense_part(q38_model *m, int dev, int l0, int l1, int last, int kvb, 
     g->beta = dalloc(256, g); g->g = dalloc(256, g);
     g->qf = dalloc((size_t)c->n_head * c->head_dim * 2, g); g->aout = dalloc((size_t)c->n_head * c->head_dim, g);
     g->knew = dalloc((size_t)c->n_head_kv * c->head_dim, g); g->vnew = dalloc((size_t)c->n_head_kv * c->head_dim, g);
-    g->fa_part = dalloc((size_t)(FA_SEG_MMA > FA_SEG ? FA_SEG_MMA : FA_SEG) * c->n_head * (c->head_dim + 2), g);
+    g->fa_part = dalloc((size_t)4 * (FA_SEG_MMA > FA_SEG ? FA_SEG_MMA : FA_SEG) * c->n_head * (c->head_dim + 2), g);   /* 4: a verification's tokens */
     fa_setup(c->head_dim);
     g->sh_gu = dalloc((size_t)2 * F, g); g->sh_h = dalloc(F, g);
     CK(cudaMalloc(&g->q8x, 4 * 32768));           /* x in 8 bits: up to 4 rows (verification) of 32768 */

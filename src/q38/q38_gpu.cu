@@ -1033,12 +1033,12 @@ __global__ void __launch_bounds__(32) k_fattn_dec_mma(const float *qf, const KT 
     __half *Qs = (__half *)smb, *Ks = Qs + 16 * (DT + FM_KP), *Vt = Ks + 16 * (DT + FM_KP);
     const int G = H / Hkv, kvh = blockIdx.x, seg = blockIdx.y, S = gridDim.y;
     const int lane = threadIdx.x, g = lane >> 2, tq = lane & 3;
-    const int T = *ppos + toff + 1;                          /* toff: token toff of a few (verification) */
+    const int tt = toff + blockIdx.z, T = *ppos + tt + 1;     /* token tt of a few (a verification): blockIdx.z */
     const int L = ((T + S - 1) / S + 15) & ~15, k0 = seg * L, k1 = T < k0 + L ? T : k0 + L;
     const float scale = rsqrtf((float)DT);
     for (int e = lane; e < 16 * DT; e += 32) {
         const int r = e / DT, i = e % DT;
-        Qs[r * (DT + FM_KP) + i] = __float2half(r < G ? qf[(int64_t)(kvh * G + r) * 2 * DT + i] * scale : 0.0f);
+        Qs[r * (DT + FM_KP) + i] = __float2half(r < G ? qf[(int64_t)tt * H * 2 * DT + (int64_t)(kvh * G + r) * 2 * DT + i] * scale : 0.0f);
     }
     float o[DT / 8][4];
 #pragma unroll
@@ -1105,7 +1105,7 @@ __global__ void __launch_bounds__(32) k_fattn_dec_mma(const float *qf, const KT 
     for (int half = 0; half < 2; half++) {
         const int r = g + 8 * half;
         if (r >= G) continue;
-        float *pp = part + ((int64_t)seg * H + kvh * G + r) * (DT + 2);
+        float *pp = part + (((int64_t)seg * gridDim.z + blockIdx.z) * H + kvh * G + r) * (DT + 2);
 #pragma unroll
         for (int j = 0; j < DT / 8; j++) {
             pp[8 * j + 2 * tq] = o[j][2 * half];
@@ -2048,8 +2048,19 @@ static int fa_ok(int H, int Hkv, int D, const int *sel)
 }
 
 /* once per process and device: the flash kernels' shared memory is above the default 48 KB */
+/* the shared-x verification products: up to 99 KB (ffn_down's 4 x 17408 bytes of x) */
+static void mvq_setup(void)
+{
+#define MVQ_ATTR(T) do { cudaFuncSetAttribute(k_mvq_ncs<T, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024); \
+                         cudaFuncSetAttribute(k_mvq_ncs<T, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024); \
+                         cudaFuncSetAttribute(k_mvq_ncs<T, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024); } while (0)
+    MVQ_ATTR(Q38_Q4_K); MVQ_ATTR(Q38_Q5_K); MVQ_ATTR(Q38_Q6_K); MVQ_ATTR(Q38_IQ4_XS); MVQ_ATTR(Q38_IQ4_NL);
+#undef MVQ_ATTR
+}
+
 static void fa_setup(int D)
 {
+    mvq_setup();
     cudaFuncSetAttribute(k_fattn<float, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fa_smem(1, D));
     cudaFuncSetAttribute(k_fattn<float, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fa_smem(4, D));
     cudaFuncSetAttribute(k_fattn<__half, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fa_smem(1, D));
@@ -2082,12 +2093,9 @@ static void attn_t(Gpu *g, int il, const float *qf, float *out, int H, int Hkv, 
         /* one token (or a few: a verification) on mma.sync: FA_SEG_MMA one-warp blocks per K/V head,
          * then the merge; a few tokens one launch each, at their positions */
         const size_t sm = (size_t)(32 * (D + FM_KP) + D * FM_VS) * 2;
-        for (int t = 0; t < N; t++) {
-            const float *q = qf + (int64_t)t * H * 2 * D;
-            if (D == 256) k_fattn_dec_mma<KT, 256><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(q, kc, vc, g->fa_part, g->d_pos, H, Hkv, NULL, NULL, t);
-            else k_fattn_dec_mma<KT, 128><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(q, kc, vc, g->fa_part, g->d_pos, H, Hkv, NULL, NULL, t);
-            k_fattn_merge<<<dim3(H, 1), 256, 0, st>>>(g->fa_part, q, out + (int64_t)t * H * D, H, D, 1, FA_SEG_MMA);
-        }
+        if (D == 256) k_fattn_dec_mma<KT, 256><<<dim3(Hkv, FA_SEG_MMA, N), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv);
+        else k_fattn_dec_mma<KT, 128><<<dim3(Hkv, FA_SEG_MMA, N), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv);
+        k_fattn_merge<<<dim3(H, N), 256, 0, st>>>(g->fa_part, qf, out, H, D, N, FA_SEG_MMA);
     } else if (N == 1) {
         /* one token: QT = 1, every segment its own block, then the merge */
         k_fattn<KT, 1><<<dim3(Hkv, 1, FA_SEG), 256, fa_smem(1, D), st>>>(qf, kc, vc, out, g->fa_part, g->d_pos, H, Hkv, D, 1);
@@ -2114,12 +2122,9 @@ static void attn_q8(Gpu *g, int il, const float *qf, float *out, int H, int Hkv,
     const float *ks = g->ksc[il], *vs = g->vsc[il];
     if (N <= 4) {                                /* one token, or a few one launch each */
         const size_t sm = (size_t)(32 * (D + FM_KP) + D * FM_VS) * 2;
-        for (int t = 0; t < N; t++) {
-            const float *q = qf + (int64_t)t * H * 2 * D;
-            if (D == 256) k_fattn_dec_mma<int8_t, 256><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(q, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs, t);
-            else k_fattn_dec_mma<int8_t, 128><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(q, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs, t);
-            k_fattn_merge<<<dim3(H, 1), 256, 0, st>>>(g->fa_part, q, out + (int64_t)t * H * D, H, D, 1, FA_SEG_MMA);
-        }
+        if (D == 256) k_fattn_dec_mma<int8_t, 256><<<dim3(Hkv, FA_SEG_MMA, N), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs);
+        else k_fattn_dec_mma<int8_t, 128><<<dim3(Hkv, FA_SEG_MMA, N), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs);
+        k_fattn_merge<<<dim3(H, N), 256, 0, st>>>(g->fa_part, qf, out, H, D, N, FA_SEG_MMA);
     } else {
         const dim3 grid(Hkv, (N + 128 / (H / Hkv) - 1) / (128 / (H / Hkv)));
         if (D == 256) k_fattn_mma<int8_t, 256><<<grid, 256, fa_mma_smem(256), st>>>(qf, kc, vc, out, g->d_pos, H, Hkv, N, ks, vs);
@@ -2651,7 +2656,7 @@ extern "C" int q38_gpu_open(void *model, int device)
     g->qkv = dalloc(ch, g); g->z = dalloc((size_t)c->n_vh * S, g); g->o = dalloc((size_t)c->n_vh * S, g);
     g->beta = dalloc(256, g); g->g = dalloc(256, g);
     g->qf = dalloc((size_t)c->n_head * c->head_dim * 2, g); g->aout = dalloc((size_t)c->n_head * c->head_dim, g);
-    g->fa_part = dalloc((size_t)(FA_SEG_MMA > FA_SEG ? FA_SEG_MMA : FA_SEG) * c->n_head * (c->head_dim + 2), g);
+    g->fa_part = dalloc((size_t)4 * (FA_SEG_MMA > FA_SEG ? FA_SEG_MMA : FA_SEG) * c->n_head * (c->head_dim + 2), g);
     fa_setup(c->head_dim);
     g->router = dalloc(c->n_exp, g); g->sh_gu = dalloc(2 * c->ff_shexp, g); g->sh_h = dalloc(c->ff_shexp, g);
     g->sh_dn = dalloc(E, g); g->sg = dalloc(1, g); g->logits = dalloc(c->n_vocab, g);
