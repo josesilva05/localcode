@@ -588,10 +588,13 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     memset(&c0, 0, sizeof c0);
     if (e->counters) e->counters(e, &c0);
     const double td = now_s();
+    int pend[GLM53F_SPEC_MAX], npend = 0, ipend = 0;   /* guesses already fed (forward_spec) */
     for (int step = 0; step < s->gen; step++) {
         if (g_stop) { interrupted = 1; break; }
+        const int fed = ipend < npend;
         int best = 0;
-        for (int i = 1; i < e->n_vocab; i++) if (s->logits[i] > s->logits[best]) best = i;
+        if (fed) best = pend[ipend++];
+        else for (int i = 1; i < e->n_vocab; i++) if (s->logits[i] > s->logits[best]) best = i;
         if (e->is_eos(e, best)) { stopped = 1; break; }
         s->out[nout++] = best;
         const int len = e->decode(e, s->out, nout, s->text, s->text_cap - 1);
@@ -618,7 +621,13 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
             k->answer(k, s->text + printed, ok - printed);
             printed = ok;
         }
-        if (step + 1 < s->gen && e->forward(e, &best, 1, s->logits) != 0) {
+        if (fed || step + 1 >= s->gen) continue;
+        int frc = 0;
+        if (e->forward_spec && s->gen - step > GLM53F_SPEC_MAX + 1) {
+            frc = e->forward_spec(e, best, pend, s->logits);
+            if (frc >= 0) { npend = frc; ipend = 0; }
+        } else frc = e->forward(e, &best, 1, s->logits);
+        if (frc < 0) {
             k->status(k, NULL, 0.0);
             k->done(k, "the engine failed while writing the answer", 2);
             return -1;

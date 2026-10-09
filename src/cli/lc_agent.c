@@ -512,9 +512,13 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
          * reasoning that loops runs until the context is full (20 minutes on the 27B) */
         const int think_cap = s->gen > 4096 ? s->gen : 4096;
         const double td = now_s();
+        /* speculative decoding (forward_spec): the guesses the model agreed with are already fed;
+         * they come out of pend one a step, as if generated, before the logits choose again */
+        int pend[GLM53F_SPEC_MAX], npend = 0, ipend = 0;
         for (int step = 0; step < gen; step++) {
             if (*stop) { interrupted = 1; break; }
-            if (in_think && !closed && nout >= think_cap && nout + 16 < s->ids_cap) {
+            const int fed = ipend < npend;            /* this step's token is a guess already fed */
+            if (!fed && in_think && !closed && nout >= think_cap && nout + 16 < s->ids_cap) {
                 int ids[16];
                 const int k2 = e->encode(e, "\n</think>\n\n", 11, ids, 16);
                 if (k2 > 0 && nout + k2 < GLM53F_CHAT_MAX_GEN) {
@@ -526,7 +530,8 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                 }
             }
             int best = 0;
-            for (int i = 1; i < e->n_vocab; i++) if (s->logits[i] > s->logits[best]) best = i;
+            if (fed) best = pend[ipend++];
+            else for (int i = 1; i < e->n_vocab; i++) if (s->logits[i] > s->logits[best]) best = i;
             if (e->is_eos(e, best)) { eos = 1; break; }
             s->out[nout++] = best;
             const int len = e->decode(e, s->out, nout, s->text, s->text_cap - 1);
@@ -558,7 +563,13 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                 if (upto > printed) { k->answer(k, s->text + printed, upto - printed); printed = upto; }
                 if (tc) { snprintf(line, sizeof line, "Writing a tool call · %d tokens", nout); k->status(k, line, td); }
             }
-            if (step + 1 < gen && e->forward(e, &best, 1, s->logits) != 0) { fatal = 1; break; }
+            if (fed || step + 1 >= gen) continue;
+            if (e->forward_spec && gen - step > GLM53F_SPEC_MAX + 1 && !(in_think && !closed && nout + GLM53F_SPEC_MAX >= think_cap)) {
+                const int k2 = e->forward_spec(e, best, pend, s->logits);
+                if (k2 < 0) { fatal = 1; break; }
+                npend = k2;
+                ipend = 0;
+            } else if (e->forward(e, &best, 1, s->logits) != 0) { fatal = 1; break; }
         }
         k->status(k, NULL, 0.0);
         dec_tok += nout;

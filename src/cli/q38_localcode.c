@@ -80,6 +80,20 @@ static int qw_forward(Glm53fEngine *e, const int *ids, int n, float *logits)
     return 0;
 }
 
+/* the MTP block's guesses (q38_model_forward_spec): tok and the right guesses in one pass */
+static int qw_forward_spec(Glm53fEngine *e, int tok, int *extra, float *logits)
+{
+    QwenEngine *q = (QwenEngine *)e->impl;
+    const double t0 = now_s();
+    const int k = q38_model_forward_spec(q->m, tok, q->eos, q->n_eos, extra);
+    e->cached = q->m->n_past;
+    if (k < 0) return -1;
+    g_dec.n += 1 + k;
+    g_dec.all += now_s() - t0;
+    memcpy(logits, q->m->logits, (size_t)q->m->c.n_vocab * sizeof(float));
+    return k;
+}
+
 static void qw_reset(Glm53fEngine *e)
 {
     QwenEngine *q = (QwenEngine *)e->impl;
@@ -575,6 +589,8 @@ int main(int argc, char **argv)
     e.cap = m.max_ctx;
     e.impl = &q;
     e.forward = qw_forward;
+    /* speculative decoding when the model has an MTP block on the GPU (LOCALCODE_SPEC=0: off) */
+    if (m.mtp && on_gpu >= 0 && !(getenv("LOCALCODE_SPEC") && !atoi(getenv("LOCALCODE_SPEC")))) e.forward_spec = qw_forward_spec;
     e.reset = qw_reset;
     e.encode = qw_encode;
     e.decode = qw_decode;

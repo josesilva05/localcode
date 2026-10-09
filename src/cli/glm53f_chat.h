@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define GLM53F_SPEC_MAX 3             /* forward_spec's extra tokens at most */
 #define GLM53F_CHAT_MAX_GEN 32768     /* an agent answer: a whole file in one tool call */
 
 /* Expert-cache counters (they only grow in a session); zero when the engine has none. */
@@ -34,6 +35,10 @@ typedef struct Glm53fEngine {
 
     /* Feed n tokens; logits of the last one. Returns 0, or -1 on failure. */
     int  (*forward)(struct Glm53fEngine *e, const int *ids, int n, float *logits);
+    /* Optional, speculative decoding: feeds tok (the token the logits chose) and the guesses after
+     * it the model agrees with, up to GLM53F_SPEC_MAX of them, into extra; logits those after the
+     * last one. Returns how many extra tokens were fed (never an end-of-turn one), -1 on failure. */
+    int  (*forward_spec)(struct Glm53fEngine *e, int tok, int *extra, float *logits);
     void (*reset)(struct Glm53fEngine *e);
     int  (*encode)(struct Glm53fEngine *e, const char *text, int len, int *out, int max);
     int  (*decode)(struct Glm53fEngine *e, const int *ids, int n, char *out, int max);
