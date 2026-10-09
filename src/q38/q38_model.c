@@ -1744,7 +1744,8 @@ int q38_model_open(q38_model *m, const char *path, int max_ctx)
     }
     /* default: 128k for the plain models (their K/V is small: 10 attention layers of 2 heads,
      * half precision on the device above 32k); 8k for Flash-Next, whose VRAM goes to expert slots */
-    if (max_ctx <= 0) max_ctx = c->dense ? 32768 : c->plain ? 131072 : 8192;   /* dense: its weights fill the VRAM */
+    /* dense: 64k (int8 K/V beside the weights; the GPU open shrinks it if it does not fit) */
+    if (max_ctx <= 0) max_ctx = c->dense ? 65536 : c->plain ? 131072 : 8192;
     if (c->idx_top_k <= 0 && max_ctx > c->max_dense_ctx) max_ctx = c->max_dense_ctx;
     if (max_ctx > c->ctx_train) max_ctx = c->ctx_train;
     m->max_ctx = max_ctx;

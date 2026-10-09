@@ -20,17 +20,18 @@ static int64_t dense_layer_bytes(const q38_model *m, int il)
     return b;
 }
 
-/* K/V (attention layers) or recurrent state of a layer on the device */
-static int64_t dense_state_bytes(const q38_model *m, int il, int kv_half)
+/* K/V (attention layers; kvb bytes an element, int8 with a float scale per row) or recurrent state of
+ * a layer on the device */
+static int64_t dense_state_bytes(const q38_model *m, int il, int kvb)
 {
     const q38_cfg *c = &m->c;
     const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
     if (m->L[il].recurrent) return ((int64_t)(c->conv_k - 1) * ch + (int64_t)c->n_vh * S * S) * 4;
-    return 2 * (int64_t)m->max_ctx * c->n_head_kv * c->head_dim * (kv_half ? 2 : 4);
+    return 2 * (int64_t)m->max_ctx * c->n_head_kv * ((int64_t)c->head_dim * kvb + (kvb == 1 ? c->head_dim / 32 * 4 : 0));
 }
 
 /* one device's part: layers [l0, l1), the head when last */
-static int dense_part(q38_model *m, int dev, int l0, int l1, int last, int kv_half, Gpu **out)
+static int dense_part(q38_model *m, int dev, int l0, int l1, int last, int kvb, Gpu **out)
 {
     const q38_cfg *c = &m->c;
     CK(cudaSetDevice(dev));
@@ -39,7 +40,9 @@ static int dense_part(q38_model *m, int dev, int l0, int l1, int last, int kv_ha
     *out = g;
     G = g;
     g->dev = dev;
-    g->kv_half = kv_half;
+    g->kv_half = kvb == 2;
+    g->kv_q8 = kvb == 1;
+    g->kvh_n = c->n_head_kv;
     CK(cudaStreamCreateWithFlags(&g->st, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&g->ev, cudaEventDisableTiming | cudaEventBlockingSync));
     for (int il = l0; il < l1; il++) {
@@ -68,10 +71,17 @@ static int dense_part(q38_model *m, int dev, int l0, int l1, int last, int kv_ha
             g->ssm[il] = dalloc((size_t)c->n_vh * S * S, g);
             if (!g->conv[il] || !g->ssm[il]) { fprintf(stderr, "q38_gpu: out of device memory (state)\n"); return -1; }
         } else {
-            const size_t kv_f = ((size_t)m->max_ctx * c->n_head_kv * c->head_dim * (kv_half ? 2 : 4) + 3) / 4;
+            const size_t kv_f = ((size_t)m->max_ctx * c->n_head_kv * c->head_dim * kvb + 3) / 4;
             g->kc[il] = dalloc(kv_f, g);
             g->vc[il] = dalloc(kv_f, g);
-            if (!g->kc[il] || !g->vc[il]) { fprintf(stderr, "q38_gpu: out of device memory (K/V)\n"); return -1; }
+            if (kvb == 1) {
+                g->ksc[il] = dalloc((size_t)m->max_ctx * c->n_head_kv * (c->head_dim / 32), g);
+                g->vsc[il] = dalloc((size_t)m->max_ctx * c->n_head_kv * (c->head_dim / 32), g);
+            }
+            if (!g->kc[il] || !g->vc[il] || (kvb == 1 && (!g->ksc[il] || !g->vsc[il]))) {
+                fprintf(stderr, "q38_gpu: out of device memory (K/V)\n");
+                return -1;
+            }
         }
     }
     if (!g->sh_h || !g->logits || !g->fa_part) { fprintf(stderr, "q38_gpu: out of device memory\n"); return -1; }
@@ -95,8 +105,12 @@ static int dense_open(q38_model *m, int device)
     cudaGetDeviceCount(&n_dev);
     /* the trunk's products with 8-bit activations (llama.cpp's mmvq); Q38_ACT8=0: float, exact */
     g_mvq = !(getenv("Q38_ACT8") && !atoi(getenv("Q38_ACT8")));
+    /* K/V: Q38_KV=8|16|32; by default int8 above 32k positions (llama.cpp's -ctk q8_0: 64k of the 27B
+     * fit beside its weights), fp16 below. int8 goes through the mma kernels only. */
     const char *ek = getenv("Q38_KV");
-    const int kv_half = ek ? atoi(ek) == 16 : 1;            /* fp16 K/V by default: VRAM is tight */
+    int kvb = ek ? (atoi(ek) == 8 ? 1 : atoi(ek) == 16 ? 2 : 4) : m->max_ctx > 32768 ? 1 : 2;
+    if (kvb == 1 && !((c->head_dim == 256 || c->head_dim == 128) && c->n_head % c->n_head_kv == 0 &&
+                      c->n_head / c->n_head_kv <= 16)) kvb = 2;
     int devs[2] = { device, -1 }, nd = 1;
     if (n_dev >= 2 && !(getenv("Q38_ONE_GPU") && atoi(getenv("Q38_ONE_GPU")))) devs[nd++] = device == 0 ? 1 : 0;
     int64_t room[2] = { 0, 0 };
@@ -108,21 +122,29 @@ static int dense_open(q38_model *m, int device)
     }
     const int L = c->n_layer;
     int64_t lay[Q38_MAX_LAYERS], all = 0;
-    for (int il = 0; il < L; il++) { lay[il] = dense_layer_bytes(m, il) + dense_state_bytes(m, il, kv_half); all += lay[il]; }
     const int64_t head = m->output.row_bytes * m->output.rows + (int64_t)c->n_vocab * 4 + (int64_t)c->n_embd * 4;
     int split = -1;
-    if (all + head <= room[0]) split = L;                   /* all on the first device */
-    else if (nd == 2) {
-        int64_t best = INT64_MAX, a = 0;
-        for (int k = 0; k <= L; k++) {
-            if (k) a += lay[k - 1];
-            const int64_t b = all - a + head;
-            if (a <= room[0] && b <= room[1]) {
-                const int64_t d = a > b ? a - b : b - a;
-                if (d < best) { best = d; split = k; }
+    const int asked = m->max_ctx;
+    for (;;) {                                              /* the context shrinks until it fits */
+        all = 0;
+        for (int il = 0; il < L; il++) { lay[il] = dense_layer_bytes(m, il) + dense_state_bytes(m, il, kvb); all += lay[il]; }
+        if (all + head <= room[0]) split = L;               /* all on the first device */
+        else if (nd == 2) {
+            int64_t best = INT64_MAX, a = 0;
+            for (int k = 0; k <= L; k++) {
+                if (k) a += lay[k - 1];
+                const int64_t b = all - a + head;
+                if (a <= room[0] && b <= room[1]) {
+                    const int64_t d = a > b ? a - b : b - a;
+                    if (d < best) { best = d; split = k; }
+                }
             }
         }
+        if (split >= 0 || m->max_ctx <= 8192) break;
+        m->max_ctx = m->max_ctx * 3 / 4 / 1024 * 1024;
     }
+    if (split >= 0 && m->max_ctx < asked)
+        fprintf(stderr, "q38_gpu: context %d -> %d positions, to fit the devices\n", asked, m->max_ctx);
     if (split < 0) {
         fprintf(stderr, "q38_gpu: the model (%.2f GB with its K/V) does not fit the devices (%.2f + %.2f GB free); "
                         "a smaller context (--ctx) or the CPU\n", (all + head) / 1e9, room[0] / 1e9, nd > 1 ? room[1] / 1e9 : 0.0);
@@ -130,8 +152,8 @@ static int dense_open(q38_model *m, int device)
     }
     GD_n = split < L ? 2 : 1;
     GD_split = split;
-    if (dense_part(m, devs[0], 0, split, GD_n == 1, kv_half, &GD[0])) return -1;
-    if (GD_n == 2 && dense_part(m, devs[1], split, L, 1, kv_half, &GD[1])) return -1;
+    if (dense_part(m, devs[0], 0, split, GD_n == 1, kvb, &GD[0])) return -1;
+    if (GD_n == 2 && dense_part(m, devs[1], split, L, 1, kvb, &GD[1])) return -1;
     G = GD[0];
     m->gpu = GD[0];
     /* the host keeps the embedding table only (looked up per token) */
@@ -154,7 +176,8 @@ static int dense_open(q38_model *m, int device)
     cudaGetDeviceProperties(&p, devs[0]);
     fprintf(stderr, "q38: dense trunk on GPU %d (%s): layers 0-%d, %.2f GB", devs[0], p.name, split - 1, GD[0]->bytes / 1e9);
     if (GD_n == 2) fprintf(stderr, "; GPU %d: layers %d-%d and the head, %.2f GB", devs[1], split, L - 1, GD[1]->bytes / 1e9);
-    fprintf(stderr, " (K/V %s, %.2f GB of RAM freed)\n", kv_half ? "fp16" : "fp32", freed / 1e9);
+    fprintf(stderr, " (context %d, K/V %s, %.2f GB of RAM freed)\n", m->max_ctx, kvb == 1 ? "int8" : kvb == 2 ? "fp16" : "fp32",
+            freed / 1e9);
     return 0;
 }
 

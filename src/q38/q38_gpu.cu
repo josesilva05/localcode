@@ -77,8 +77,9 @@ typedef struct {
     float    *router, *sh_gu, *sh_h, *sh_dn, *sg, *logits;
     /* state */
     float    *conv[Q38_MAX_LAYERS], *ssm[Q38_MAX_LAYERS];
-    void     *kc[Q38_MAX_LAYERS], *vc[Q38_MAX_LAYERS];   /* float, or __half when kv_half */
-    int       kv_half;
+    void     *kc[Q38_MAX_LAYERS], *vc[Q38_MAX_LAYERS];   /* float, __half when kv_half, int8 when kv_q8 */
+    int       kv_half, kv_q8, kvh_n;      /* kvh_n: K/V heads (the int8 store's rows) */
+    float    *ksc[Q38_MAX_LAYERS], *vsc[Q38_MAX_LAYERS];  /* kv_q8: a scale per 32 values (llama.cpp's q8_0) */
     /* pinned host buffers */
     float    *h_x, *h_router, *h_y, *h_res, *h_tap;
     int64_t   bytes;
@@ -833,8 +834,8 @@ __device__ __forceinline__ uint32_t ld_u32(const __half *p) { return *(const uin
 /* 16 cells of K (rows of DT) and V (transposed: Vt[d][cell]) into shared fp16 */
 #define FM_KP 8                     /* row padding (halves): no bank conflicts on the fragment loads */
 #define FM_VS 24                    /* Vt row stride: 16 cells + 8 */
-__device__ __forceinline__ void kv_tile16(const __half *kc, const __half *vc, int kb, int nk, int Hkv, int kvh, int DT,
-                                          __half *Ks, __half *Vt)
+__device__ __forceinline__ void kv_tile16(const __half *kc, const __half *vc, const float *, const float *, int kb, int nk,
+                                          int Hkv, int kvh, int DT, __half *Ks, __half *Vt)
 {
     for (int e = threadIdx.x; e < 16 * (DT / 8); e += blockDim.x) {
         const int c = e / (DT / 8), i = (e % (DT / 8)) * 8;
@@ -851,8 +852,8 @@ __device__ __forceinline__ void kv_tile16(const __half *kc, const __half *vc, in
     }
 }
 
-__device__ __forceinline__ void kv_tile16(const float *kc, const float *vc, int kb, int nk, int Hkv, int kvh, int DT,
-                                          __half *Ks, __half *Vt)
+__device__ __forceinline__ void kv_tile16(const float *kc, const float *vc, const float *, const float *, int kb, int nk,
+                                          int Hkv, int kvh, int DT, __half *Ks, __half *Vt)
 {
     for (int e = threadIdx.x; e < 16 * (DT / 8); e += blockDim.x) {
         const int c = e / (DT / 8), i = (e % (DT / 8)) * 8;
@@ -870,6 +871,48 @@ __device__ __forceinline__ void kv_tile16(const float *kc, const float *vc, int 
     }
 }
 
+/* int8 K/V (kv_q8): 8 values a load, times their row's scale */
+__device__ __forceinline__ void kv_tile16(const int8_t *kc, const int8_t *vc, const float *ks, const float *vs, int kb,
+                                          int nk, int Hkv, int kvh, int DT, __half *Ks, __half *Vt)
+{
+    for (int e = threadIdx.x; e < 16 * (DT / 8); e += blockDim.x) {
+        const int c = e / (DT / 8), i = (e % (DT / 8)) * 8;
+        uint2 kq = make_uint2(0, 0), vq = kq;
+        float sk = 0.0f, sv = 0.0f;
+        if (c < nk) {
+            const int64_t row = (int64_t)(kb + c) * Hkv + kvh, o = row * DT + i, b = row * (DT / 32) + i / 32;
+            kq = *(const uint2 *)(const void *)(kc + o);
+            vq = *(const uint2 *)(const void *)(vc + o);
+            sk = ks[b];
+            sv = vs[b];
+        }
+        const int8_t *k8 = (const int8_t *)&kq, *v8 = (const int8_t *)&vq;
+        __half kh[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            kh[j] = __float2half((float)k8[j] * sk);
+            Vt[(i + j) * FM_VS + c] = __float2half((float)v8[j] * sv);
+        }
+        *(uint4 *)(void *)(Ks + c * (DT + FM_KP) + i) = *(const uint4 *)kh;
+    }
+}
+
+/* the K/V of N tokens as int8 rows of D (blockDim = D), a scale per 32 values (amax / 127; each
+ * warp one block): one per row was 9.5e-3 from float64 on the 27B (outliers in the keys) */
+__global__ void k_kv_store_q8(const float *k, const float *v, int8_t *kc, int8_t *vc, float *ks, float *vs, const int *ppos,
+                              int Hkv, int D)
+{
+    const int row = blockIdx.x, t = row / Hkv, h = row % Hkv, i = threadIdx.x;
+    const int64_t dst = (int64_t)(*ppos + t) * Hkv + h;
+    for (int w = 0; w < 2; w++) {
+        const float x = (w ? v : k)[(int64_t)row * D + i];
+        float m = fabsf(x);
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        (w ? vc : kc)[dst * D + i] = (int8_t)__float2int_rn(m > 0.0f ? x * (127.0f / m) : 0.0f);
+        if ((i & 31) == 0) (w ? vs : ks)[dst * (D / 32) + (i >> 5)] = m / 127.0f;
+    }
+}
+
 /* Flash attention of a prompt batch, FlashAttention-2 style on mma.sync: block (kv head, QT tokens)
  * = 128 query rows (QT tokens x the G heads of that K/V head), 8 warps of 16 rows; each warp keeps
  * its rows' output (16 x DT, fp32) in registers, the scores of a 16-cell tile too: their
@@ -877,7 +920,7 @@ __device__ __forceinline__ void kv_tile16(const float *kc, const float *vc, int 
  * 16 tokens (the WMMA kernel: per 4, with O through shared memory). */
 template <typename KT, int DT>
 __global__ void __launch_bounds__(256) k_fattn_mma(const float *qf, const KT *kc, const KT *vc, float *out, const int *ppos,
-                                                   int H, int Hkv, int N)
+                                                   int H, int Hkv, int N, const float *ks = NULL, const float *vs = NULL)
 {
     extern __shared__ __align__(16) unsigned char smb[];
     __half *Qs = (__half *)smb, *Ks = Qs + 128 * (DT + FM_KP), *Vt = Ks + 16 * (DT + FM_KP);
@@ -902,7 +945,7 @@ __global__ void __launch_bounds__(256) k_fattn_mma(const float *qf, const KT *kc
     for (int kb = 0; kb < Tb; kb += 16) {
         const int nk = Tb - kb < 16 ? Tb - kb : 16;
         __syncthreads();                                     /* Q stored / the last tile used */
-        kv_tile16(kc, vc, kb, nk, Hkv, kvh, DT, Ks, Vt);
+        kv_tile16(kc, vc, ks, vs, kb, nk, Hkv, kvh, DT, Ks, Vt);
         __syncthreads();
         float s[2][4] = { { 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 #pragma unroll 4
@@ -979,7 +1022,8 @@ __global__ void __launch_bounds__(256) k_fattn_mma(const float *qf, const KT *kc
 #define FA_SEG_MMA 128
 template <typename KT, int DT>
 __global__ void __launch_bounds__(32) k_fattn_dec_mma(const float *qf, const KT *kc, const KT *vc, float *part,
-                                                      const int *ppos, int H, int Hkv)
+                                                      const int *ppos, int H, int Hkv, const float *ks = NULL,
+                                                      const float *vs = NULL)
 {
     extern __shared__ __align__(16) unsigned char smb[];
     __half *Qs = (__half *)smb, *Ks = Qs + 16 * (DT + FM_KP), *Vt = Ks + 16 * (DT + FM_KP);
@@ -1000,7 +1044,7 @@ __global__ void __launch_bounds__(32) k_fattn_dec_mma(const float *qf, const KT 
     for (int kb = k0; kb < k1; kb += 16) {
         const int nk = k1 - kb < 16 ? k1 - kb : 16;
         __syncwarp();
-        kv_tile16(kc, vc, kb, nk, Hkv, kvh, DT, Ks, Vt);
+        kv_tile16(kc, vc, ks, vs, kb, nk, Hkv, kvh, DT, Ks, Vt);
         __syncwarp();
         float s[2][4] = { { 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
 #pragma unroll 4
@@ -1971,6 +2015,12 @@ static float *dalloc(size_t n, Gpu *g);
 /* store N tokens' K/V of layer il and run its attention (qf rows of H*2*D: q then gate) */
 static void kv_store(Gpu *g, int il, const float *k, const float *v, int n, int N, cudaStream_t st)
 {
+    if (g->kv_q8) {
+        const int D = n / g->kvh_n;
+        k_kv_store_q8<<<N * g->kvh_n, D, 0, st>>>(k, v, (int8_t *)g->kc[il], (int8_t *)g->vc[il], g->ksc[il], g->vsc[il],
+                                                  g->d_pos, g->kvh_n, D);
+        return;
+    }
     const int nb = (int)(((int64_t)n * N + 255) / 256);
     if (g->kv_half) k_kv_store<<<nb, 256, 0, st>>>(k, v, (__half *)g->kc[il], (__half *)g->vc[il], g->d_pos, n, N);
     else k_kv_store<<<nb, 256, 0, st>>>(k, v, (float *)g->kc[il], (float *)g->vc[il], g->d_pos, n, N);
@@ -2006,6 +2056,8 @@ static void fa_setup(int D)
     cudaFuncSetAttribute(k_fattn_mma<__half, 256>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fa_mma_smem(256));
     cudaFuncSetAttribute(k_fattn_mma<float, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fa_mma_smem(128));
     cudaFuncSetAttribute(k_fattn_mma<__half, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fa_mma_smem(128));
+    cudaFuncSetAttribute(k_fattn_mma<int8_t, 256>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fa_mma_smem(256));
+    cudaFuncSetAttribute(k_fattn_mma<int8_t, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)fa_mma_smem(128));
 }
 
 template <typename KT>
@@ -2047,9 +2099,27 @@ static void attn_t(Gpu *g, int il, const float *qf, float *out, int H, int Hkv, 
     }
 }
 
+/* int8 K/V: the mma kernels only (head dims 128/256, head groups up to 16: checked at open) */
+static void attn_q8(Gpu *g, int il, const float *qf, float *out, int H, int Hkv, int D, int N, cudaStream_t st)
+{
+    const int8_t *kc = (const int8_t *)g->kc[il], *vc = (const int8_t *)g->vc[il];
+    const float *ks = g->ksc[il], *vs = g->vsc[il];
+    if (N == 1) {
+        const size_t sm = (size_t)(32 * (D + FM_KP) + D * FM_VS) * 2;
+        if (D == 256) k_fattn_dec_mma<int8_t, 256><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs);
+        else k_fattn_dec_mma<int8_t, 128><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs);
+        k_fattn_merge<<<dim3(H, 1), 256, 0, st>>>(g->fa_part, qf, out, H, D, 1, FA_SEG_MMA);
+    } else {
+        const dim3 grid(Hkv, (N + 128 / (H / Hkv) - 1) / (128 / (H / Hkv)));
+        if (D == 256) k_fattn_mma<int8_t, 256><<<grid, 256, fa_mma_smem(256), st>>>(qf, kc, vc, out, g->d_pos, H, Hkv, N, ks, vs);
+        else k_fattn_mma<int8_t, 128><<<grid, 256, fa_mma_smem(128), st>>>(qf, kc, vc, out, g->d_pos, H, Hkv, N, ks, vs);
+    }
+}
+
 static void attn(Gpu *g, int il, const float *qf, float *out, int H, int Hkv, int D, const int *sel, int W, int N,
                  cudaStream_t st)
 {
+    if (g->kv_q8) { attn_q8(g, il, qf, out, H, Hkv, D, N, st); return; }
     if (g->kv_half) attn_t<__half>(g, il, qf, out, H, Hkv, D, sel, W, N, st);
     else attn_t<float>(g, il, qf, out, H, Hkv, D, sel, W, N, st);
 }
@@ -2779,7 +2849,8 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
     const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
     const size_t ring_b = G->ple_ring ? (size_t)(c->ple_kern - 1) * c->ple_ngram * c->hc * c->n_embd * sizeof(float) : 0;
-    const size_t kv_row = (size_t)c->n_head_kv * c->head_dim * (G->kv_half ? 2 : 4), ix_row = (size_t)c->idx_dim * sizeof(float);
+    const size_t kv_row = (size_t)c->n_head_kv * c->head_dim * (G->kv_q8 ? 1 : G->kv_half ? 2 : 4), ix_row = (size_t)c->idx_dim * sizeof(float);
+    const size_t sc_row = G->kv_q8 ? (size_t)c->n_head_kv * (c->head_dim / 32) * sizeof(float) : 0;   /* int8 K/V: the scales */
     /* what the file's layout depends on: a state from another shape is refused */
     const int64_t shape[10] = { Q38_STATE_MAGIC, Q38_STATE_VERSION, c->n_layer, (int64_t)kv_row, (int64_t)ix_row,
                                 c->idx_ratio, (int64_t)conv_b, (int64_t)ssm_b, (int64_t)ring_b, c->n_vocab };
@@ -2797,6 +2868,7 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     size_t big = ring_b > conv_b ? ring_b : conv_b;
     if (ssm_b > big) big = ssm_b;
     if (ok && (size_t)n * kv_row > big) big = (size_t)n * kv_row;
+    if (ok && (size_t)n * sc_row > big) big = (size_t)n * sc_row;
     if (ok && (size_t)n * ix_row > big) big = (size_t)n * ix_row;
     uint8_t *buf = ok ? (uint8_t *)malloc(big) : NULL;
     if (!buf) ok = 0;
@@ -2831,6 +2903,7 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
         if (gl->conv[il]) io(gl->conv[il], conv_b);
         if (gl->ssm[il]) io(gl->ssm[il], ssm_b);
         if (gl->kc[il]) { io(gl->kc[il], (size_t)n * kv_row); io(gl->vc[il], (size_t)n * kv_row); }
+        if (gl->ksc[il]) { io(gl->ksc[il], (size_t)n * sc_row); io(gl->vsc[il], (size_t)n * sc_row); }
         if (gl->idx_raw[il]) {
             io(gl->idx_raw[il], (size_t)n * ix_row);
             io(gl->idx_pool[il], (size_t)(n / c->idx_ratio + 1) * ix_row);   /* with the partial block */
