@@ -161,7 +161,7 @@ const Glm53fCommand glm53f_commands[] = {
     { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
     { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 2 },
     { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
-    { "/plugin",    "[on|off NAME]",   "the plugins (skills, commands, hooks, mods), or one plugin or skill (plugin:name) on or off", 2 },
+    { "/plugin",    "[on|off NAME]",   "the plugins (skills, commands, hooks, mods), or one plugin or skill (plugin:name) on or off; /plugin hooks on|off NAME allows its hooks", 2 },
     { "/auto",      "[off]",           "this folder, remembered: the agent goes from start to finish without asking anything", 1 },
     { "/reasoning", "LEVEL",           "reasoning effort of level 0 chat (set when a conversation opens)", 2 },
     { "/gen",       "N",               "tokens to generate per answer", 2 },
@@ -453,6 +453,14 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
     } else if (!strcmp(line, "/plugin") || !strcmp(line, "/plugins")) {
         lc_plugins_load(lc_tools_root());
         in->note = lc_plugins_report();
+    } else if (!strncmp(line, "/plugin hooks on ", 17) || !strncmp(line, "/plugin hooks off ", 18)) {
+        const int on = line[15] == 'n';
+        const char *what = line + (on ? 17 : 18);
+        lc_plugins_load(lc_tools_root());
+        in->note = lc_plugin_trust(what, on)
+                       ? fmt_str("no plugin named %s%s (/plugin lists them)", what, "")
+                       : fmt_str(on ? "%s: its hooks may run from the next start of localcode%s"
+                                    : "%s: its hooks no longer run (from the next start of localcode)%s", what, "");
     } else if (!strncmp(line, "/plugin on ", 11) || !strncmp(line, "/plugin off ", 12)) {
         const int on = line[9] == 'n';
         const char *what = line + (on ? 11 : 12);

@@ -531,7 +531,10 @@ static void defaults_apply(void)
         char kind[16], what[600], val[8];
         if (sscanf(line, "%15s %599s %7s", kind, what, val) == 3) {
             const int on = !strcmp(val, "on");
-            if (!strcmp(kind, "plugin")) {
+            if (!strcmp(kind, "hooks")) {
+                const int pi = plugin_find(what);
+                if (pi >= 0) P[pi].trusted = on;
+            } else if (!strcmp(kind, "plugin")) {
                 const int pi = plugin_find(what);
                 if (pi >= 0) P[pi].on = on;
             } else if (!strcmp(kind, "skill")) {
@@ -758,6 +761,37 @@ int lc_plugin_switch(const char *what, int on)
     return 0;
 }
 
+static int state_line(const char *kind, const char *what, int on)
+{
+    char *sp = state_path();
+    if (!sp) return 0;
+    char *t = lc_slurp(sp, NULL);
+    Buf b = { 0 };
+    char head[700];
+    snprintf(head, sizeof head, "%s %s ", kind, what);
+    for (char *line = t; line && *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (strncmp(line, head, strlen(head)) && *line) { b_str(&b, line); b_str(&b, "\n"); }
+        line = nl ? nl + 1 : NULL;
+    }
+    free(t);
+    b_fmt(&b, "%s%s\n", head, on ? "on" : "off");
+    FILE *f = fopen(sp, "wb");
+    if (f) { fwrite(b.p, 1, b.n, f); fclose(f); }
+    free(sp);
+    free(b.p);
+    return 0;
+}
+
+int lc_plugin_trust(const char *name, int on)
+{
+    const int pi = plugin_find(name);
+    if (pi < 0) return -1;
+    P[pi].trusted = on;
+    return state_line("hooks", name, on);
+}
+
 char *lc_plugins_report(void)
 {
     Buf b = { 0 };
@@ -771,8 +805,7 @@ char *lc_plugins_report(void)
         b_fmt(&b, "%s %-34s %3d skills (%d on)", P[i].on ? "on " : "off", P[i].name, P[i].n_skills, son);
         if (P[i].n_commands) b_fmt(&b, ", %d commands", P[i].n_commands);
         if (P[i].n_agents) b_fmt(&b, ", %d agents", P[i].n_agents);
-        if (P[i].mod) b_str(&b, ", mod");
-        else if (P[i].hooks) b_str(&b, ", hooks");
+        if (P[i].hooks) b_fmt(&b, ", %s %s", P[i].mod ? "mod" : "hooks", P[i].trusted ? "allowed" : "not allowed");
         b_fmt(&b, " · %s\n", P[i].origin);
     }
     return b.p ? b.p : xdup("");

@@ -22,6 +22,7 @@
 
 #include "glm53f_chat.h"
 #include "lc_tools.h"
+#include "lc_hooks.h"
 
 #define MAX_CALLS   8          /* tool calls carried out from one model answer */
 #define ROOM        1024       /* positions kept free for the next step's start */
@@ -445,6 +446,27 @@ static void call_detail(const LcCall *c, Str *d)
 
 /* ------------------------------------------------------------- the turn ---- */
 
+/* a hook event's runs on the screen: what blocked, what it says, or that it ran */
+static void hook_shown(Glm53fTurnSink *k, const char *ev, const LcHookOut *o)
+{
+    if (!o->ran || !k->tool) return;
+    char title[80], sum[600];
+    snprintf(title, sizeof title, "hook %s", ev);
+    const char *what = o->block ? o->reason : o->message ? o->message : o->context ? o->context : NULL;
+    snprintf(sum, sizeof sum, "%s%.300s", o->block ? "blocked: " : "", what ? what : "ran");
+    for (char *p = sum; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
+    k->tool(k, title, sum, !o->block && !(o->message && strstr(o->message, "failed")));
+}
+
+/* context from hooks, as Claude Code gives it to the model */
+static void hook_context(Str *t, const LcHookOut *o)
+{
+    if (!o->context || !*o->context) return;
+    s_str(t, "\n\n<system-reminder>\n");
+    s_str(t, o->context);
+    s_str(t, "\n</system-reminder>");
+}
+
 int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
 {
     Glm53fEngine *e = s->e;
@@ -460,6 +482,36 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     /* /auto: the request carries the rule (the context's opening stays the same for every folder) */
     s_str(&req, in->prompt);
     if (s->autonomous && level == 2) s_str(&req, AUTONOMOUS_NOTE);
+    /* the hooks of the plugins the user allowed and of the project (lc_hooks.c) */
+    lc_hooks_load(lc_tools_root());
+    if (s->first && lc_hooks_any(LC_HOOK_SESSION_START)) {
+        LcHookOut ho;
+        lc_hooks_run(LC_HOOK_SESSION_START, "startup", "\"source\": \"startup\"", &ho);
+        hook_shown(k, "SessionStart", &ho);
+        hook_context(&req, &ho);
+        lc_hook_out_free(&ho);
+    }
+    if (lc_hooks_any(LC_HOOK_USER_PROMPT)) {
+        LcHookOut ho;
+        char *q = lc_json_quote(in->prompt);
+        Str f = { 0 };
+        s_str(&f, "\"prompt\": ");
+        s_str(&f, q ? q : "\"\"");
+        lc_hooks_run(LC_HOOK_USER_PROMPT, NULL, f.p, &ho);
+        free(q);
+        free(f.p);
+        hook_shown(k, "UserPromptSubmit", &ho);
+        if (ho.block) {                          /* the message does not go to the model */
+            char m[700];
+            snprintf(m, sizeof m, "a hook blocked the message: %.600s", ho.reason ? ho.reason : "");
+            lc_hook_out_free(&ho);
+            free(req.p);
+            k->done(k, m, 2);
+            return 0;
+        }
+        hook_context(&req, &ho);
+        lc_hook_out_free(&ho);
+    }
     const char *prompt = req.p ? req.p : in->prompt;
     if (s->first) {
         open_context(s, k, &t, level, prompt);
@@ -469,7 +521,7 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
         s_str(&t, "<|im_end|>\n<|im_start|>assistant\n<think>\n");
     }
 
-    int steps = 0, calls_done = 0, fatal = 0, failed = 0, interrupted = 0, compacted = 0;
+    int steps = 0, calls_done = 0, fatal = 0, failed = 0, interrupted = 0, compacted = 0, stop_hooks = 0;
     long pre_tok = 0, dec_tok = 0;
     double pre_s = 0.0, dec_s = 0.0;
     const double t_turn = now_s();
@@ -603,6 +655,26 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
             break;
         }
         if (!nc) {                               /* answered */
+            if (lc_hooks_any(LC_HOOK_STOP) && stop_hooks < 3) {
+                /* a Stop hook may send the agent back to work, with its reason */
+                LcHookOut ho;
+                lc_hooks_run(LC_HOOK_STOP, NULL, stop_hooks ? "\"stop_hook_active\": true" : "\"stop_hook_active\": false", &ho);
+                hook_shown(k, "Stop", &ho);
+                const int again = ho.block && ho.reason && *ho.reason;
+                if (again) {
+                    stop_hooks++;
+                    answer.n = 0;
+                    if (answer.p) answer.p[0] = 0;
+                    s_str(&t, "<|im_end|>\n<|im_start|>user\n[hook] ");
+                    s_str(&t, ho.reason);
+                    s_str(&t, "<|im_end|>\n<|im_start|>assistant\n<think>\n");
+                }
+                lc_hook_out_free(&ho);
+                if (again) {
+                    if (++steps >= max_steps) { why_stop = "stopped: too many steps"; break; }
+                    continue;
+                }
+            }
             if (level >= 2 && fl.edits_since_test > 0 && fl.planned && !fl.stopped && fl.nudges < 2) {
                 /* changed files, not tested since: back to test before finishing */
                 fl.nudges++;
@@ -652,7 +724,40 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
             } else {
                 int go = 1;
                 const int bit = tool_bit(c->name);
-                if (lc_tool_needs_approval(c->name) && !s->auto_approve && !(s->always & (unsigned)bit)) {
+                const char *hname = lc_hook_tool_name(c->name);
+                char *hinput = NULL;
+                LcHookOut pre;
+                memset(&pre, 0, sizeof pre);
+                if (lc_hooks_any(LC_HOOK_PRE_TOOL) || lc_hooks_any(LC_HOOK_POST_TOOL)) {
+                    if (test_cmd) {
+                        char *qc = lc_json_quote(test_cmd);
+                        Str hi = { 0 };
+                        s_str(&hi, "{\"command\": ");
+                        s_str(&hi, qc ? qc : "\"\"");
+                        s_str(&hi, "}");
+                        free(qc);
+                        hinput = hi.p;
+                    } else {
+                        hinput = lc_hook_tool_input(c);
+                    }
+                }
+                if (lc_hooks_any(LC_HOOK_PRE_TOOL)) {
+                    Str f = { 0 };
+                    s_fmt(&f, "\"tool_name\": \"%s\", \"tool_input\": ", hname);
+                    s_str(&f, hinput ? hinput : "{}");
+                    lc_hooks_run(LC_HOOK_PRE_TOOL, hname, f.p, &pre);
+                    free(f.p);
+                    hook_shown(k, "PreToolUse", &pre);
+                }
+                if (pre.block) {                         /* a hook said no: the model reads why */
+                    go = 0;
+                    snprintf(sum, sizeof sum, "blocked by a hook");
+                    Str b = { 0 };
+                    s_fmt(&b, "A hook blocked this %s call: ", c->name);
+                    s_str(&b, pre.reason ? pre.reason : "(no reason given)");
+                    res = b.p;
+                } else if (pre.decision != 1 && ((lc_tool_needs_approval(c->name) && !s->auto_approve && !(s->always & (unsigned)bit)) ||
+                                                 pre.decision == 3)) {
                     Str d = { 0 };
                     if (test_cmd) s_str(&d, test_cmd); else call_detail(c, &d);
                     const int a = k->approve ? k->approve(k, title, d.p ? d.p : "") : 0;
@@ -687,7 +792,32 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                         }
                     }
                     k->status(k, NULL, 0.0);
+                    if (lc_hooks_any(LC_HOOK_POST_TOOL) && res) {
+                        LcHookOut po;
+                        char *qr = lc_json_quote(res);
+                        Str f = { 0 };
+                        s_fmt(&f, "\"tool_name\": \"%s\", \"tool_input\": ", hname);
+                        s_str(&f, hinput ? hinput : "{}");
+                        s_str(&f, ", \"tool_response\": {\"output\": ");
+                        s_str(&f, qr ? qr : "\"\"");
+                        s_str(&f, "}");
+                        free(qr);
+                        lc_hooks_run(LC_HOOK_POST_TOOL, hname, f.p, &po);
+                        free(f.p);
+                        hook_shown(k, "PostToolUse", &po);
+                        if (po.block || po.context) {    /* the hook's word goes with the result */
+                            Str r2 = { 0 };
+                            s_str(&r2, res);
+                            if (po.block && po.reason) { s_str(&r2, "\n[hook] "); s_str(&r2, po.reason); }
+                            if (po.context) { s_str(&r2, "\n<system-reminder>\n"); s_str(&r2, po.context); s_str(&r2, "\n</system-reminder>"); }
+                            free(res);
+                            res = r2.p;
+                        }
+                        lc_hook_out_free(&po);
+                    }
                 }
+                free(hinput);
+                lc_hook_out_free(&pre);
             }
             if (!interrupted || res) {
                 if (k->tool) k->tool(k, title, sum, ok);

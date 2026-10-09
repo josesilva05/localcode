@@ -33,6 +33,7 @@ typedef struct {
     char *name, *desc, *version, *dir, *origin; /* origin: "system", "user", "project" */
     int   on;
     int   n_skills, n_commands, n_agents, hooks, mod;   /* mod: hooks are JavaScript modules */
+    int   trusted;               /* its hooks (or mod) may run: the user said so (/plugin hooks on) */
 } LcPlugin;
 
 /* Finds everything (once; root: the working directory). */
@@ -55,6 +56,9 @@ char *lc_skill_search(const char *query, int max);
 /* A plugin (by name) or one skill ("plugin:name") on or off, kept in plugins.txt. 0, or -1 when
  * there is no such plugin or skill. */
 int lc_plugin_switch(const char *what, int on);
+/* A plugin's hooks (programs it runs at the agent's events) allowed or not, kept in plugins.txt; they
+ * are not allowed until the user says so. 0, or -1 when there is no such plugin. */
+int lc_plugin_trust(const char *name, int on);
 /* /plugin's text: every plugin with its parts, on or off, where it is. */
 char *lc_plugins_report(void);
 
