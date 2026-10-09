@@ -117,6 +117,7 @@ typedef struct {
     int          agent_level;
     int          auto_approve;   /* 1: writes and commands run without asking  */
     int          autonomous;     /* 1: /auto in this folder: no approvals, no questions, to the end */
+    int          plan_mode;      /* 1: the agent plans and changes nothing (Tab, /mode plan); 0: it builds */
     unsigned     always;         /* tools the user allowed for the session (bit per tool) */
     /* the conversation on disk and its compaction (lc_session.c) */
     void        *sess;           /* the session file being written; NULL until the first message */
@@ -150,6 +151,9 @@ typedef struct Glm53fTurnSink {
     /* called while a mod holds a tool call (lc_mods.c): the plain front end answers its pane here;
      * NULL where another thread does (the full-screen one) */
     void (*mod_pump)(void);
+    /* the agent's question tool: the question and its options (one per line, may be empty); the
+     * user's answer (malloc'd: an option's text or what was typed), or NULL when not answered */
+    char *(*question)(struct Glm53fTurnSink *k, const char *question, const char *options);
 } Glm53fTurnSink;
 
 /* Set by the full-screen front end: what the mods draw changed (called from another thread). */

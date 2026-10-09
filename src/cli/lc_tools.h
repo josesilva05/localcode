@@ -26,6 +26,11 @@ const char *lc_call_arg(const LcCall *c, const char *key);
 /* The working directory the tools are confined to; NULL keeps the current one. */
 int  lc_tools_init(const char *root);
 const char *lc_tools_root(void);
+/* A path the model gave as the permission rules see it: relative to the working directory with '/'
+ * (0), absolute when outside it (1), or -1 when it is not a path. */
+int  lc_tools_where(const char *path, char *out, size_t cap);
+/* The next calls may reach paths outside the working directory (the user allowed it); 0 again after. */
+void lc_tools_allow_outside(int on);
 
 /* run's shell: 0 bash (Git Bash on Windows), 1 PowerShell; lc_tools_set_shell returns -1 when bash is
  * not found. */
@@ -44,7 +49,7 @@ void lc_tool_title(const LcCall *c, char *buf, size_t cap);
 
 /* For lc_plugins.c: the entries of a folder (absolute path, without . and .., folders first,
  * then by name), and a whole file (NUL-terminated; NULL when it cannot be read, up to 8 MB). */
-typedef struct { char *name; int dir; long long size; } LcEnt;
+typedef struct { char *name; int dir; long long size, mtime; } LcEnt;   /* mtime in seconds */
 LcEnt *lc_read_dir(const char *dir, int *n);
 void   lc_ents_free(LcEnt *v, int n);
 char  *lc_slurp(const char *path, long *n);

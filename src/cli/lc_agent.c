@@ -24,6 +24,7 @@
 #include "lc_tools.h"
 #include "lc_hooks.h"
 #include "lc_mods.h"
+#include "lc_perm.h"
 #include "lc_snap.h"
 
 #define MAX_CALLS   8          /* tool calls carried out from one model answer */
@@ -34,6 +35,13 @@ static const char AUTONOMOUS_NOTE[] =
     "\n\n[localcode] Modo autônomo nesta pasta: não faça perguntas nem peça confirmação ao usuário. "
     "Quando algo for ambíguo, escolha a opção mais razoável, diga qual escolheu e siga até terminar a tarefa "
     "(com o teste passando, se houver).";
+
+/* what plan mode (Tab, /mode plan) adds: investigate and propose, change nothing */
+static const char PLAN_NOTE[] =
+    "\n\n[localcode] Plan mode: investigate (read, search, run read-only commands if needed) and answer with a plan "
+    "of the change: the files and functions involved, the steps, the risks, and the command that will test it. "
+    "Do not change any file: write_file, edit_file and apply_patch are refused in this mode. The user switches to "
+    "build mode to carry the plan out.";
 
 static double now_s(void)
 {
@@ -183,7 +191,7 @@ static void system_block(Str *t, int level)
         s_str(t, "1. Look: list, search and read the files involved.\n"
                  "2. Plan: call plan with the steps and a test_command that proves the task works (the project's "
                  "tests, a build, or running the program with a check; write a small check when there is none).\n"
-                 "3. Code: the smallest correct change with edit_file; write_file only for new files or full rewrites.\n"
+                 "3. Code: the smallest correct change with edit_file (apply_patch for several places or files at once); write_file only for new files or full rewrites.\n"
                  "4. Test: call test after the change.\n"
                  "5. If it fails: debug (read the error, find its cause in the code), fix, and call test again. "
                  "At most 5 failed attempts; then stop and say what still fails.\n"
@@ -348,6 +356,7 @@ static int tool_bit(const char *name)
 {
     static const char *names[] = { "write_file", "edit_file", "run" };
     if (!strcmp(name, "test")) return 1 << 2;           /* a command too: run's permission */
+    if (!strcmp(name, "apply_patch")) return 1 << 1;    /* edits: edit_file's permission */
     for (int i = 0; i < 3; i++) if (!strcmp(name, names[i])) return 1 << i;
     return 0;
 }
@@ -395,7 +404,15 @@ static char *flow_plan(Flow *fl, const LcCall *c, char *sum, size_t sc, int *ok)
         const char *q = p;
         while (n && (*q == ' ' || *q == '-' || *q == '*' || (*q >= '0' && *q <= '9') || *q == '.' || *q == ')')) { q++; n--; }
         while (n && (q[n - 1] == '\r' || q[n - 1] == ' ')) n--;
-        if (n) { s_fmt(&sm, "%s%d. ", k ? "\n" : "", ++k); s_add(&sm, q, n); }
+        /* the progress marks of a revised plan: [x] done, [>] doing, [ ] to do */
+        const char *mark = "";
+        if (n >= 3 && q[0] == '[' && q[2] == ']') {
+            mark = (q[1] | 32) == 'x' ? "✓ " : q[1] == '>' || q[1] == '~' ? "▸ " : "○ ";
+            q += 3;
+            n -= 3;
+            while (n && *q == ' ') { q++; n--; }
+        }
+        if (n) { s_fmt(&sm, "%s%d. %s", k ? "\n" : "", ++k, mark); s_add(&sm, q, n); }
         p = nl ? nl + 1 : p + strlen(p);
     }
     s_fmt(&sm, "%steste: %s", k ? "\n" : "", fl->test_cmd ? fl->test_cmd : "(nenhum)");
@@ -470,6 +487,77 @@ static char *flow_test(Flow *fl, const char *cmd, volatile int *stop, char *sum,
 }
 
 /* What the user sees before allowing a call: the change or the command. */
+/* What the permission rules (lc_perm) say of a call: of every path or command it names; *outside 1
+ * when a path is outside the working directory (external_directory decides it too). */
+static int perm_call(const LcCall *c, const char *test_cmd, char *why, size_t wcap, int *outside)
+{
+    *outside = 0;
+    *why = 0;
+    if (test_cmd) return lc_perm_check("test", test_cmd, why, wcap);
+    if (!strcmp(c->name, "run")) return lc_perm_check("run", lc_call_arg(c, "command"), why, wcap);
+    if (!strcmp(c->name, "webfetch")) return lc_perm_check("webfetch", lc_call_arg(c, "url"), why, wcap);
+    if (!strcmp(c->name, "skill")) return lc_perm_check("skill", lc_call_arg(c, "name"), why, wcap);
+    if (!strcmp(c->name, "skill_search")) return lc_perm_check("skill_search", lc_call_arg(c, "query"), why, wcap);
+    if (!strcmp(c->name, "plan")) return LC_PERM_NONE;
+    static char paths[32][1024];
+    int np = 0;
+    if (!strcmp(c->name, "apply_patch")) {       /* the files of the patch, and where they move */
+        static const char *heads[] = { "*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:" };
+        for (const char *p = lc_call_arg(c, "patch"); p && *p && np < 32;) {
+            for (int h = 0; h < 4; h++) {
+                const size_t hl = strlen(heads[h]);
+                if (strncmp(p, heads[h], hl)) continue;
+                const char *q = p + hl;
+                while (*q == ' ') q++;
+                size_t k = strcspn(q, "\r\n");
+                while (k && q[k - 1] == ' ') k--;
+                snprintf(paths[np++], sizeof paths[0], "%.*s", (int)k, q);
+                break;
+            }
+            p = strchr(p, '\n');
+            if (p) p++;
+        }
+    } else {
+        const char *p = lc_call_arg(c, "path");
+        snprintf(paths[np++], sizeof paths[0], "%s", p && *p ? p : ".");
+    }
+    int any_deny = 0, any_ask = 0, all_allow = np > 0;
+    char wd[300] = "", wa[300] = "", wl[300] = "";
+    for (int i = 0; i < np; i++) {
+        char rel[4400], one[300];
+        if (lc_tools_where(paths[i], rel, sizeof rel) == 1) {
+            *outside = 1;
+            const int x = lc_perm_check("external_directory", rel, one, sizeof one);
+            if (x == LC_PERM_DENY && !any_deny) { any_deny = 1; snprintf(wd, sizeof wd, "%s (outside the working directory: %s)", one, rel); }
+            if (x == LC_PERM_ASK && !any_ask) { any_ask = 1; snprintf(wa, sizeof wa, "outside the working directory: %s", rel); }
+        }
+        const int a = lc_perm_check(c->name, rel, one, sizeof one);
+        if (a == LC_PERM_DENY && !any_deny) { any_deny = 1; snprintf(wd, sizeof wd, "%s", one); }
+        if (a == LC_PERM_ASK && !any_ask) { any_ask = 1; snprintf(wa, sizeof wa, "%s", one); }
+        if (a != LC_PERM_ALLOW) all_allow = 0;
+        else if (!*wl) snprintf(wl, sizeof wl, "%s", one);
+    }
+    if (any_deny) { snprintf(why, wcap, "%s", wd); return LC_PERM_DENY; }
+    if (any_ask) { snprintf(why, wcap, "%s", wa); return LC_PERM_ASK; }
+    if (all_allow) { snprintf(why, wcap, "%s", wl); return LC_PERM_ALLOW; }
+    return LC_PERM_NONE;
+}
+
+/* the same call (name and arguments) as the two before it: a doom loop */
+static int doom_loop(const LcCall *c)
+{
+    static char *prev[2];
+    Str s = { 0 };
+    s_str(&s, c->name);
+    for (int i = 0; i < c->n; i++) s_fmt(&s, "\x1f%s=%s", c->key[i] ? c->key[i] : "", c->val[i] ? c->val[i] : "");
+    if (!s.p) return 0;
+    const int same = prev[0] && prev[1] && !strcmp(prev[0], s.p) && !strcmp(prev[1], s.p);
+    free(prev[0]);
+    prev[0] = prev[1];
+    prev[1] = s.p;
+    return same;
+}
+
 static void call_detail(const LcCall *c, Str *d)
 {
     const char *v;
@@ -481,7 +569,8 @@ static void call_detail(const LcCall *c, Str *d)
         s_add(d, o ? o : "", o && strlen(o) > 600 ? 600 : (o ? strlen(o) : 0));
         s_str(d, "\n+ ");
         s_add(d, nw ? nw : "", nw && strlen(nw) > 600 ? 600 : (nw ? strlen(nw) : 0));
-    } else if (!strcmp(c->name, "write_file") && (v = lc_call_arg(c, "content"))) {
+    } else if ((!strcmp(c->name, "write_file") && (v = lc_call_arg(c, "content"))) ||
+               (!strcmp(c->name, "apply_patch") && (v = lc_call_arg(c, "patch")))) {
         const size_t n = strlen(v);
         s_add(d, v, n > 600 ? 600 : n);
         if (n > 600) s_fmt(d, "\n[... %zu more bytes]", n - 600);
@@ -530,7 +619,9 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     }
     s_str(&req, in->prompt);
     if (s->autonomous && level == 2) s_str(&req, AUTONOMOUS_NOTE);
+    if (s->plan_mode && level == 2) s_str(&req, PLAN_NOTE);
     if (level >= 2) lc_snap_turn();              /* the folder before this turn, for /undo */
+    lc_perm_load(lc_tools_root());               /* the permission rules, as the files are now */
     /* the hooks of the plugins the user allowed and of the project (lc_hooks.c) */
     lc_hooks_load(lc_tools_root());
     if (s->first && lc_hooks_any(LC_HOOK_SESSION_START)) {
@@ -766,6 +857,28 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                 if (res) snprintf(res, 200, "[localcode] The fix limit was reached: no more functions. Answer now.");
             } else if (lc_tool_allowed(c->name, level) && !strcmp(c->name, "plan")) {
                 res = flow_plan(&fl, c, sum, sizeof sum, &ok);
+            } else if (s->plan_mode && level == 2 &&
+                       (!strcmp(c->name, "write_file") || !strcmp(c->name, "edit_file") || !strcmp(c->name, "apply_patch"))) {
+                snprintf(sum, sizeof sum, "plan mode: no changes");
+                res = (char *)malloc(300);
+                if (res) snprintf(res, 300, "Plan mode: %s is refused, no file changes. Finish the plan and give it to the user; "
+                                            "they switch to build mode to carry it out.", c->name);
+            } else if (lc_tool_allowed(c->name, level) && !strcmp(c->name, "question")) {
+                const char *q = lc_call_arg(c, "question");
+                char *a = q && *q && k->question && !s->autonomous ? k->question(k, q, lc_call_arg(c, "options")) : NULL;
+                Str r = { 0 };
+                if (a) {
+                    s_str(&r, "The user answered: ");
+                    s_str(&r, a);
+                    snprintf(sum, sizeof sum, "%.200s", a);
+                    ok = 1;
+                } else {
+                    s_str(&r, k->question ? "The user did not answer. Go on with the most sensible choice and say which one you took."
+                                          : "No one can answer here. Go on with the most sensible choice and say which one you took.");
+                    snprintf(sum, sizeof sum, "sem resposta");
+                }
+                free(a);
+                res = r.p;
             } else if (lc_tool_allowed(c->name, level) && !strcmp(c->name, "test") && !test_cmd) {
                 snprintf(sum, sizeof sum, "sem comando de teste");
                 res = (char *)malloc(200);
@@ -811,6 +924,14 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                     free(f.p);
                     hook_shown(k, "PreToolUse", &pre);
                 }
+                char pwhy[400];
+                int outside = 0;
+                int perm = perm_call(c, test_cmd, pwhy, sizeof pwhy, &outside);
+                if (s->plan_mode && level == 2 && perm != LC_PERM_DENY && (test_cmd || !strcmp(c->name, "run"))) {
+                    perm = LC_PERM_ASK;                  /* plan mode: a command may change things, the user decides */
+                    snprintf(pwhy, sizeof pwhy, "plan mode");
+                }
+                const int doom = doom_loop(c) ? lc_perm_check("doom_loop", c->name, NULL, 0) : LC_PERM_NONE;
                 if (pre.block) {                         /* a hook said no: the model reads why */
                     go = 0;
                     snprintf(sum, sizeof sum, mod_no ? "refused by a mod" : "blocked by a hook");
@@ -818,9 +939,23 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                     s_fmt(&b, mod_no ? "A mod refused this %s call: " : "A hook blocked this %s call: ", c->name);
                     s_str(&b, pre.reason ? pre.reason : "(no reason given)");
                     res = b.p;
-                } else if (pre.decision != 1 && ((lc_tool_needs_approval(c->name) && !s->auto_approve && !(s->always & (unsigned)bit)) ||
-                                                 pre.decision == 3)) {
+                } else if (perm == LC_PERM_DENY || doom == LC_PERM_DENY) {   /* the user's rules say no */
+                    go = 0;
+                    snprintf(sum, sizeof sum, "denied by a permission rule");
+                    Str b = { 0 };
+                    if (perm == LC_PERM_DENY)
+                        s_fmt(&b, "The user's permission rules deny this %s call (%s). Do not repeat it; take another way or ask the user.",
+                              c->name, pwhy);
+                    else
+                        s_fmt(&b, "This is the third identical %s call in a row and the rules stop it: the same input gives the "
+                                  "same result. Take another way.", c->name);
+                    res = b.p;
+                } else if (pre.decision != 1 &&
+                           (perm == LC_PERM_ASK || doom == LC_PERM_ASK || pre.decision == 3 ||
+                            (perm == LC_PERM_NONE && lc_tool_needs_approval(c->name) && !s->auto_approve && !(s->always & (unsigned)bit)))) {
                     Str d = { 0 };
+                    if (doom == LC_PERM_ASK) s_str(&d, "(the same call a third time in a row, the same input as the two before)\n");
+                    if (perm == LC_PERM_ASK && *pwhy) s_fmt(&d, "(asked by the rule: %s)\n", pwhy);
                     if (test_cmd) s_str(&d, test_cmd); else call_detail(c, &d);
                     const int a = k->approve ? k->approve(k, title, d.p ? d.p : "") : 0;
                     free(d.p);
@@ -839,8 +974,11 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                     if (test_cmd) {
                         res = flow_test(&fl, test_cmd, stop, sum, sizeof sum, &ok);
                     } else {
+                        lc_tools_allow_outside(outside);  /* allowed or asked above: this call only */
                         res = lc_tool_run(c, stop, sum, sizeof sum, &ok);
-                        if (ok && (!strcmp(c->name, "edit_file") || !strcmp(c->name, "write_file"))) {
+                        lc_tools_allow_outside(0);
+                        if (ok && (!strcmp(c->name, "edit_file") || !strcmp(c->name, "write_file") ||
+                                   !strcmp(c->name, "apply_patch"))) {
                             fl.edited = 1;
                             fl.edits_since_test++;
                             fl.passed = 0;

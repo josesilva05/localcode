@@ -3,6 +3,7 @@
 
 #include "lc_tools.h"
 #include "lc_plugins.h"
+#include "lc_regex.h"
 #include "lc_web.h"
 
 #include <stdarg.h>
@@ -28,6 +29,7 @@
 #define LINE_CAP       400       /* characters kept of one long line              */
 #define LIST_CAP       300       /* list_dir / glob entries                       */
 #define GREP_CAP       120       /* grep matching lines                           */
+#define GLOB_SCAN      20000     /* glob matches gathered to order by date        */
 #define FILE_CAP       (8 << 20) /* bytes a tool reads from one file              */
 #define RUN_OUT_CAP    16000     /* characters of a command's output (head + tail) */
 
@@ -183,6 +185,10 @@ int lc_tools_init(const char *root)
 
 const char *lc_tools_root(void) { return g_root; }
 
+static int g_outside;        /* this call may reach outside the working directory (the user allowed it) */
+
+void lc_tools_allow_outside(int on) { g_outside = on; }
+
 /* The absolute path of a path the model gave, or NULL (with why) when it leaves the
  * working directory. out keeps '\\' on Windows. */
 static int resolve(const char *rel, char *out, size_t cap, char *why, size_t wcap)
@@ -203,7 +209,7 @@ static int resolve(const char *rel, char *out, size_t cap, char *why, size_t wca
     if (!u) { snprintf(why, wcap, "out of memory"); return -1; }
     const size_t rl = strlen(g_root);
     const int inside = !_strnicmp(u, g_root, rl) && (u[rl] == 0 || u[rl] == '\\' || g_root[rl - 1] == '\\');
-    if (!inside) {
+    if (!inside && !g_outside) {
         snprintf(why, wcap, "%s is outside the working directory %s", rel, g_root);
         free(u);
         return -1;
@@ -228,7 +234,7 @@ static int resolve(const char *rel, char *out, size_t cap, char *why, size_t wca
     char whole[8192];
     snprintf(whole, sizeof whole, "%s%s", full, rest);
     const size_t rl = strlen(g_root);
-    if (strncmp(whole, g_root, rl) || (whole[rl] && whole[rl] != '/')) {
+    if ((strncmp(whole, g_root, rl) || (whole[rl] && whole[rl] != '/')) && !g_outside) {
         snprintf(why, wcap, "%s is outside the working directory %s", rel, g_root);
         return -1;
     }
@@ -241,11 +247,36 @@ static int resolve(const char *rel, char *out, size_t cap, char *why, size_t wca
 static const char *rel_of(const char *abs, char *buf, size_t cap)
 {
     const size_t rl = strlen(g_root);
-    const char *p = strlen(abs) >= rl ? abs + rl : abs;
-    while (*p == '\\' || *p == '/') p++;
+#ifdef _WIN32
+    const int under = !_strnicmp(abs, g_root, rl);
+#else
+    const int under = !strncmp(abs, g_root, rl);
+#endif
+    const char *p = under ? abs + rl : abs;        /* outside (allowed by the user): the whole path */
+    if (under) while (*p == '\\' || *p == '/') p++;
     snprintf(buf, cap, "%s", *p ? p : ".");
     for (char *q = buf; *q; q++) if (*q == '\\') *q = '/';
     return buf;
+}
+
+int lc_tools_where(const char *p, char *out, size_t cap)
+{
+    const int keep = g_outside;
+    char abs[4096], why[600];
+    g_outside = 1;
+    const int r = resolve(p, abs, sizeof abs, why, sizeof why);
+    g_outside = keep;
+    if (r) { snprintf(out, cap, "%s", p ? p : ""); return -1; }
+    const size_t rl = strlen(g_root);
+#ifdef _WIN32
+    const int inside = !_strnicmp(abs, g_root, rl) && (abs[rl] == 0 || abs[rl] == '\\' || g_root[rl - 1] == '\\');
+#else
+    const int inside = !strncmp(abs, g_root, rl) && (abs[rl] == 0 || abs[rl] == '/');
+#endif
+    if (inside) { rel_of(abs, out, cap); return 0; }
+    snprintf(out, cap, "%s", abs);
+    for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
+    return 1;
 }
 
 static FILE *open_file(const char *path, const char *mode)
@@ -329,16 +360,18 @@ static int is_binary(const char *p, long n)
 
 #define T_READ  "{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file of the working directory, with line numbers. Long files come in pieces: give offset (first line, 1-based) and limit (number of lines, default 400).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"file path relative to the working directory\"}, \"offset\": {\"type\": \"integer\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}"
 #define T_LIST  "{\"type\": \"function\", \"function\": {\"name\": \"list_dir\", \"description\": \"List the files and folders of a folder of the working directory (folders end with /).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"folder relative to the working directory, default .\"}}, \"required\": []}}}"
-#define T_GLOB  "{\"type\": \"function\", \"function\": {\"name\": \"glob\", \"description\": \"Find files by name pattern, for example src/**/*.c or *.md. * matches within one folder name, ** any number of folders.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}}, \"required\": [\"pattern\"]}}}"
-#define T_GREP  "{\"type\": \"function\", \"function\": {\"name\": \"grep\", \"description\": \"Search text files for a literal string (not a regular expression); lists path:line: text of each match.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\", \"description\": \"the text to find\"}, \"path\": {\"type\": \"string\", \"description\": \"folder or file to search, default .\"}, \"glob\": {\"type\": \"string\", \"description\": \"only file names matching this, for example *.c\"}, \"ignore_case\": {\"type\": \"boolean\"}}, \"required\": [\"pattern\"]}}}"
+#define T_GLOB  "{\"type\": \"function\", \"function\": {\"name\": \"glob\", \"description\": \"Find files by name pattern, for example src/**/*.c or *.md. * matches within one folder name, ** any number of folders. The most recently changed files come first.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}}, \"required\": [\"pattern\"]}}}"
+#define T_GREP  "{\"type\": \"function\", \"function\": {\"name\": \"grep\", \"description\": \"Search the contents of text files with a regular expression (for example def \\\\w+\\\\( or TODO|FIXME; . [] * + ? {m,n} | () \\\\b \\\\d \\\\w \\\\s ^ $, no lookaround); lists path:line: text of each match. literal true searches the exact text instead.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\", \"description\": \"the regular expression (or the text, with literal)\"}, \"literal\": {\"type\": \"boolean\"}, \"path\": {\"type\": \"string\", \"description\": \"folder or file to search, default .\"}, \"glob\": {\"type\": \"string\", \"description\": \"only file names matching this, for example *.c\"}, \"ignore_case\": {\"type\": \"boolean\"}}, \"required\": [\"pattern\"]}}}"
 #define T_WRITE "{\"type\": \"function\", \"function\": {\"name\": \"write_file\", \"description\": \"Create a file or replace all of its content. Prefer edit_file to change part of an existing file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\", \"description\": \"the whole new content\"}}, \"required\": [\"path\", \"content\"]}}}"
 #define T_EDIT  "{\"type\": \"function\", \"function\": {\"name\": \"edit_file\", \"description\": \"Replace an exact piece of text in a file. old_string must appear exactly once (copy it from read_file, without the line numbers, with enough surrounding lines to be unique), unless replace_all is true.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_string\": {\"type\": \"string\"}, \"new_string\": {\"type\": \"string\"}, \"replace_all\": {\"type\": \"boolean\"}}, \"required\": [\"path\", \"old_string\", \"new_string\"]}}}"
 #define T_RUN   "{\"type\": \"function\", \"function\": {\"name\": \"run\", \"description\": \"Run a PowerShell command in the working directory (builds, tests, git, scripts) and get its output and exit code. Not for interactive programs.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout_s\": {\"type\": \"integer\", \"description\": \"seconds before it is stopped, default 120, at most 1800\"}}, \"required\": [\"command\"]}}}"
 #define T_RUN_SH "{\"type\": \"function\", \"function\": {\"name\": \"run\", \"description\": \"Run a bash command (Git Bash) in the working directory (builds, tests, git, scripts) and get its output and exit code. Not for interactive programs.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout_s\": {\"type\": \"integer\", \"description\": \"seconds before it is stopped, default 120, at most 1800\"}}, \"required\": [\"command\"]}}}"
 
-#define T_PLAN  "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"PowerShell command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
-#define T_PLAN_SH "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"bash command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
+#define T_PLAN  "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan or to show progress: begin a step with [x] when done, [>] while doing it.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"PowerShell command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
+#define T_PLAN_SH "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan or to show progress: begin a step with [x] when done, [>] while doing it.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"bash command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
 #define T_TEST  "{\"type\": \"function\", \"function\": {\"name\": \"test\", \"description\": \"Run the plan's test command (or command, when given) and tell whether it passes (exit code 0), with its output. Call it after every change.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"another test command; default the plan's\"}}, \"required\": []}}}"
+#define T_QUESTION "{\"type\": \"function\", \"function\": {\"name\": \"question\", \"description\": \"Ask the user a question and wait for the answer: only when a decision is theirs and the request, the code and sensible defaults do not settle it (which of two behaviours they want, a name, a missing value). Give the likely answers as options, the recommended one first.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"question\": {\"type\": \"string\"}, \"options\": {\"type\": \"string\", \"description\": \"the answers to choose from, one per line (at most 9); the user may also write another\"}}, \"required\": [\"question\"]}}}"
+#define T_PATCH "{\"type\": \"function\", \"function\": {\"name\": \"apply_patch\", \"description\": \"Change several places or files in one call, all or nothing. The patch: *** Begin Patch, then per file *** Update File: path (hunks: a line @@ or @@ followed by a line just before the change, then lines starting with a space for unchanged context, - for removed, + for added; 3 context lines around each change), *** Add File: path (every line starting with +), or *** Delete File: path; *** Move to: new path after an Update renames; *** End Patch.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"patch\": {\"type\": \"string\"}}, \"required\": [\"patch\"]}}}"
 #define T_WEB   "{\"type\": \"function\", \"function\": {\"name\": \"webfetch\", \"description\": \"Fetch a web page (http or https URL) and read it as text: documentation, an API reference, an issue, a changelog. The user approves each fetch unless approval is automatic.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"url\": {\"type\": \"string\"}}, \"required\": [\"url\"]}}}"
 #define T_SKILL "{\"type\": \"function\", \"function\": {\"name\": \"skill\", \"description\": \"Load a skill listed in the instructions (or found by skill_search): its steps for a kind of task, to follow. name as listed (plugin:name when given so). file reads another file of the skill's folder.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, \"file\": {\"type\": \"string\"}}, \"required\": [\"name\"]}}}"
 #define T_SEARCH "{\"type\": \"function\", \"function\": {\"name\": \"skill_search\", \"description\": \"Find skills that are not in the list of the instructions: give a few English words of the task (for example: security audit, slides, react performance), even when the user writes in another language; it returns matching skills to load with skill.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}}"
@@ -398,25 +431,26 @@ const char *lc_tools_json(int level)
     const int sh = lc_tools_shell();
     Str *s = level <= 1 ? &l1[sh] : &l2[sh];
     if (s->p) return s->p;
-    s_str(s, T_READ "\n" T_LIST "\n" T_GLOB "\n" T_GREP "\n" T_WEB);
-    if (level >= 2) s_str(s, sh ? "\n" T_WRITE "\n" T_EDIT "\n" T_RUN "\n" T_PLAN "\n" T_TEST
-                                : "\n" T_WRITE "\n" T_EDIT "\n" T_RUN_SH "\n" T_PLAN_SH "\n" T_TEST);
+    s_str(s, T_READ "\n" T_LIST "\n" T_GLOB "\n" T_GREP "\n" T_WEB "\n" T_QUESTION);
+    if (level >= 2) s_str(s, sh ? "\n" T_WRITE "\n" T_EDIT "\n" T_PATCH "\n" T_RUN "\n" T_PLAN "\n" T_TEST
+                                : "\n" T_WRITE "\n" T_EDIT "\n" T_PATCH "\n" T_RUN_SH "\n" T_PLAN_SH "\n" T_TEST);
     if (*lc_skills_block()) s_str(s, "\n" T_SKILL "\n" T_SEARCH);   /* only where there are skills */
     return s->p;
 }
 
 int lc_tool_allowed(const char *name, int level)
 {
-    static const char *reading[] = { "read_file", "list_dir", "glob", "grep", "skill", "skill_search", "webfetch" };
-    static const char *all[] = { "write_file", "edit_file", "run", "plan", "test" };
-    for (int i = 0; i < 7; i++) if (!strcmp(name, reading[i])) return level >= 1;
-    for (int i = 0; i < 5; i++) if (!strcmp(name, all[i])) return level >= 2;
+    static const char *reading[] = { "read_file", "list_dir", "glob", "grep", "skill", "skill_search", "webfetch", "question" };
+    static const char *all[] = { "write_file", "edit_file", "apply_patch", "run", "plan", "test" };
+    for (int i = 0; i < 8; i++) if (!strcmp(name, reading[i])) return level >= 1;
+    for (int i = 0; i < 6; i++) if (!strcmp(name, all[i])) return level >= 2;
     return 0;
 }
 
 int lc_tool_needs_approval(const char *name)
 {
-    return !strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "run") || !strcmp(name, "test") ||
+    return !strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "apply_patch") || !strcmp(name, "run") ||
+           !strcmp(name, "test") ||
            !strcmp(name, "webfetch");                /* it goes out to the network */
 }
 
@@ -429,6 +463,20 @@ void lc_tool_title(const LcCall *c, char *buf, size_t cap)
     else if (!strcmp(c->name, "skill_search")) a = lc_call_arg(c, "query");
     else if (!strcmp(c->name, "webfetch")) a = lc_call_arg(c, "url");
     else if (!strcmp(c->name, "plan")) a = "";
+    else if (!strcmp(c->name, "question")) a = lc_call_arg(c, "question");
+    char files[300] = "";
+    if (!strcmp(c->name, "apply_patch")) {        /* the files it names */
+        const char *p = lc_call_arg(c, "patch");
+        for (; p && (p = strstr(p, "*** ")); p += 4) {
+            const char *q = !strncmp(p, "*** Add File:", 13) ? p + 13 : !strncmp(p, "*** Update File:", 16) ? p + 16 :
+                            !strncmp(p, "*** Delete File:", 16) ? p + 16 : NULL;
+            if (!q) continue;
+            while (*q == ' ') q++;
+            const size_t k = strcspn(q, "\r\n"), fl = strlen(files);
+            if (fl < sizeof files - 8) snprintf(files + fl, sizeof files - fl, "%s%.*s", fl ? ", " : "", (int)k, q);
+        }
+        a = files;
+    }
     char one[300];
     snprintf(one, sizeof one, "%s", a ? a : "");
     for (char *p = one; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
@@ -513,6 +561,8 @@ static Ent *read_dir(const char *dir, int *n)
             v[k].name = narrow(fd.cFileName);
             v[k].dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             v[k].size = ((long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            v[k].mtime = (long long)((((unsigned long long)fd.ftLastWriteTime.dwHighDateTime << 32) |
+                                      fd.ftLastWriteTime.dwLowDateTime) / 10000000ULL);
             if (v[k].name) k++;
         } while (FindNextFileW(h, &fd));
         FindClose(h);
@@ -529,6 +579,7 @@ static Ent *read_dir(const char *dir, int *n)
         v[k].name = dup_str(de->d_name);
         v[k].dir = !stat(full, &st) && S_ISDIR(st.st_mode);
         v[k].size = v[k].dir ? 0 : (long long)st.st_size;
+        v[k].mtime = (long long)st.st_mtime;
         if (v[k].name) k++;
     }
     if (d) closedir(d);
@@ -632,12 +683,17 @@ static int match_path(const char *pat, const char *path)
     return match_path(ps + 1, ss + 1);
 }
 
+typedef struct { char *rel; long long mtime; } Hit;
+
 typedef struct {
     const char *pattern;      /* glob: the path pattern; grep: the name filter or NULL */
     const char *needle;       /* grep: the text */
     int         icase;
     Str        *out;
     int         found, files, cap_hit;
+    LcRegex    *re;           /* grep: the regular expression, or NULL for the literal text */
+    Hit        *hits;         /* glob: the files found, ordered once the walk is done */
+    int         nhits, chits;
 } Walk;
 
 static void grep_file(Walk *w, const char *abs, const char *rel);
@@ -659,11 +715,27 @@ static void walk(Walk *w, const char *dir, const char *rel, int depth)
         } else if (w->needle) {
             if (!w->pattern || match_name(w->pattern, v[i].name)) grep_file(w, abs, r);
         } else if (match_path(w->pattern, r)) {
-            s_fmt(w->out, "%s\n", r);
-            if (++w->found >= LIST_CAP) w->cap_hit = 1;
+            if (w->nhits == w->chits) {
+                const int c = w->chits ? w->chits * 2 : 64;
+                Hit *g = (Hit *)realloc(w->hits, (size_t)c * sizeof *g);
+                if (!g) { w->cap_hit = 1; break; }
+                w->hits = g;
+                w->chits = c;
+            }
+            w->hits[w->nhits].rel = dup_str(r);
+            w->hits[w->nhits].mtime = v[i].mtime;
+            if (w->hits[w->nhits].rel) w->nhits++;
+            if (++w->found >= GLOB_SCAN) w->cap_hit = 1;
         }
     }
     ents_free(v, n);
+}
+
+static int hit_cmp(const void *a, const void *b)
+{
+    const Hit *x = (const Hit *)a, *y = (const Hit *)b;
+    if (x->mtime != y->mtime) return x->mtime > y->mtime ? -1 : 1;
+    return strcmp(x->rel, y->rel);
 }
 
 static char *t_glob(const LcCall *c, char *sum, size_t sc, int *ok)
@@ -690,10 +762,21 @@ static char *t_glob(const LcCall *c, char *sum, size_t sc, int *ok)
     char dir[4096], why[600];
     if (resolve(*base ? base : ".", dir, sizeof dir, why, sizeof why)) { snprintf(sum, sc, "%s", why); return dup_str(why); }
     Str s = { 0 };
-    Walk w = { start, NULL, 0, &s, 0, 0, 0 };
+    Walk w;
+    memset(&w, 0, sizeof w);
+    w.pattern = start;
+    w.out = &s;
     walk(&w, dir, base, 0);
+    /* the newest first (what was just being worked on), then by path */
+    qsort(w.hits, (size_t)w.nhits, sizeof *w.hits, hit_cmp);
+    for (int i = 0; i < w.nhits; i++) {
+        if (i < LIST_CAP) s_fmt(&s, "%s\n", w.hits[i].rel);
+        free(w.hits[i].rel);
+    }
+    free(w.hits);
     if (!w.found) s_fmt(&s, "no file matches %s\n", pat);
-    if (w.cap_hit) s_fmt(&s, "[stopped at %d files; narrow the pattern]\n", LIST_CAP);
+    if (w.cap_hit) s_fmt(&s, "[stopped after %d files; narrow the pattern]\n", GLOB_SCAN);
+    else if (w.nhits > LIST_CAP) s_fmt(&s, "[%d more files, older; narrow the pattern]\n", w.nhits - LIST_CAP);
     snprintf(sum, sc, "%s · %d file%s", pat, w.found, w.found == 1 ? "" : "s");
     *ok = 1;
     return capped(&s);
@@ -719,6 +802,35 @@ static const char *find_text(const char *hay, size_t n, const char *needle, size
     return NULL;
 }
 
+static int utf8_valid(const char *s, long n)
+{
+    const unsigned char *p = (const unsigned char *)s, *e = p + n;
+    while (p < e) {
+        const int c = *p;
+        const int len = c < 0x80 ? 1 : c >= 0xC2 && c <= 0xDF ? 2 : c >= 0xE0 && c <= 0xEF ? 3 : c >= 0xF0 && c <= 0xF4 ? 4 : 0;
+        if (!len || p + len > e) return 0;
+        for (int k = 1; k < len; k++) if ((p[k] & 0xC0) != 0x80) return 0;
+        p += len;
+    }
+    return 1;
+}
+
+/* each byte of s as the code point of the same number (Latin-1), in UTF-8; *n the new length */
+static char *latin1_to_utf8(const char *s, long *n)
+{
+    char *u = (char *)malloc((size_t)*n * 2 + 1);
+    if (!u) return NULL;
+    long k = 0;
+    for (long i = 0; i < *n; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) u[k++] = (char)c;
+        else { u[k++] = (char)(0xC0 | c >> 6); u[k++] = (char)(0x80 | (c & 63)); }
+    }
+    u[k] = 0;
+    *n = k;
+    return u;
+}
+
 static void grep_file(Walk *w, const char *abs, const char *rel)
 {
     long n = 0;
@@ -727,6 +839,10 @@ static void grep_file(Walk *w, const char *abs, const char *rel)
     if (!b) return;
     if (n > (2 << 20) || is_binary(b, n)) { free(b); return; }
     w->files++;
+    if (!utf8_valid(b, n)) {                       /* a Latin-1 / Windows-1252 file: read as UTF-8 */
+        char *u = latin1_to_utf8(b, &n);
+        if (u) { free(b); b = u; }
+    }
     const size_t m = strlen(w->needle);
     int line = 1;
     const char *p = b, *end = b + n;
@@ -734,7 +850,7 @@ static void grep_file(Walk *w, const char *abs, const char *rel)
         const char *q = memchr(p, '\n', (size_t)(end - p));
         size_t len = (size_t)((q ? q : end) - p);
         if (len && p[len - 1] == '\r') len--;
-        if (find_text(p, len, w->needle, m, w->icase)) {
+        if (w->re ? lc_regex_search(w->re, p, len) : find_text(p, len, w->needle, m, w->icase) != NULL) {
             s_fmt(w->out, "%s:%d: ", rel, line);
             s_add(w->out, p, len > 240 ? 240 : len);
             s_str(w->out, len > 240 ? " [...]\n" : "\n");
@@ -753,8 +869,18 @@ static char *t_grep(const LcCall *c, char *sum, size_t sc, int *ok)
     char path[4096], why[600], rel[1024];
     if (resolve(lc_call_arg(c, "path"), path, sizeof path, why, sizeof why)) { snprintf(sum, sc, "%s", why); return dup_str(why); }
     Str s = { 0 };
-    Walk w = { lc_call_arg(c, "glob"), needle, arg_bool(c, "ignore_case"), &s, 0, 0, 0 };
+    Walk w;
+    memset(&w, 0, sizeof w);
+    w.pattern = lc_call_arg(c, "glob");
+    w.needle = needle;
+    w.icase = arg_bool(c, "ignore_case");
+    w.out = &s;
     if (w.pattern && !*w.pattern) w.pattern = NULL;
+    if (!arg_bool(c, "literal")) {
+        char err[200];
+        w.re = lc_regex_new(needle, w.icase, err, sizeof err);
+        if (!w.re) s_fmt(&s, "(\"%s\" is not a regular expression this grep takes: %s; searched as literal text)\n", needle, err);
+    }
     rel_of(path, rel, sizeof rel);
     int n = 0;
     Ent *probe = read_dir(path, &n);
@@ -763,6 +889,7 @@ static char *t_grep(const LcCall *c, char *sum, size_t sc, int *ok)
     if (probe) ents_free(probe, n);
     if (!w.found) s_fmt(&s, "no match for \"%s\" in %d file%s\n", needle, w.files, w.files == 1 ? "" : "s");
     if (w.cap_hit) s_fmt(&s, "[stopped at %d matches; narrow the search]\n", GREP_CAP);
+    lc_regex_free(w.re);
     snprintf(sum, sc, "%d match%s in %d file%s", w.found, w.found == 1 ? "" : "es", w.files, w.files == 1 ? "" : "s");
     *ok = 1;
     return capped(&s);
@@ -843,6 +970,271 @@ static char *t_edit(const LcCall *c, char *sum, size_t sc, int *ok)
     free(nw.p);
     free(b);
     return res;
+}
+
+/* --------------------------------------------------------------- apply_patch ---- */
+/* opencode's (and Codex's) patch format: several files changed, added, deleted or moved in one call,
+ * all or nothing: every hunk is located before the first file is written.
+ *     *** Begin Patch
+ *     *** Add File: path            then its lines, each after +
+ *     *** Delete File: path
+ *     *** Update File: path         [*** Move to: new path]
+ *     @@ [a line that comes before the hunk, to find it]
+ *      context line / -removed line / +added line
+ *     *** End Patch
+ * A hunk's lines are found from where the previous one ended: exactly, then ignoring the spaces at
+ * the ends of lines, then ignoring the spaces at both ends. */
+
+typedef struct { const char *p; size_t n; } Ln;
+
+typedef struct {
+    int    op;               /* 'A' add, 'D' delete, 'U' update */
+    char   path[1024], to[1024];
+    char  *text;             /* the new content (add, update) */
+    size_t len;
+    int    crlf;
+} PFile;
+
+static int split_lines(const char *s, size_t n, Ln **out)
+{
+    int cap = 64, k = 0;
+    Ln *v = (Ln *)malloc((size_t)cap * sizeof *v);
+    if (!v) return -1;
+    for (size_t i = 0; i < n;) {
+        size_t j = i;
+        while (j < n && s[j] != '\n') j++;
+        size_t len = j - i;
+        if (len && s[i + len - 1] == '\r') len--;
+        if (k == cap) { Ln *g = (Ln *)realloc(v, (size_t)(cap *= 2) * sizeof *v); if (!g) { free(v); return -1; } v = g; }
+        v[k].p = s + i;
+        v[k].n = len;
+        k++;
+        i = j + 1;
+    }
+    *out = v;
+    return k;
+}
+
+/* a line equal to another at a level: 0 exactly, 1 but for the spaces at its end, 2 at both ends */
+static int line_eq(Ln a, Ln b, int level)
+{
+    if (level >= 1) {
+        while (a.n && (a.p[a.n - 1] == ' ' || a.p[a.n - 1] == '\t')) a.n--;
+        while (b.n && (b.p[b.n - 1] == ' ' || b.p[b.n - 1] == '\t')) b.n--;
+    }
+    if (level >= 2) {
+        while (a.n && (*a.p == ' ' || *a.p == '\t')) a.p++, a.n--;
+        while (b.n && (*b.p == ' ' || *b.p == '\t')) b.p++, b.n--;
+    }
+    return a.n == b.n && !memcmp(a.p, b.p, a.n);
+}
+
+/* where old[0..m) first appears in f[from..n), or -1 */
+static int find_lines(const Ln *f, int n, int from, const Ln *old, int m)
+{
+    for (int level = 0; level < 3; level++)
+        for (int i = from; i + m <= n; i++) {
+            int j = 0;
+            while (j < m && line_eq(f[i + j], old[j], level)) j++;
+            if (j == m) return i;
+        }
+    return -1;
+}
+
+static int starts(Ln l, const char *pfx)
+{
+    const size_t k = strlen(pfx);
+    return l.n >= k && !memcmp(l.p, pfx, k);
+}
+
+static void ln_copy(char *dst, size_t cap, Ln l, size_t skip)
+{
+    size_t n = l.n > skip ? l.n - skip : 0;
+    const char *p = l.p + skip;
+    while (n && (*p == ' ' || *p == '\t')) p++, n--;
+    while (n && (p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, p, n);
+    dst[n] = 0;
+}
+
+/* the hunks of one Update (lines h[0..nh)) applied to the file's text; NULL and why on failure */
+static char *patch_update(const char *rel, const char *body, size_t blen, const Ln *h, int nh, size_t *olen, Str *why)
+{
+    Ln *f = NULL;
+    const int nf = split_lines(body, blen, &f);
+    if (nf < 0) { s_str(why, "out of memory"); return NULL; }
+    const int crlf = strstr(body, "\r\n") != NULL;
+    const int had_nl = blen && body[blen - 1] == '\n';
+    Str out = { 0 };
+    int cur = 0, i = 0, hunk = 0, bad = 0;
+    Ln *old = (Ln *)malloc((size_t)(nh + 1) * sizeof *old), *neu = (Ln *)malloc((size_t)(nh + 1) * sizeof *neu);
+    if (!old || !neu) { s_str(why, "out of memory"); bad = 1; }
+    while (!bad && i < nh) {
+        int from = cur;
+        hunk++;
+        if (starts(h[i], "@@")) {                  /* the header: a line to find first */
+            char head[600];
+            ln_copy(head, sizeof head, h[i], 2);
+            i++;
+            if (*head) {
+                const Ln hl = { head, strlen(head) };
+                const int at = find_lines(f, nf, from, &hl, 1);
+                if (at >= 0) from = at + 1;        /* not found: the hunk's own lines still decide */
+            }
+        }
+        int no = 0, nn = 0;
+        while (i < nh && !starts(h[i], "@@")) {
+            Ln l = h[i++];
+            if (starts(l, "*** End of File")) continue;
+            const char c = l.n ? l.p[0] : ' ';
+            Ln t = l;
+            if (c == ' ' || c == '-' || c == '+') { t.p++; t.n--; }
+            if (!l.n) t.n = 0;
+            if (c == '-') old[no++] = t;
+            else if (c == '+') neu[nn++] = t;
+            else { old[no++] = t; neu[nn++] = t; }   /* context (a missing space taken as one) */
+        }
+        int at;
+        if (!no) at = from > cur ? from : nf;      /* only additions: after the header, or at the end */
+        else at = find_lines(f, nf, from, old, no);
+        if (at < 0 && from > cur) at = find_lines(f, nf, cur, old, no);
+        if (at < 0) {
+            s_fmt(why, "%s: hunk %d not found; its lines (context and -) must be in the file as it is now:\n", rel, hunk);
+            for (int k = 0; k < no && k < 12; k++) { s_str(why, "  "); s_add(why, old[k].p, old[k].n); s_str(why, "\n"); }
+            bad = 1;
+            break;
+        }
+        for (int k = cur; k < at; k++) { s_add(&out, f[k].p, f[k].n); s_str(&out, crlf ? "\r\n" : "\n"); }
+        for (int k = 0; k < nn; k++) { s_add(&out, neu[k].p, neu[k].n); s_str(&out, crlf ? "\r\n" : "\n"); }
+        cur = at + no;
+    }
+    if (!bad) {
+        for (int k = cur; k < nf; k++) { s_add(&out, f[k].p, f[k].n); s_str(&out, crlf ? "\r\n" : "\n"); }
+        if (!had_nl && out.n) out.n -= crlf ? 2 : 1, out.p[out.n] = 0;   /* as the file ended */
+    }
+    free(old);
+    free(neu);
+    free(f);
+    if (bad) { free(out.p); return NULL; }
+    *olen = out.n;
+    return out.p ? out.p : dup_str("");
+}
+
+static char *t_patch(const LcCall *c, char *sum, size_t sc, int *ok)
+{
+    const char *text = lc_call_arg(c, "patch");
+    if (!text || !*text) { snprintf(sum, sc, "apply_patch: no patch"); return dup_str("apply_patch needs patch"); }
+    Ln *l = NULL;
+    const int nl = split_lines(text, strlen(text), &l);
+    if (nl < 0) return dup_str("out of memory");
+    PFile files[64];
+    int nfiles = 0;
+    Str why = { 0 };
+    int i = 0;
+    while (i < nl && !starts(l[i], "*** Begin Patch")) i++;
+    if (i == nl) i = 0;                            /* no Begin line: taken as if it were there */
+    else i++;
+    while (i < nl && !why.n) {
+        Ln x = l[i];
+        if (starts(x, "*** End Patch")) break;
+        if (!x.n || (x.n == 1 && x.p[0] == ' ')) { i++; continue; }
+        int op = starts(x, "*** Add File:") ? 'A' : starts(x, "*** Delete File:") ? 'D' : starts(x, "*** Update File:") ? 'U' : 0;
+        if (!op) { s_fmt(&why, "line %d: expected *** Add File:, *** Update File: or *** Delete File:, not: %.*s\n", i + 1, (int)(x.n > 120 ? 120 : x.n), x.p); break; }
+        if (nfiles == 64) { s_str(&why, "more than 64 files in one patch; split it\n"); break; }
+        PFile *pf = &files[nfiles];
+        memset(pf, 0, sizeof *pf);
+        pf->op = op;
+        ln_copy(pf->path, sizeof pf->path, x, op == 'A' ? 13 : op == 'D' ? 16 : 16);
+        i++;
+        char abs[4096], w[600], rel[1024];
+        if (resolve(pf->path, abs, sizeof abs, w, sizeof w)) { s_fmt(&why, "%s\n", w); break; }
+        rel_of(abs, rel, sizeof rel);
+        snprintf(pf->path, sizeof pf->path, "%s", rel);
+        int twice = 0;
+        for (int k = 0; k < nfiles; k++) twice |= !strcmp(files[k].path, rel);
+        if (twice) { s_fmt(&why, "%s appears twice; put all of its hunks under one *** Update File:\n", rel); break; }
+        if (op == 'A') {
+            Str body = { 0 };
+            while (i < nl && !starts(l[i], "*** ")) {
+                Ln t = l[i++];
+                if (t.n && t.p[0] == '+') { t.p++; t.n--; }
+                s_add(&body, t.p, t.n);
+                s_str(&body, "\n");
+            }
+            FILE *e = open_file(abs, "rb");
+            if (e) { fclose(e); s_fmt(&why, "%s already exists; use *** Update File: to change it\n", rel); free(body.p); break; }
+            pf->text = body.p ? body.p : dup_str("");
+            pf->len = body.n;
+        } else {
+            long n = 0;
+            const char *err = NULL;
+            char *b = slurp(abs, &n, &err);
+            if (!b) { s_fmt(&why, "%s: %s\n", rel, err); break; }
+            if (op == 'U') {
+                if (i < nl && starts(l[i], "*** Move to:")) {
+                    char to[1024], ta[4096];
+                    ln_copy(to, sizeof to, l[i], 12);
+                    i++;
+                    if (resolve(to, ta, sizeof ta, w, sizeof w)) { s_fmt(&why, "%s\n", w); free(b); break; }
+                    rel_of(ta, pf->to, sizeof pf->to);
+                }
+                const int h0 = i;
+                while (i < nl && !(starts(l[i], "*** ") && !starts(l[i], "*** End of File"))) i++;
+                pf->text = patch_update(rel, b, (size_t)n, l + h0, i - h0, &pf->len, &why);
+                if (!pf->text) { free(b); break; }
+            }
+            free(b);
+        }
+        nfiles++;
+    }
+    if (!why.n && !nfiles) s_str(&why, "the patch changes no file\n");
+    Str r = { 0 };
+    if (why.n) {
+        s_str(&r, "the patch was not applied (no file changed):\n");
+        s_add(&r, why.p, why.n);
+        snprintf(sum, sc, "apply_patch: not applied");
+    } else {
+        int written = 0;
+        char line[200] = "";
+        for (int k = 0; k < nfiles; k++) {
+            PFile *pf = &files[k];
+            char abs[4096], w[600];
+            resolve(pf->to[0] ? pf->to : pf->path, abs, sizeof abs, w, sizeof w);
+            if (pf->op == 'D') {
+                char src[4096];
+                resolve(pf->path, src, sizeof src, w, sizeof w);
+#ifdef _WIN32
+                wchar_t *ws = wide(src);
+                const int gone = ws && DeleteFileW(ws);
+                free(ws);
+#else
+                const int gone = unlink(src) == 0;
+#endif
+                s_fmt(&r, "%s %s\n", gone ? "deleted" : "could not delete", pf->path);
+            } else if (write_all(abs, pf->text, pf->len)) {
+                s_fmt(&r, "could not write %s\n", pf->to[0] ? pf->to : pf->path);
+            } else {
+                if (pf->to[0]) {
+                    char src[4096];
+                    resolve(pf->path, src, sizeof src, w, sizeof w);
+                    remove(src);
+                    s_fmt(&r, "updated %s, moved to %s\n", pf->path, pf->to);
+                } else {
+                    s_fmt(&r, "%s %s\n", pf->op == 'A' ? "added" : "updated", pf->path);
+                }
+                written++;
+            }
+            const size_t ll = strlen(line);
+            if (ll < 120) snprintf(line + ll, sizeof line - ll, "%s%c %s", k ? ", " : "", pf->op == 'U' ? 'M' : pf->op, pf->path);
+        }
+        snprintf(sum, sc, "%s", line);
+        *ok = 1;
+    }
+    for (int k = 0; k < nfiles; k++) free(files[k].text);
+    free(why.p);
+    free(l);
+    return r.p ? r.p : dup_str("");
 }
 
 /* ------------------------------------------------------------------------ run ---- */
@@ -1106,6 +1498,7 @@ char *lc_tool_run(const LcCall *c, volatile int *stop, char *summary, size_t sca
     if (!strcmp(c->name, "grep"))       return t_grep(c, summary, scap, ok);
     if (!strcmp(c->name, "write_file")) return t_write(c, summary, scap, ok);
     if (!strcmp(c->name, "edit_file"))  return t_edit(c, summary, scap, ok);
+    if (!strcmp(c->name, "apply_patch")) return t_patch(c, summary, scap, ok);
     if (!strcmp(c->name, "run"))        return t_run(c, stop, summary, scap, ok);
     snprintf(summary, scap, "unknown tool %s", c->name);
     return dup_fmt("there is no tool named %s", c->name);

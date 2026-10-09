@@ -15,6 +15,7 @@
 #include "glm53f_portable_io.h"
 
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,7 @@
 #include "lc_tools.h"
 #include "lc_plugins.h"
 #include "lc_mods.h"
+#include "lc_perm.h"
 #include "lc_snap.h"
 
 static double now_s(void)
@@ -163,6 +165,8 @@ const Glm53fCommand glm53f_commands[] = {
     { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
     { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 2 },
     { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
+    { "/mode",      "plan|build",      "plan: the agent investigates and proposes, changing nothing; build: it carries out (Tab switches)", 2 },
+    { "/permissions", "",              "the allow / ask / deny rules (opencode.json, .claude/settings.json, .localcode/settings.json)", 0 },
     { "/undo",      "",                "put the files back as they were before the agent's last turn (its commands' changes too)", 0 },
     { "/redo",      "",                "put back what /undo took away", 0 },
     { "/init",      "[FOCUS]",         "the agent studies this project and writes its rules in AGENTS.md (read by every conversation here)", 1 },
@@ -213,6 +217,7 @@ void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char
     if (!strcmp(n, "/reasoning"))     snprintf(buf, cap, "%s", s->reasoning);
     else if (!strcmp(n, "/level"))    snprintf(buf, cap, "%s", s->agent_level == 2 ? "2 agent" : s->agent_level == 1 ? "1 quick" : "0 chat");
     else if (!strcmp(n, "/approve"))  snprintf(buf, cap, "%s", s->auto_approve ? "auto" : "ask");
+    else if (!strcmp(n, "/mode"))     snprintf(buf, cap, "%s", s->plan_mode ? "plan" : "build");
     else if (!strcmp(n, "/auto"))     snprintf(buf, cap, "%s", s->autonomous ? "on" : "off");
     else if (!strcmp(n, "/gen"))      snprintf(buf, cap, "%d", s->gen);
     else if (!strcmp(n, "/temp"))     snprintf(buf, cap, s->smp.temp > 0.0f ? "%.2g" : "0 greedy", s->smp.temp);
@@ -339,6 +344,87 @@ void glm53f_chat_input_free(Glm53fInput *in)
     memset(in, 0, sizeof *in);
 }
 
+/* A message's @mentions of files (@src/main.c, as opencode takes them): each existing text file's
+ * text after the message, in <file path="..."> blocks; NULL when it names none. *note lists them. */
+#define MENTION_FILE  (256 * 1024)
+#define MENTION_TOTAL (512 * 1024)
+
+typedef struct { char *p; size_t n, cap; } Str;
+
+static void s_add(Str *s, const char *p, size_t n)
+{
+    if (s->n + n + 1 > s->cap) {
+        size_t c = s->cap ? s->cap : 256;
+        while (c < s->n + n + 1) c *= 2;
+        char *g = (char *)realloc(s->p, c);
+        if (!g) return;
+        s->p = g;
+        s->cap = c;
+    }
+    memcpy(s->p + s->n, p, n);
+    s->n += n;
+    s->p[s->n] = 0;
+}
+
+static void s_str(Str *s, const char *p) { s_add(s, p, strlen(p)); }
+
+static void s_fmt(Str *s, const char *fmt, ...)
+{
+    char b[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    const int k = vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    if (k > 0) s_add(s, b, (size_t)k < sizeof b ? (size_t)k : sizeof b - 1);
+}
+
+static char *mentions(const char *line, char **note)
+{
+    Str out = { 0 }, nt = { 0 };
+    size_t total = 0;
+    int n = 0;
+    for (const char *p = line; (p = strchr(p, '@')) != NULL; p++) {
+        if (p > line && p[-1] != ' ' && p[-1] != '\t' && p[-1] != '\n' && p[-1] != '(') continue;
+        size_t k = 0;
+        while (p[1 + k] && p[1 + k] != ' ' && p[1 + k] != '\t' && p[1 + k] != '\n') k++;
+        char rel[1024], path[4400];
+        for (int trim = 0; trim < 3 && k; trim++) {      /* "@a.py," "@a.py)" "@a.py?": the punctuation is not the name */
+            snprintf(rel, sizeof rel, "%.*s", (int)k, p + 1);
+            snprintf(path, sizeof path, "%s/%s", lc_tools_root(), rel);
+            FILE *f = fopen(path, "rb");
+            if (f) { fclose(f); break; }
+            if (strchr(",.;:)?!'\"", p[k])) k--;
+            else { k = 0; break; }
+        }
+        if (!k) continue;
+        long flen = 0;
+        char *content = read_file(path, &flen);
+        if (!content) continue;                          /* a folder, or unreadable */
+        int bin = 0;
+        for (long i = 0; i < flen && i < 8000; i++) if (!content[i]) bin = 1;
+        if (bin || flen > MENTION_FILE || total + (size_t)flen > MENTION_TOTAL) {
+            s_fmt(&nt, "%s@%s not attached (%s)", n++ ? " · " : "", rel, bin ? "binary" : "too large");
+            free(content);
+            continue;
+        }
+        int lines = flen ? 1 : 0;
+        for (long i = 0; i + 1 < flen; i++) lines += content[i] == '\n';
+        s_fmt(&out, "\n\n<file path=\"%s\">\n", rel);
+        s_add(&out, content, (size_t)flen);
+        s_str(&out, flen && content[flen - 1] == '\n' ? "</file>" : "\n</file>");
+        s_fmt(&nt, "%s📎 %s · %d line%s", n++ ? " · " : "", rel, lines, lines == 1 ? "" : "s");
+        total += (size_t)flen;
+        free(content);
+    }
+    *note = nt.p;
+    if (!out.p) return NULL;
+    Str msg = { 0 };
+    s_str(&msg, line);
+    s_add(&msg, out.p, out.n);
+    free(out.p);
+    return msg.p;
+}
+
 void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
 {
     memset(in, 0, sizeof *in);
@@ -354,8 +440,10 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
 
     if (line[0] != '/') {
         in->kind = GLM53F_IN_MESSAGE;
-        in->prompt = line;
         in->shown = dup_str(line);
+        char *with = strchr(line, '@') ? mentions(line, &in->note) : NULL;
+        if (with) { free(line); line = with; }
+        in->prompt = line;
         return;
     }
     in->kind = GLM53F_IN_NOTE;
@@ -456,6 +544,15 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
                                            : "writes and commands ask first");
     } else if (!strncmp(line, "/approve", 8)) {
         in->note = dup_str("/approve takes ask or auto");
+    } else if (!strcmp(line, "/mode plan") || !strcmp(line, "/mode build")) {
+        s->plan_mode = line[6] == 'p';
+        in->note = dup_str(s->plan_mode ? "plan mode: the agent investigates and proposes a plan, it changes no file (Tab or /mode build to carry it out)"
+                                        : "build mode: the agent changes files and runs commands");
+    } else if (!strncmp(line, "/mode", 5)) {
+        in->note = dup_str(s->plan_mode ? "plan mode (/mode build to change files)" : "build mode (/mode plan to only plan)");
+    } else if (!strcmp(line, "/permissions")) {
+        lc_perm_load(lc_tools_root());
+        in->note = lc_perm_list();
     } else if (!strcmp(line, "/undo") || !strcmp(line, "/redo")) {
         int changed = 0;
         in->note = line[1] == 'u' ? lc_snap_undo(&changed) : lc_snap_redo(&changed);
@@ -847,6 +944,36 @@ static int read_line(char *buf, int cap)
     return (int)strlen(buf);
 }
 
+/* the agent's question: the options numbered; a number picks one, other text is the answer */
+static char *plain_question(Glm53fTurnSink *k, const char *question, const char *options)
+{
+    (void)k;
+    const char *opt[9];
+    size_t len[9];
+    int n = 0;
+    printf("\n  ? %s\n", question);
+    for (const char *p = options ? options : ""; *p && n < 9;) {
+        const size_t l = strcspn(p, "\n");
+        if (l) { opt[n] = p; len[n] = l; n++; printf("    %d. %.*s\n", n, (int)l, p); }
+        p += l;
+        if (*p) p++;
+    }
+    printf(n ? "  a number, or your answer: " : "  your answer: ");
+    fflush(stdout);
+    char a[4096];
+    if (read_line(a, sizeof a) < 0) return NULL;
+    size_t al = strlen(a);
+    while (al && (a[al - 1] == '\r' || a[al - 1] == '\n' || a[al - 1] == ' ')) a[--al] = 0;
+    if (!a[0] || a[0] == '/') return NULL;
+    if (n && a[0] >= '1' && a[0] <= '0' + n && !a[1]) {
+        const int i = a[0] - '1';
+        char *r = (char *)malloc(len[i] + 1);
+        if (r) { memcpy(r, opt[i], len[i]); r[len[i]] = 0; }
+        return r;
+    }
+    return dup_str(a);
+}
+
 /* A mod's pane while it holds a call (plain front end): drawn once, answered by a line (a button's
  * hotkey or the start of its label; an empty line or the end of the input stops what waits). */
 static void plain_mod_pump(void)
@@ -896,7 +1023,7 @@ static int plain_run(Glm53fChat *s)
     if (s->start_note) printf("  %s\n", s->start_note);
     int rc = 0, shown = 0;
     Glm53fTurnSink k = { plain_status, plain_reasoning, plain_thought, plain_answer, plain_done, &shown, plain_tool, plain_approve,
-                         plain_mod_pump };
+                         plain_mod_pump, plain_question };
     for (;;) {
         printf("\n> ");
         fflush(stdout);

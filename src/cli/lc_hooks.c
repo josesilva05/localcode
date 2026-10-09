@@ -527,7 +527,7 @@ void lc_hook_out_free(LcHookOut *o)
 const char *lc_hook_tool_name(const char *t)
 {
     static const char *map[][2] = { { "run", "Bash" }, { "test", "Bash" }, { "read_file", "Read" }, { "write_file", "Write" },
-                                    { "edit_file", "Edit" }, { "glob", "Glob" }, { "grep", "Grep" }, { "list_dir", "LS" },
+                                    { "edit_file", "Edit" }, { "apply_patch", "MultiEdit" }, { "glob", "Glob" }, { "grep", "Grep" }, { "list_dir", "LS" },
                                     { "skill", "Skill" }, { "plan", "TodoWrite" } };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++) if (!strcmp(t, map[i][0])) return map[i][1];
     return t;

@@ -889,7 +889,7 @@ static void render_ask(Lines *L, const char *text, size_t len, int W)
     buf_str(&b, "╮" C_RESET);
     lines_push(L, &b);
     char title[600];
-    snprintf(title, sizeof title, "%.*s?", (int)(tl < 500 ? tl : 500), text);
+    snprintf(title, sizeof title, "%.*s%s", (int)(tl < 500 ? tl : 500), text, tl && text[tl - 1] == '?' ? "" : "?");
     if (title[0] >= 'a' && title[0] <= 'z') title[0] = (char)(title[0] - 32);
     buf_str(&b, " " C_YELLOW "│ " C_BOLD C_TEXT);
     put_cols(&b, title, inner - 1);
@@ -1382,6 +1382,103 @@ static void menu_files(const char *typed)
     }
 }
 
+/* ---- @mentions: the project's files, found by fuzzy search ---- */
+
+#define FX_MAX 20000
+
+static char  **g_fx;           /* the working directory's files, relative, with '/' */
+static int     g_nfx;
+static double  g_fx_t;
+
+static void fx_walk(const char *abs, const char *rel, int depth)
+{
+    if (depth > 12 || g_nfx >= FX_MAX) return;
+    int n = 0;
+    LcEnt *v = lc_read_dir(abs, &n);
+    for (int i = 0; v && i < n && g_nfx < FX_MAX; i++) {
+        const char *nm = v[i].name;
+        if (nm[0] == '.' || !strcmp(nm, "node_modules") || !strcmp(nm, "__pycache__") || !strcmp(nm, "venv")) continue;
+        char a[4400], r[2048];
+        snprintf(a, sizeof a, "%s/%s", abs, nm);
+        snprintf(r, sizeof r, "%s%s%s", rel, *rel ? "/" : "", nm);
+        if (v[i].dir) { fx_walk(a, r, depth + 1); continue; }
+        const size_t l = strlen(r) + 1;
+        char *c = (char *)malloc(l);
+        if (!c) break;
+        memcpy(c, r, l);
+        g_fx[g_nfx++] = c;
+    }
+    if (v) lc_ents_free(v, n);
+}
+
+static void fx_index(void)
+{
+    if (g_fx && now_s() - g_fx_t < 10.0) return;   /* new files show within 10 s */
+    for (int i = 0; i < g_nfx; i++) free(g_fx[i]);
+    if (!g_fx) g_fx = (char **)malloc(FX_MAX * sizeof *g_fx);
+    g_nfx = 0;
+    if (g_fx) fx_walk(lc_tools_root(), "", 0);
+    g_fx_t = now_s();
+}
+
+/* how well typed names path: by its file name's start, inside the name, inside the path, then the
+ * letters in order; 0 not at all */
+static int fx_score(const char *path, const char *typed)
+{
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const int len = (int)strlen(path);
+    if (!*typed) return 1000 - len;
+    if (starts_with_ci(base, typed)) return 4000 - len;
+    const size_t tl = strlen(typed);
+    for (const char *p = base; *p; p++) if (starts_with_ci(p, typed)) return 3000 - len;
+    for (const char *p = path; *p; p++) if (starts_with_ci(p, typed)) return 2500 - len;
+    (void)tl;
+    if (subsequence(path, typed)) return 1500 - len;
+    return 0;
+}
+
+/* where the @word being typed begins (at the end of the text), or NULL */
+static const char *mention_at(const char *t)
+{
+    const char *at = strrchr(t, '@');
+    if (!at || (at > t && at[-1] != ' ' && at[-1] != '\n' && at[-1] != '\t' && at[-1] != '(')) return NULL;
+    for (const char *p = at + 1; *p; p++) if (*p == ' ' || *p == '\n' || *p == '\t') return NULL;
+    return at;
+}
+
+static void menu_mentions(const char *t, const char *at)
+{
+    const char *typed = at + 1;
+    const size_t pre = (size_t)(at - t);
+    if (pre + 600 > sizeof ((MenuItem *)0)->tab) return;
+    fx_index();
+    static int idx[MENU_MAX], sc[MENU_MAX];
+    int k = 0, found = 0;
+    for (int i = 0; i < g_nfx; i++) {
+        const int s = fx_score(g_fx[i], typed);
+        if (s <= 0) continue;
+        found++;
+        int j;                                         /* keep the best MENU_MAX, sorted */
+        if (k < MENU_MAX) j = k++;
+        else if (s <= sc[MENU_MAX - 1]) continue;
+        else j = MENU_MAX - 1;
+        while (j > 0 && sc[j - 1] < s) { sc[j] = sc[j - 1]; idx[j] = idx[j - 1]; j--; }
+        sc[j] = s;
+        idx[j] = i;
+    }
+    snprintf(M.title, sizeof M.title, "files (@ attaches the file's text to the message)");
+    snprintf(M.right, sizeof M.right, "%d of %d%s", found, g_nfx, g_nfx >= FX_MAX ? "+" : "");
+    for (int i = 0; i < k; i++) {
+        MenuItem *it = menu_add();
+        if (!it) break;
+        const char *path = g_fx[idx[i]];
+        if (snprintf(it->tab, sizeof it->tab, "%.*s@%s ", (int)pre, t, path) >= (int)sizeof it->tab) { M.n--; continue; }
+        snprintf(it->label, sizeof it->label, "%s", path);
+        it->submits = 0;
+    }
+}
+
 /* Rebuild the items for the editor's text; no menu unless it is one line starting with "/". */
 static void menu_build(void)
 {
@@ -1394,6 +1491,12 @@ static void menu_build(void)
     M.n = 0;
     M.raw_enter = 0;
     M.title[0] = M.right[0] = 0;
+    const char *at = t[0] != '/' ? mention_at(t) : NULL;
+    if (at) {
+        menu_mentions(t, at);
+        if (M.sel >= M.n) M.sel = M.n ? M.n - 1 : 0;
+        return;
+    }
     if (t[0] != '/' || strchr(t, '\n')) return;
     if (g_s->last_spt > 0.0)
         snprintf(M.right, sizeof M.right, "last answer %.1f tok/s · %.3f s/token", 1.0 / g_s->last_spt, g_s->last_spt);
@@ -1609,10 +1712,68 @@ static void ask_answer(int a)
     pthread_cond_broadcast(&g_ask_cv);
 }
 
+/* the agent's question tool: state 2 while open; a digit picks an option, Enter sends what was typed,
+ * esc leaves it unanswered (the turn goes on) */
+static char  *g_q_answer;
+static char   g_q_opts[9][300];
+static int    g_q_n;
+
+static char *sink_question(Glm53fTurnSink *k, const char *question, const char *options)
+{
+    (void)k;
+    pthread_mutex_lock(&g_mu);
+    Block *b = block_new(B_ASK);
+    g_q_n = 0;
+    if (b) {
+        buf_str(&b->text, question);
+        for (const char *p = options ? options : ""; *p && g_q_n < 9;) {
+            const size_t l = strcspn(p, "\n");
+            if (l) {
+                snprintf(g_q_opts[g_q_n], sizeof g_q_opts[0], "%.*s", (int)l, p);
+                g_q_n++;
+                buf_fmt(&b->text, "\n%d. %s", g_q_n, g_q_opts[g_q_n - 1]);
+            }
+            p += l;
+            if (*p) p++;
+        }
+        snprintf(g_ask_title, sizeof g_ask_title, "%s", question);
+    }
+    g_ask_block = g_nblocks - 1;
+    g_q_answer = NULL;
+    g_ask_state = 2;
+    g_offset = 0;
+    g_dirty = 1;
+    while (g_ask_state == 2) pthread_cond_wait(&g_ask_cv, &g_mu);
+    char *a = g_q_answer;
+    g_q_answer = NULL;
+    pthread_mutex_unlock(&g_mu);
+    return a;
+}
+
+/* The UI thread's answer to the open question tool (under g_mu); a: malloc'd or NULL, taken. */
+static void q_answer(char *a)
+{
+    if (g_ask_state != 2) { free(a); return; }
+    g_q_answer = a;
+    g_ask_state = 0;
+    if (g_ask_block < g_nblocks && g_blocks[g_ask_block].kind == B_ASK) {
+        Block *b = &g_blocks[g_ask_block];
+        b->text.n = 0;
+        if (b->text.p) b->text.p[0] = 0;
+        buf_str(&b->text, g_ask_title);
+        buf_str(&b->text, " — ");
+        buf_str(&b->text, a ? a : "sem resposta");
+        b->kind = B_NOTE;
+    }
+    g_dirty = 1;
+    pthread_cond_broadcast(&g_ask_cv);
+}
+
 static void *worker_main(void *arg)
 {
     (void)arg;
-    Glm53fTurnSink k = { sink_status, sink_reasoning, sink_thought, sink_answer, sink_done, NULL, sink_tool, sink_approve };
+    Glm53fTurnSink k = { sink_status, sink_reasoning, sink_thought, sink_answer, sink_done, NULL, sink_tool, sink_approve,
+                         NULL, sink_question };
     if (glm53f_chat_turn(g_s, &g_job, &k) != 0) g_fatal = 1;
     pthread_mutex_lock(&g_mu);
     g_worker_done = 1;
@@ -1674,6 +1835,13 @@ static void submit(void)
     char *line = (char *)malloc(E.b.n + 1);
     if (!line) return;
     memcpy(line, E.b.p, E.b.n + 1);
+    if (g_ask_state == 2) {                       /* the answer to the agent's question */
+        ed_set("");
+        pthread_mutex_lock(&g_mu);
+        q_answer(line);
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
     if (g_nhist == 64) { free(g_hist[0]); memmove(g_hist, g_hist + 1, 63 * sizeof *g_hist); g_nhist--; }
     g_hist[g_nhist] = (char *)malloc(E.b.n + 1);
     if (g_hist[g_nhist]) memcpy(g_hist[g_nhist++], line, E.b.n + 1);
@@ -1814,9 +1982,11 @@ static void draw(Glm53fChat *s)
         static const char *mode[] = { "Chat", "Rápido", "Agente" };
         const int lvl = s->agent_level > 0 && s->e->agent ? s->agent_level : 0;
         snprintf(left, sizeof left, C_BOLD C_BRIGHT "%s" C_NOBOLD C_DIM " · " C_TEXT "%s" C_DIM " · " C_YELLOW "%s",
-                 mode[lvl], s->e->name,
+                 lvl == 2 && s->plan_mode ? "Plano" : mode[lvl], s->e->name,
                  lvl ? (lvl == 1 ? "low" : "medium") : s->reasoning);
         if (g_ask_state == 1)  snprintf(right, sizeof right, C_YELLOW "S sim · A sempre · N não");
+        else if (g_ask_state == 2) snprintf(right, sizeof right, C_YELLOW "%s escreva e Enter · esc pula",
+                                            g_q_n ? "1-9 escolhe ·" : "");
         else if (g_busy)       snprintf(right, sizeof right, C_DIM "esc interrompe%s", g_nqueue ? " · na fila" : "");
         else if (lvl == 2 && s->autonomous) snprintf(right, sizeof right, C_YELLOW "⏵⏵ autônomo nesta pasta");
         else if (lvl == 2)     snprintf(right, sizeof right, s->auto_approve ? C_YELLOW "⏵⏵ aprovação automática"
@@ -1919,6 +2089,20 @@ static int on_input(const char *p, int n, int view_rows)
                     hit = 1;
                 }
             if (hit) { i += 2; g_mods_dirty = 1; g_dirty = 1; continue; }
+        }
+        if (g_ask_state == 2 && !E.b.n && ((c >= '1' && c <= '0' + g_q_n) || c == 0x1b || c == 0x03) &&
+            !(c == 0x1b && i + 1 < n && (p[i + 1] == '[' || p[i + 1] == 'O'))) {   /* the question tool: pick or skip */
+            char *a = NULL;
+            if (c >= '1' && c <= '9') {
+                const size_t l = strlen(g_q_opts[c - '1']);
+                a = (char *)malloc(l + 1);
+                if (a) memcpy(a, g_q_opts[c - '1'], l + 1);
+            }
+            pthread_mutex_lock(&g_mu);
+            q_answer(a);
+            pthread_mutex_unlock(&g_mu);
+            i++;
+            continue;
         }
         if (g_ask_state == 1) {                          /* an open question takes the keys */
             if (c == 0x1b && i + 1 < n && (p[i + 1] == '[' || p[i + 1] == 'O')) {   /* arrows, mouse: not an answer */
@@ -2047,6 +2231,7 @@ static int on_input(const char *p, int n, int view_rows)
         }
         if (c == '\t') {
             if (menu_open()) ed_set(M.it[M.sel].tab);   /* tab: complete the choice */
+            else if (!E.b.n && g_s->agent_level == 2) g_s->plan_mode = !g_s->plan_mode;   /* build <-> plan */
             else ed_insert("    ", 4);
             i++;
             g_dirty = 1;
@@ -2117,6 +2302,7 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
         glm53f_chat_stop();
         pthread_mutex_lock(&g_mu);
         ask_answer(0);
+        q_answer(NULL);
         pthread_mutex_unlock(&g_mu);
         pthread_join(g_worker, NULL);
         glm53f_chat_input_free(&g_job);
