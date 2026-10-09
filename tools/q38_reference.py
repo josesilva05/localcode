@@ -135,6 +135,7 @@ class State:
         self.v = {}
         self.ple_hist = {}  # il -> [hist, hc*E]
         self.toks = []
+        self.hprev = None  # the main hidden (before output_norm) of the position before, for MTP
 
 
 class Ref:
@@ -290,6 +291,19 @@ class Ref:
         self.tap(f"attn_output-{il}", o)
         return o
 
+    def mtp(self, h, tok, pos):
+        """The MTP block (llama.cpp graph_mtp) at pos on (h of pos-1, tok): logits of the token after."""
+        m = self.m
+        il = m.n_layer
+        p = f"blk.{il}."
+        e = m.rows("token_embd.weight", [tok])[0]
+        cat = np.concatenate([rms(e, m.eps) * m.vec(p + "nextn.enorm.weight"), rms(h, m.eps) * m.vec(p + "nextn.hnorm.weight")])
+        x = m.w(p + "nextn.eh_proj.weight") @ cat
+        x = x + self.attn(il, rms(x, m.eps) * m.vec(p + "attn_norm.weight"), pos)
+        x = x + self.ffn(il, rms(x, m.eps) * m.vec(p + "post_attention_norm.weight"))
+        out = rms(x, m.eps) * m.vec(p + "nextn.shared_head_norm.weight")
+        return m.w("output.weight") @ out
+
     def ffn(self, il, x):
         m = self.m
         p = f"blk.{il}."
@@ -336,6 +350,10 @@ class Ref:
             self.tap("result_norm", final)
             logits = m.w("output.weight") @ final
             self.tap("logits", logits)
+            if m.n_exp == 0 and m.kv.get(m.arch + ".nextn_predict_layers", 0) == 1:
+                hp = st.hprev if st.hprev is not None else np.zeros(m.E)
+                self.tap("mtp_logits", self.mtp(hp, tok, pos))
+                st.hprev = x
             return logits
         res = np.tile(x, (m.hc, 1))
         for il in range(m.n_layer):

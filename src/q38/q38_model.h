@@ -22,7 +22,7 @@
 #include <stdint.h>
 #include "q38_gguf.h"
 
-#define Q38_MAX_LAYERS 64
+#define Q38_MAX_LAYERS 72      /* the 27B: 64 and its MTP block */
 #define Q38_MAX_PLE_HEADS 32
 
 typedef struct {
@@ -117,6 +117,15 @@ typedef struct {
     q38_layer L[Q38_MAX_LAYERS];
     q38_mat   tok_embd, output, out_hc_norm, out_hc_down, out_hc_up, ple_table;
     q38_mat   output_norm;               /* plain members */
+    /* the multi-token prediction block (qwen35: nextn, after the decoder layers, in L[n_layer]):
+     * it runs on every token the model reads, on (h of the position before, the token), filling
+     * its own K/V, and drafts the token after next (llama.cpp's graph_mtp) */
+    int       mtp;
+    q38_mat   mtp_eh, mtp_enorm, mtp_hnorm, mtp_shnorm;
+    float    *mtp_hprev;                 /* [n_embd]: the main hidden (before output_norm) of n_past - 1 */
+    float    *mtp_x, *mtp_hout, *mtp_logits;
+    int64_t   spec_tries, spec_hits;     /* q38_model_forward_spec: verifications, right guesses */
+    double    spec_t[2];                 /* its seconds: drafting, verifying (with the state copy) */
     int64_t   trunk_bytes;
 
     /* state for one sequence */
@@ -206,5 +215,16 @@ void q38_model_reset(q38_model *m);
 const float *q38_model_forward(q38_model *m, int token);
 /* n tokens at once (batched on the GPU, one by one on the CPU); logits of the last one. */
 const float *q38_model_forward_batch(q38_model *m, const int *toks, int n);
+/* The MTP block's draft: tok goes at position n_past (the token the main logits chose); returns
+ * the logits of the token after it, or NULL without an MTP block. The block's K/V at n_past is
+ * written (the next forward writes it again, the same). */
+const float *q38_model_mtp_draft(q38_model *m, int tok);
+/* Speculative decoding with the MTP block: feeds tok (the token the logits chose) and the block's
+ * chained guesses for the tokens after it (Q38_SPEC_N, default 3, at most Q38_SPEC_MAX), all in one
+ * pass of the model; the guesses the model agrees with are kept. A guess that is one of the n_stop
+ * stop tokens ends the chain. Returns the tokens fed beyond tok (in extra), m->logits those after the
+ * last one; -1 on failure. Without an MTP block or a GPU it is q38_model_forward. */
+int q38_model_forward_spec(q38_model *m, int tok, const int *stop, int n_stop, int *extra);
+#define Q38_SPEC_MAX 3                       /* drafts a step at most (extra holds that many) */
 
 #endif

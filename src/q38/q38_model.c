@@ -263,6 +263,40 @@ static int bind_all(q38_model *m)
     return 0;
 }
 
+/* The MTP block (a full-attention decoder block with its dense FFN) and its nextn tensors, in
+ * L[n_layer]; Q38_MTP=0 leaves it out. Dense models only for now. */
+static int bind_mtp(q38_model *m)
+{
+    const q38_cfg *c = &m->c;
+    const int il = c->n_layer;
+    const int64_t E = c->n_embd;
+    char name[128];
+    if (c->n_nextn != 1 || !c->dense || il + 1 > Q38_MAX_LAYERS || (getenv("Q38_MTP") && !atoi(getenv("Q38_MTP")))) return 0;
+    q38_layer *l = &m->L[il];
+    l->recurrent = 0;
+    B(attn_norm, "blk.%d.attn_norm.weight", E, 1);
+    B(post_norm, "blk.%d.post_attention_norm.weight", E, 1);
+    B(wq, "blk.%d.attn_q.weight", E, (int64_t)c->n_head * c->head_dim * 2);
+    B(wk, "blk.%d.attn_k.weight", E, (int64_t)c->n_head_kv * c->head_dim);
+    B(wv, "blk.%d.attn_v.weight", E, (int64_t)c->n_head_kv * c->head_dim);
+    B(wo, "blk.%d.attn_output.weight", (int64_t)c->n_head * c->head_dim, E);
+    B(q_norm, "blk.%d.attn_q_norm.weight", c->head_dim, 1);
+    B(k_norm, "blk.%d.attn_k_norm.weight", c->head_dim, 1);
+    B(sh_gate, "blk.%d.ffn_gate.weight", E, c->ff_shexp);
+    B(sh_up, "blk.%d.ffn_up.weight", E, c->ff_shexp);
+    B(sh_down, "blk.%d.ffn_down.weight", c->ff_shexp, E);
+    snprintf(name, sizeof name, "blk.%d.nextn.eh_proj.weight", il);
+    if (bind(m, &m->mtp_eh, name, 2 * E, E, 1)) return -1;
+    snprintf(name, sizeof name, "blk.%d.nextn.enorm.weight", il);
+    if (bind(m, &m->mtp_enorm, name, E, 1, 1)) return -1;
+    snprintf(name, sizeof name, "blk.%d.nextn.hnorm.weight", il);
+    if (bind(m, &m->mtp_hnorm, name, E, 1, 1)) return -1;
+    snprintf(name, sizeof name, "blk.%d.nextn.shared_head_norm.weight", il);
+    if (bind(m, &m->mtp_shnorm, name, E, 1, 1)) return -1;
+    m->mtp = 1;
+    return 0;
+}
+
 /* -------------------------------------------------------------------- kernels -- */
 #define MAX_NE0 32768          /* the dense 27B's down rows: 17408 */
 #define MAX_THREADS 64
@@ -1207,6 +1241,109 @@ static int dense_ffn(q38_model *m, int il, const float *x, float *y)
     return 0;
 }
 
+/* The MTP block at position pos on (h, tok), llama.cpp's graph_mtp: x = eh_proj([enorm(emb(tok));
+ * hnorm(h)]), a full-attention block with its dense FFN (its K/V written at pos), shared_head_norm,
+ * the head into logits (when not NULL). m->mtp_hout keeps the normed output (a chained draft's h). */
+static int dense_ffn(q38_model *m, int il, const float *x, float *y);
+static void attn(q38_model *m, int il, const float *x, float *y);
+static int mtp_block(q38_model *m, const float *h, int tok, int pos, float *logits)
+{
+    const q38_cfg *c = &m->c;
+    const int E = c->n_embd, il = c->n_layer;
+    const q38_layer *l = &m->L[il];
+    float *cat = m->mtp_x, *x = m->mtp_x + 2 * E, *y = m->tmp2 + 4 * 4096;
+    q38_dequant_row(m->tok_embd.type, m->tok_embd.data + (int64_t)tok * m->tok_embd.row_bytes, x, E);
+    rmsnorm(cat, x, vecf(&m->mtp_enorm), E, c->eps);
+    rmsnorm(cat + E, h, vecf(&m->mtp_hnorm), E, c->eps);
+    matvec(&m->mtp_eh, cat, x);
+    rmsnorm(m->mixed, x, vecf(&l->attn_norm), E, c->eps);
+    const int saved = m->n_past;
+    m->n_past = pos;                              /* attn() writes and reads at n_past */
+    attn(m, il, m->mixed, y);
+    m->n_past = saved;
+    for (int i = 0; i < E; i++) x[i] += y[i];
+    rmsnorm(m->mixed, x, vecf(&l->post_norm), E, c->eps);
+    if (dense_ffn(m, il, m->mixed, y)) return -1;
+    for (int i = 0; i < E; i++) x[i] += y[i];
+    rmsnorm(m->mtp_hout, x, vecf(&m->mtp_shnorm), E, c->eps);
+    if (logits) matvec(&m->output, m->mtp_hout, logits);
+    if (m->tap && logits) m->tap(m->tap_ctx, "mtp_logits", logits, c->n_vocab);
+    return 0;
+}
+
+const float *q38_model_mtp_draft(q38_model *m, int tok)
+{
+    if (!m->mtp) return NULL;
+#ifdef Q38_CUDA
+    if (m->gpu) return q38_gpu_mtp_draft(m, tok, 0) ? NULL : m->mtp_logits;
+#endif
+    return mtp_block(m, m->mtp_hprev, tok, m->n_past, m->mtp_logits) ? NULL : m->mtp_logits;
+}
+
+static int argmax_v(const float *v, int n)
+{
+    int b = 0;
+    for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i;
+    return b;
+}
+
+int q38_model_forward_spec(q38_model *m, int tok, const int *stop, int n_stop, int *extra)
+{
+#ifdef Q38_CUDA
+    static int want = -1;
+    if (want < 0) {
+        const char *e = getenv("Q38_SPEC_N");
+        want = e ? atoi(e) : 3;
+        if (want > Q38_SPEC_MAX) want = Q38_SPEC_MAX;
+    }
+    if (m->mtp && m->gpu && want > 0 && m->n_past + want + 1 < m->max_ctx && !m->tap) {
+        const int V = m->c.n_vocab;
+        int toks[Q38_SPEC_MAX + 1], nd = 0;
+        toks[0] = tok;
+        const double t0 = now_s();
+        for (int j = 0; j < want; j++) {          /* the chain of guesses */
+            if (q38_gpu_mtp_draft(m, toks[j], j)) return -1;
+            const int d = argmax_v(m->mtp_logits, V);
+            int stopped = 0;
+            for (int i = 0; i < n_stop; i++) if (d == stop[i]) stopped = 1;
+            if (stopped) break;
+            toks[++nd] = d;
+        }
+        const double t1 = now_s();
+        m->spec_t[0] += t1 - t0;
+        if (nd > 0) {
+            static float *lg;
+            if (!lg && !(lg = (float *)malloc((size_t)(Q38_SPEC_MAX + 1) * V * sizeof(float)))) return -1;
+            static int kept = -1;                 /* the verification keeps its states: no copy before */
+            if (kept != 1 && q38_gpu_spec_state(m, 0)) return -1;
+            const int rv = q38_gpu_verify(m, toks, nd + 1, lg);
+            if (rv < 0) return -1;
+            kept = rv;
+            m->spec_t[1] += now_s() - t1;
+            m->spec_tries += nd;
+            int a = 0;                            /* the guesses the model agrees with, in order */
+            while (a < nd && argmax_v(lg + (int64_t)a * V, V) == toks[a + 1]) a++;
+            m->spec_hits += a;
+            if (a < nd && rv == 1) {              /* the state after token a, copied back */
+                if (q38_gpu_spec_keep(m, a, nd + 1)) return -1;
+            } else if (a < nd) {
+                /* a wrong one: the state as before, then tok and the right guesses alone (their K/V and
+                 * state must not hold the wrong ones) */
+                if (q38_gpu_spec_state(m, 1)) return -1;
+                m->n_past -= nd + 1;
+                if (a == 0) return q38_model_forward(m, tok) ? 0 : -1;
+                if (q38_gpu_verify(m, toks, a + 1, lg)) return -1;
+            }
+            memcpy(m->logits, lg + (int64_t)a * V, (size_t)V * sizeof(float));
+            for (int i = 0; i < a; i++) extra[i] = toks[i + 1];
+            return a;
+        }
+    }
+#endif
+    (void)stop; (void)n_stop; (void)extra;
+    return q38_model_forward(m, tok) ? 0 : -1;
+}
+
 /* The MoE block on the host (the CPU path). */
 static int moe(q38_model *m, int il, const float *x, float *y)
 {
@@ -1646,6 +1783,13 @@ const float *q38_model_forward(q38_model *m, int token)
         if (m->tap) m->tap(m->tap_ctx, "result_norm", m->mixed, E);
         matvec(&m->output, m->mixed, m->logits);
         if (m->tap) m->tap(m->tap_ctx, "logits", m->logits, c->n_vocab);
+        if (m->mtp) {                             /* the MTP block's K/V at this position */
+            memcpy(m->mtp_x + 2 * E, x, (size_t)E * sizeof(float));     /* h_t, before mtp_block reuses x */
+            float *h_t = m->tmp2;                 /* mtp_block uses tmp2 + 4*4096 only */
+            memcpy(h_t, x, (size_t)E * sizeof(float));
+            if (mtp_block(m, m->mtp_hprev, token, m->n_past, m->tap ? m->mtp_logits : NULL)) return NULL;
+            memcpy(m->mtp_hprev, h_t, (size_t)E * sizeof(float));
+        }
         m->toks[m->n_past++] = token;
         m->t_trunk += now_s() - t0;
         return m->logits;
@@ -1718,6 +1862,7 @@ void q38_model_reset(q38_model *m)
     const q38_cfg *c = &m->c;
     const int ch = 2 * c->n_kh * c->d_state + c->n_vh * c->d_state;
     m->n_past = 0;
+    if (m->mtp_hprev) memset(m->mtp_hprev, 0, (size_t)c->n_embd * sizeof(float));
     for (int il = 0; il < c->n_layer; il++) {
         if (m->conv_state[il]) memset(m->conv_state[il], 0, (size_t)(c->conv_k - 1) * ch * sizeof(float));
         if (m->ssm_state[il]) memset(m->ssm_state[il], 0, (size_t)c->n_vh * c->d_state * c->d_state * sizeof(float));
@@ -1750,7 +1895,7 @@ int q38_model_open(q38_model *m, const char *path, int max_ctx)
     if (max_ctx > c->ctx_train) max_ctx = c->ctx_train;
     m->max_ctx = max_ctx;
     double t0 = now_s();
-    if (bind_all(m)) { q38_model_close(m); return -1; }
+    if (bind_all(m) || bind_mtp(m)) { q38_model_close(m); return -1; }
     double t1 = now_s();
 
     const int E = c->n_embd, hcE = c->hc * E;
@@ -1785,6 +1930,16 @@ int q38_model_open(q38_model *m, const char *path, int max_ctx)
     if (a > big) big = a;
     m->big = (float *)calloc((size_t)big, sizeof(float));
     m->logits = (float *)calloc((size_t)c->n_vocab, sizeof(float));
+    if (m->mtp) {
+        const int il = c->n_layer;
+        m->kcache[il] = (float *)calloc((size_t)max_ctx * c->n_head_kv * c->head_dim, sizeof(float));
+        m->vcache[il] = (float *)calloc((size_t)max_ctx * c->n_head_kv * c->head_dim, sizeof(float));
+        m->mtp_hprev = (float *)calloc((size_t)E, sizeof(float));
+        m->mtp_x = (float *)calloc((size_t)3 * E, sizeof(float));
+        m->mtp_hout = (float *)calloc((size_t)E, sizeof(float));
+        m->mtp_logits = (float *)calloc((size_t)c->n_vocab, sizeof(float));
+        if (!m->kcache[il] || !m->vcache[il] || !m->mtp_hprev || !m->mtp_x || !m->mtp_hout || !m->mtp_logits) m->mtp = 0;
+    }
     const int NX = c->n_exp_used + 1;
     const int64_t ffw = (int64_t)NX * c->ff_exp > c->ff_shexp ? (int64_t)NX * c->ff_exp : c->ff_shexp;  /* dense: one FFN */
     m->table = (q38_slot **)calloc((size_t)c->n_layer * c->n_exp + 1, sizeof(q38_slot *));
@@ -1832,6 +1987,8 @@ void q38_model_close(q38_model *m)
     free(m->tr_buf);
     free(m->use);
     free(m->table); free(m->moe_gu); free(m->moe_h); free(m->moe_dn); free(m->moe_bsum);
+    free(m->mtp_eh.data); free(m->mtp_enorm.data); free(m->mtp_hnorm.data); free(m->mtp_shnorm.data);
+    free(m->mtp_hprev); free(m->mtp_x); free(m->mtp_hout); free(m->mtp_logits);
     q38_gguf_close(&m->g);
     memset(m, 0, sizeof *m);
 }

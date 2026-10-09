@@ -13,6 +13,14 @@ typedef struct {
     float  *h_in[2], *h_out[2];                  /* [nb][E] pinned, two slots each: the embeddings (part 0),
                                                   * the residual for the next part */
     cudaEvent_t ev_in[2], ev_out[2];             /* this part read slot k / wrote its result for the next */
+    float  *h_mtp, *emb2, *cat2;                 /* the MTP catch-up (last part): embeddings, block input */
+    cudaEvent_t ev_mtp;
+    float  *lgv, *h_lgv;                         /* a verification's logits, 4 rows (last part) */
+    float  *snap_conv[Q38_MAX_LAYERS], *snap_ssm[Q38_MAX_LAYERS], *snap_h;   /* the recurrent state before it */
+    /* a verification keeps the recurrent state after each of its tokens (but the last) and the hidden
+     * rows: a wrong guess then costs a copy back, not a second pass */
+    float  *keep_conv[Q38_MAX_LAYERS], *keep_ssm[Q38_MAX_LAYERS], *keep_h;
+    int     keeping, keep_ok;
     cublasHandle_t blas;
     __half *wh, *xh;                             /* a matrix in fp16; the activations in fp16 */
     int64_t wcap, xcap;
@@ -52,9 +60,38 @@ __global__ void k_rows_h(const float *__restrict__ X, int ldx, int ne0, int N, _
     }
 }
 
+/* Y [N][rows] for N <= 4 tokens (a verification): the 8-bit products, weights read once for all;
+ * other types a vector at a time */
+static int mvn(const DMat *w, const float *X, int ldx, float *Y, int ldy, int N, cudaStream_t st)
+{
+    if (mvq_ok(w->type) && G->q8x && w->ne0 % 256 == 0 && w->ne0 <= 32768) {
+        const int nb = (int)(w->ne0 / 32);
+        k_q8x_nc<<<(nb * N + 3) / 4, 128, 0, st>>>(X, ldx, (int)w->ne0, N, G->q8x, G->q8d, G->q8s);
+        const dim3 b4(32, 4);
+        const int g4 = (int)((w->rows + 3) / 4);
+        const uint8_t *W = (const uint8_t *)w->d;
+#define MVN_CASE(T, NC) k_mvq_nc<T, NC><<<g4, b4, 0, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, Y, ldy)
+#define MVN_TYPE(T) switch (N) { case 1: MVN_CASE(T, 1); break; case 2: MVN_CASE(T, 2); break; \
+                                 case 3: MVN_CASE(T, 3); break; default: MVN_CASE(T, 4); break; }
+        switch (w->type) {
+        case Q38_Q4_K:   MVN_TYPE(Q38_Q4_K); break;
+        case Q38_Q5_K:   MVN_TYPE(Q38_Q5_K); break;
+        case Q38_Q6_K:   MVN_TYPE(Q38_Q6_K); break;
+        case Q38_IQ4_XS: MVN_TYPE(Q38_IQ4_XS); break;
+        default:         MVN_TYPE(Q38_IQ4_NL); break;
+        }
+#undef MVN_TYPE
+#undef MVN_CASE
+        return 0;
+    }
+    for (int t = 0; t < N; t++) if (mv(w, X + (int64_t)t * ldx, Y + (int64_t)t * ldy, st)) return -1;
+    return 0;
+}
+
 /* Y [N][rows] (row stride ldy) = W . X for N tokens */
 static int dmm(DBat *d, const DMat *w, const float *X, int ldx, float *Y, int ldy, int N, cudaStream_t st)
 {
+    if (N <= 4) return mvn(w, X, ldx, Y, ldy, N, st);   /* a verification: the decode's products */
     const int64_t n = w->rows * w->ne0;
     if (w->type == Q38_F32) {
         const dim3 blk(32, ROWS_PER_BLOCK), grid(nblocks(w->rows, ROWS_PER_BLOCK), nblocks(N, TB));
@@ -106,8 +143,13 @@ static int dbat_open(q38_model *m, int p, int l0, int l1, int nb)
         CK(cudaEventCreateWithFlags(&d->ev_in[k], cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&d->ev_out[k], cudaEventDisableTiming));
     }
-    int64_t wmax = 0, xmax = 0;
-    for (int il = l0; il < l1; il++)
+    if (g->mtp_eh.d) {
+        CK(cudaMallocHost(&d->h_mtp, (size_t)nb * E * sizeof(float)));
+        if (!(d->emb2 = dalloc((size_t)nb * E, g)) || !(d->cat2 = dalloc((size_t)nb * 2 * E, g))) return -1;
+        CK(cudaEventCreateWithFlags(&d->ev_mtp, cudaEventDisableTiming));
+    }
+    int64_t wmax = g->mtp_eh.d ? g->mtp_eh.rows * g->mtp_eh.ne0 : 0, xmax = g->mtp_eh.d ? g->mtp_eh.ne0 : 0;
+    for (int il = l0; il < l1 + (g->mtp_eh.d ? 1 : 0); il++)
         for (int i = 0; i < NMAT; i++) {
             const DMat *w = &g->L[il][i];
             if (!w->d || w->type == Q38_F32) continue;
@@ -140,9 +182,11 @@ static int dense_layer_b(q38_model *m, DBat *d, int il, int N, cudaStream_t st)
             return -1;
         k_gdn_gates_b<<<nblocks(Hv * N, 256), 256, 0, st>>>(d->beta, d->g, (const float *)LM(il, dt_bias).d,
                                                            (const float *)LM(il, a).d, Hv, N);
-        k_conv_silu_b<<<nblocks(ch, 256), 256, 0, st>>>(d->qkv, ch, G->conv[il], (const float *)LM(il, conv).d, ch, c->conv_k, N);
+        k_conv_silu_b<<<nblocks(ch, 256), 256, 0, st>>>(d->qkv, ch, G->conv[il], (const float *)LM(il, conv).d, ch, c->conv_k, N,
+                                                       d->keeping ? d->keep_conv[il] : NULL);
         k_l2norm_b<<<N * 2 * Hk, 32, 0, st>>>(d->qkv, S, 2 * Hk, ch, c->eps);
-        k_gdn_step_b<<<Hv, dim3(S, 4), 6 * S * sizeof(float), st>>>(G->ssm[il], d->qkv, ch, d->g, d->beta, d->o, S, Hk, Hv, N);
+        k_gdn_step_b<<<Hv, dim3(S, 4), 6 * S * sizeof(float), st>>>(G->ssm[il], d->qkv, ch, d->g, d->beta, d->o, S, Hk, Hv, N,
+                                                                   d->keeping ? d->keep_ssm[il] : NULL);
         k_norm_gate<<<N * Hv, 128, 0, st>>>(d->o, d->z, (const float *)LM(il, ssm_norm).d, S, c->eps, c->gdn_silu);
         if (dmm(d, &LM(il, ssm_out), d->o, Hv * S, d->y, E, N, st)) return -1;
     } else {
@@ -167,26 +211,30 @@ static int dense_layer_b(q38_model *m, DBat *d, int il, int N, cudaStream_t st)
     return 0;
 }
 
-__global__ void k_set_int(int *p, int v) { *p = v; }
 
 /* n tokens in pieces of nb, pipelined over the parts: part 0 starts piece k+1 while part 1 runs
  * piece k (each its own device and stream; the residual goes through pinned slots, the next part's
  * stream waiting on the event of the copy). Positions are set by a kernel argument, so queued
  * pieces each keep theirs. The last piece's last token gets the logits. */
+static int mtp_catchup_b(q38_model *m, DBat *d, const int *toks, int N, cudaStream_t st);   /* below */
+
+static int dense_bat_ready(q38_model *m)
+{
+    if (GDB[0]) return 0;
+    const char *e = getenv("Q38_BATCH");
+    int nb = e ? atoi(e) : 1024;                 /* 1024: 435 tok/s on the 27B, 512: 421, 256: 379 */
+    if (nb < 16) nb = 16;
+    if (nb > 2048) nb = 2048;
+    const int rc = dbat_open(m, 0, 0, GD_split, nb) || (GD_n == 2 && dbat_open(m, 1, GD_split, m->c.n_layer, nb)) ? -1 : 0;
+    G = GD[0];
+    return rc;
+}
+
 static int dense_forward_batch(q38_model *m, const int *toks, int n)
 {
     const q38_cfg *c = &m->c;
     const int E = c->n_embd;
-    if (!GDB[0]) {
-        const char *e = getenv("Q38_BATCH");
-        int nb = e ? atoi(e) : 1024;            /* 1024: 435 tok/s on the 27B, 512: 421, 256: 379 */
-        if (nb < 16) nb = 16;
-        if (nb > 2048) nb = 2048;
-        if (dbat_open(m, 0, 0, GD_split, nb) || (GD_n == 2 && dbat_open(m, 1, GD_split, c->n_layer, nb))) {
-            G = GD[0];
-            return -1;
-        }
-    }
+    if (dense_bat_ready(m)) return -1;
     const int nb = GDB[0]->nb, p00 = m->n_past;
     const double t0 = now_s();
     for (int i = 0, k = 0; i < n; i += nb, k ^= 1) {
@@ -221,6 +269,10 @@ static int dense_forward_batch(q38_model *m, const int *toks, int n)
                 if (mv(&G->output, G->mixed, G->logits, st)) { G = GD[0]; return -1; }
                 CK(cudaMemcpyAsync(G->h_logits, G->logits, (size_t)c->n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
+            if (p + 1 == GD_n && G->mtp_eh.d && mtp_catchup_b(m, d, toks + i, N, st)) {   /* the MTP block's K/V */
+                G = GD[0];
+                return -1;
+            }
         }
     }
     for (int p = GD_n - 1; p >= 0; p--) {
@@ -238,10 +290,167 @@ static int dense_forward_batch(q38_model *m, const int *toks, int n)
     return 0;
 }
 
+/* The MTP block's K/V over N tokens just through the last part (d->res holds their hidden rows):
+ * pairs (h of the position before, token), hprev the last row after */
+static int mtp_catchup_b(q38_model *m, DBat *d, const int *toks, int N, cudaStream_t st)
+{
+    const q38_cfg *c = &m->c;
+    const int E = c->n_embd;
+    CK(cudaEventSynchronize(d->ev_mtp));
+    for (int t = 0; t < N; t++)
+        q38_dequant_row(m->tok_embd.type, m->tok_embd.data + (int64_t)toks[t] * m->tok_embd.row_bytes, d->h_mtp + (int64_t)t * E, E);
+    CK(cudaMemcpyAsync(d->emb2, d->h_mtp, (size_t)N * E * sizeof(float), cudaMemcpyHostToDevice, st));
+    CK(cudaEventRecord(d->ev_mtp, st));
+    k_mtp_cat<<<N, 256, 0, st>>>(d->emb2, d->res, G->mtp_hprev, (const float *)G->mtp_enorm.d, (const float *)G->mtp_hnorm.d,
+                                 d->cat2, E, c->eps);
+    CK(cudaMemcpyAsync(G->mtp_hprev, d->res + (int64_t)(N - 1) * E, (size_t)E * sizeof(float), cudaMemcpyDeviceToDevice, st));
+    return dmm(d, &G->mtp_eh, d->cat2, 2 * E, d->res, E, N, st) || dense_layer_b(m, d, c->n_layer, N, st) ? -1 : 0;
+}
+
+/* A verification: N <= 4 tokens at n_past through the parts (the decode's 8-bit products, weights read
+ * once for all of them), the logits of every one into logits [N][n_vocab], the MTP catch-up. */
+/* the buffers a verification keeps its states in (Q38_SPEC_MAX copies a recurrent layer); 0 when they fit */
+static int keep_open(q38_model *m)
+{
+    const q38_cfg *c = &m->c;
+    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
+    for (int p = 0; p < GD_n; p++) {
+        DBat *d = GDB[p];
+        if (d->keep_ok) continue;
+        CK(cudaSetDevice(GD[p]->dev));
+        for (int il = 0; il < c->n_layer; il++) {
+            if (!GD[p]->conv[il]) continue;
+            if (cudaMalloc(&d->keep_conv[il], (size_t)Q38_SPEC_MAX * (c->conv_k - 1) * ch * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&d->keep_ssm[il], (size_t)Q38_SPEC_MAX * c->n_vh * S * S * sizeof(float)) != cudaSuccess) {
+                cudaGetLastError();
+                return -1;
+            }
+        }
+        if (cudaMalloc(&d->keep_h, (size_t)4 * c->n_embd * sizeof(float)) != cudaSuccess) { cudaGetLastError(); return -1; }
+        d->keep_ok = 1;
+    }
+    return 0;
+}
+
+extern "C" int q38_gpu_verify(void *model, const int *toks, int N, float *logits)
+{
+    q38_model *m = (q38_model *)model;
+    const q38_cfg *c = &m->c;
+    const int E = c->n_embd, p0 = m->n_past;
+    if (N < 1 || N > 4 || dense_bat_ready(m)) return -1;
+    static int keep = -1;                        /* the states kept per token: when their buffers fit */
+    if (keep < 0) keep = !(getenv("Q38_SPEC_KEEP") && !atoi(getenv("Q38_SPEC_KEEP"))) && keep_open(m) == 0;
+    for (int p = 0; p < GD_n; p++) GDB[p]->keeping = keep && N > 1;
+    for (int p = 0; p < GD_n; p++) {
+        G = GD[p];
+        DBat *d = GDB[p];
+        cudaStream_t st = G->st;
+        CK(cudaSetDevice(G->dev));
+        if (p == 0) {
+            CK(cudaEventSynchronize(d->ev_in[0]));
+            for (int t = 0; t < N; t++)
+                q38_dequant_row(m->tok_embd.type, m->tok_embd.data + (int64_t)toks[t] * m->tok_embd.row_bytes,
+                                d->h_in[0] + (int64_t)t * E, E);
+            CK(cudaMemcpyAsync(d->res, d->h_in[0], (size_t)N * E * sizeof(float), cudaMemcpyHostToDevice, st));
+            CK(cudaEventRecord(d->ev_in[0], st));
+        } else {
+            CK(cudaMemcpyAsync(d->res, GDB[p - 1]->h_out[0], (size_t)N * E * sizeof(float), cudaMemcpyHostToDevice, st));
+        }
+        k_set_int<<<1, 1, 0, st>>>(G->d_pos, p0);
+        const int l0 = p == 0 ? 0 : GD_split, l1 = p == 0 ? GD_split : c->n_layer;
+        for (int il = l0; il < l1; il++) if (dense_layer_b(m, d, il, N, st)) { G = GD[0]; return -1; }
+        if (p + 1 < GD_n) {
+            CK(cudaMemcpyAsync(d->h_out[0], d->res, (size_t)N * E * sizeof(float), cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            continue;
+        }
+        if (!d->lgv) {
+            if (!(d->lgv = dalloc((size_t)4 * c->n_vocab, G))) { G = GD[0]; return -1; }
+            CK(cudaMallocHost(&d->h_lgv, (size_t)4 * c->n_vocab * sizeof(float)));
+        }
+        k_rmsnorm_rows<<<N, 256, 0, st>>>(d->res, (const float *)G->output_norm.d, d->mixed, E, c->eps);
+        if (mvn(&G->output, d->mixed, E, d->lgv, c->n_vocab, N, st)) { G = GD[0]; return -1; }
+        CK(cudaMemcpyAsync(d->h_lgv, d->lgv, (size_t)N * c->n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st));
+        if (d->keeping) CK(cudaMemcpyAsync(d->keep_h, d->res, (size_t)N * E * sizeof(float), cudaMemcpyDeviceToDevice, st));
+        if (G->mtp_eh.d && mtp_catchup_b(m, d, toks, N, st)) { G = GD[0]; return -1; }
+        CK(cudaStreamSynchronize(st));
+        CK(cudaGetLastError());
+        memcpy(logits, d->h_lgv, (size_t)N * c->n_vocab * sizeof(float));
+    }
+    for (int t = 0; t < N; t++) m->toks[p0 + t] = toks[t];
+    m->n_past = p0 + N;
+    for (int p = 0; p < GD_n; p++) GDB[p]->keeping = 0;
+    G = GD[0];
+    return keep && N > 1 ? 1 : 0;                /* 1: the states after each token were kept */
+}
+
+/* After a verification of N tokens that kept its states (q38_gpu_verify returned 1): only its first
+ * a + 1 tokens stand. The recurrent state and the MTP block's hidden go back to those after token a;
+ * n_past to after it (the K/V past it is written again later). */
+extern "C" int q38_gpu_spec_keep(void *model, int a, int N)
+{
+    q38_model *m = (q38_model *)model;
+    const q38_cfg *c = &m->c;
+    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
+    const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
+    if (a >= N - 1) return 0;
+    for (int p = 0; p < GD_n; p++) {
+        Gpu *g = GD[p];
+        DBat *d = GDB[p];
+        CK(cudaSetDevice(g->dev));
+        for (int il = 0; il < c->n_layer; il++) {
+            if (!g->conv[il]) continue;
+            CK(cudaMemcpyAsync(g->conv[il], (const uint8_t *)d->keep_conv[il] + (size_t)a * conv_b, conv_b, cudaMemcpyDeviceToDevice, g->st));
+            CK(cudaMemcpyAsync(g->ssm[il], (const uint8_t *)d->keep_ssm[il] + (size_t)a * ssm_b, ssm_b, cudaMemcpyDeviceToDevice, g->st));
+        }
+        if (g->mtp_hprev)
+            CK(cudaMemcpyAsync(g->mtp_hprev, d->keep_h + (size_t)a * c->n_embd, (size_t)c->n_embd * sizeof(float),
+                               cudaMemcpyDeviceToDevice, g->st));
+    }
+    m->n_past -= N - 1 - a;
+    G = GD[0];
+    return 0;
+}
+
+/* The recurrent state (GDN and convolution of every layer, the MTP block's hidden) copied aside before
+ * a verification, and put back when its draft was wrong (the K/V past n_past is just written again). */
+extern "C" int q38_gpu_spec_state(void *model, int restore)
+{
+    q38_model *m = (q38_model *)model;
+    const q38_cfg *c = &m->c;
+    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
+    const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
+    if (dense_bat_ready(m)) return -1;
+    for (int p = 0; p < GD_n; p++) {
+        Gpu *g = GD[p];
+        DBat *d = GDB[p];
+        CK(cudaSetDevice(g->dev));
+        for (int il = 0; il < c->n_layer; il++) {
+            if (!g->conv[il]) continue;
+            if (!d->snap_conv[il]) {
+                CK(cudaMalloc(&d->snap_conv[il], conv_b));
+                CK(cudaMalloc(&d->snap_ssm[il], ssm_b));
+            }
+            CK(cudaMemcpyAsync(restore ? g->conv[il] : d->snap_conv[il], restore ? d->snap_conv[il] : g->conv[il], conv_b,
+                               cudaMemcpyDeviceToDevice, g->st));
+            CK(cudaMemcpyAsync(restore ? g->ssm[il] : d->snap_ssm[il], restore ? d->snap_ssm[il] : g->ssm[il], ssm_b,
+                               cudaMemcpyDeviceToDevice, g->st));
+        }
+        if (g->mtp_hprev) {
+            if (!d->snap_h) CK(cudaMalloc(&d->snap_h, (size_t)c->n_embd * sizeof(float)));
+            CK(cudaMemcpyAsync(restore ? g->mtp_hprev : d->snap_h, restore ? d->snap_h : g->mtp_hprev,
+                               (size_t)c->n_embd * sizeof(float), cudaMemcpyDeviceToDevice, g->st));
+        }
+    }
+    G = GD[0];
+    return 0;
+}
+
 static void dense_batch_close(void)
 {
     for (int p = 0; p < 2; p++) {
         if (!GDB[p]) continue;
+        if (GDB[p]->h_mtp) cudaFreeHost(GDB[p]->h_mtp);
         for (int k = 0; k < 2; k++) {
             if (GDB[p]->h_in[k]) cudaFreeHost(GDB[p]->h_in[k]);
             if (GDB[p]->h_out[k]) cudaFreeHost(GDB[p]->h_out[k]);

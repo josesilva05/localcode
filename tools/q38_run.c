@@ -81,6 +81,8 @@ int main(int argc, char **argv)
     double cache_gb = 0;
     int gpu = -1;
     const char *logits_dir = NULL;
+    int mtp = 0, mtp_hit = 0, mtp_n = 0, mtp_draft = -1;   /* --mtp: how often the MTP block guesses right */
+    int spec = 0;                     /* --spec: generate with speculative decoding */
     int from = 0, quiet = 0, batch = 0, text = 0, vbench = 0, xbench = 0, d8check = 0, mvbench = 0, lbench = 0;
     static int gtoks[8192];
     double preload = 0;               /* GB of experts read at start from localcode's usage profile */  /* --batch: the prompt in one batched pass */     /* logits only, without taps (taps force plain GPU launches) */
@@ -94,6 +96,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--from") && i + 1 < argc) from = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
         else if (!strcmp(argv[i], "--batch")) batch = 1;
+        else if (!strcmp(argv[i], "--mtp")) mtp = 1;
+        else if (!strcmp(argv[i], "--spec")) spec = 1;
         else if (!strcmp(argv[i], "--text")) text = 1;
         else if (!strcmp(argv[i], "--verify-bench")) vbench = 1;
         else if (!strcmp(argv[i], "--expert-bench")) xbench = 1;
@@ -181,7 +185,7 @@ int main(int argc, char **argv)
         }
         i0 = n;
     }
-    for (int i = i0; i < n + gen; i++) {
+    for (int i = i0; i < n + (spec ? 0 : gen); i++) {   /* --spec: the prompt here, the answer below */
         int tok = i < n ? toks[i] : next;
         double t0 = now_s(), r0 = m.t_read, e0 = m.t_experts, w0 = m.t_gpu_wait, p0 = m.t_ple, l0 = m.t_tail;
         g_cur = i;
@@ -198,11 +202,41 @@ int main(int argc, char **argv)
         top5(lg, m.c.n_vocab, t5);
         next = t5[0];
         if (i >= n - 1 && i - (n - 1) < 8192) gtoks[i - (n - 1)] = next;
+        if (mtp && i >= n - 1) {                 /* the guess for the token after next, checked next step */
+            if (mtp_draft >= 0) { mtp_n++; mtp_hit += mtp_draft == next; }
+            const float *dl = q38_model_mtp_draft(&m, next);
+            if (dl) { int b = 0; for (int v = 1; v < m.c.n_vocab; v++) if (dl[v] > dl[b]) b = v; mtp_draft = b; }
+        }
         if (!quiet || i >= n) printf("%s %3d id %6d %6.3fs (read %.3f, experts %.3f, gpuwait %.3f, ple %.3f, tail %.3f) top5 %d %d %d %d %d\n",
                i < n ? "prompt" : "gen   ", i, tok, now_s() - t0, m.t_read - r0, m.t_experts - e0, m.t_gpu_wait - w0,
                m.t_ple - p0, m.t_tail - l0, t5[0], t5[1], t5[2], t5[3], t5[4]);
         fflush(stdout);
     }
+    if (mtp) printf("mtp: %d of %d drafts right (%.1f%%)\n", mtp_hit, mtp_n, mtp_n ? 100.0 * mtp_hit / mtp_n : 0.0);
+    if (spec && gen > 0) {            /* the answer with speculative decoding (the MTP block's guesses) */
+        const double ts = now_s();
+        int produced = 0;
+        while (produced < gen && produced < 8191) {
+            int extra[Q38_SPEC_MAX];
+            gtoks[produced++] = next;
+            const int k = q38_model_forward_spec(&m, next, NULL, 0, extra);
+            if (k < 0) return 1;
+            for (int i = 0; i < k && produced < 8192; i++) gtoks[produced++] = extra[i];
+            int b = 0;
+            for (int v = 1; v < m.c.n_vocab; v++) if (m.logits[v] > m.logits[b]) b = v;
+            next = b;
+        }
+        const double dt = now_s() - ts;
+        const double nt = m.spec_tries ? (double)m.spec_tries : 1.0;
+        printf("spec: draft %.1f ms, verify %.1f ms a step\n", 1e3 * m.spec_t[0] / nt, 1e3 * m.spec_t[1] / nt);
+        printf("spec: %d tokens in %.2f s (%.1f tok/s); %lld guesses, %lld right\n", produced, dt, produced / dt,
+               (long long)m.spec_tries, (long long)m.spec_hits);
+        printf("ids:");
+        for (int i = 0; i < produced && i < 64; i++) printf(" %d", gtoks[i]);
+        printf("\n");
+        gen = produced;
+    }
+    fflush(stdout);                   /* a CPU run can leave without the exit's flush */
     if (text && gen > 0) {            /* what it wrote, readable (long-context recall tests) */
         q38_tok *tk = q38_tok_load(&m.g);
         if (tk) {
@@ -213,6 +247,7 @@ int main(int argc, char **argv)
                 printf("%s", piece);
             }
             printf("\n");
+            fflush(stdout);
             q38_tok_free(tk);
         }
     }

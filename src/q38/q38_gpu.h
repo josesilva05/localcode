@@ -36,6 +36,14 @@ int  q38_gpu_mvbench(void *model);
 int  q38_gpu_launchbench(void *model);
 /* One token; the logits land in the model's host buffer. Returns 0 or -1. */
 int  q38_gpu_forward(void *model, int token);
+/* The MTP block's draft on the device (see q38_model_mtp_draft): logits into m->mtp_logits. */
+int  q38_gpu_mtp_draft(void *model, int tok, int j);
+/* N <= 4 tokens at n_past, the logits of every one into logits [N][n_vocab] (dense models) */
+int  q38_gpu_verify(void *model, const int *toks, int n, float *logits);
+/* the recurrent state copied aside (restore 0) or put back (restore 1) around a verification */
+int  q38_gpu_spec_state(void *model, int restore);
+/* after a verification that kept its states (q38_gpu_verify returned 1): only its first a + 1 tokens stand */
+int  q38_gpu_spec_keep(void *model, int a, int n);
 /* The sequence state that does not follow from the position alone (Gated DeltaNet states,
  * convolution windows, the PLE ring) copied to a host buffer (save = 1) or back (save = 0).
  * With n_past set back to the position of the save, the model continues from there: the

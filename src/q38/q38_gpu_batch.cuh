@@ -170,7 +170,7 @@ __global__ void k_gdn_gates_b(float *beta, float *g, const float *dt_bias, const
 }
 
 /* the short convolution over N tokens in order; the state keeps the last K-1 inputs */
-__global__ void k_conv_silu_b(float *x, int ldx, float *state, const float *w, int ch, int K, int N)
+__global__ void k_conv_silu_b(float *x, int ldx, float *state, const float *w, int ch, int K, int N, float *snap = NULL)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ch || K > 8) return;
@@ -188,6 +188,10 @@ __global__ void k_conv_silu_b(float *x, int ldx, float *state, const float *w, i
 #pragma unroll
         for (int k = 0; k < 7; k++) if (k == K - 2) prev[k] = xi;
         x[(int64_t)t * ldx + i] = siluf_(acc);
+        if (snap && t < N - 1) {                  /* the state after token t (a verification) */
+#pragma unroll
+            for (int k = 0; k < 7; k++) if (k < K - 1) snap[((int64_t)t * (K - 1) + k) * ch + i] = prev[k];
+        }
     }
 #pragma unroll
     for (int k = 0; k < 7; k++) if (k < K - 1) state[(int64_t)k * ch + i] = prev[k];
@@ -206,7 +210,7 @@ __global__ void k_l2norm_b(float *x, int S, int rpt, int ld, float eps)
 
 /* the Gated DeltaNet recurrence of one value head over N tokens in order */
 __global__ void k_gdn_step_b(float *state, const float *qkv, int ld, const float *g, const float *beta, float *o,
-                             int S, int Hk, int Hv, int N)
+                             int S, int Hk, int Hv, int N, float *snap = NULL)
 {
     extern __shared__ float sh[];
     float *ks = sh, *qs = sh + S, *red = sh + 2 * S;
@@ -230,6 +234,7 @@ __global__ void k_gdn_step_b(float *state, const float *qkv, int ld, const float
         for (int i = i0; i < i1; i++) {
             const float s2 = St[(int64_t)i * S + j] * eg + ks[i] * d;
             St[(int64_t)i * S + j] = s2;
+            if (snap && t < N - 1) snap[(int64_t)t * Hv * S * S + ((int64_t)h * S + i) * S + j] = s2;   /* after token t */
             acc += s2 * qs[i];
         }
         red[p * S + j] = acc;

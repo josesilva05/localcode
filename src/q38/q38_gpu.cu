@@ -68,6 +68,10 @@ typedef struct {
     cudaEvent_t  ev;
     DMat      L[Q38_MAX_LAYERS][64];
     DMat      output, out_hc_norm, out_hc_down, out_hc_up, output_norm;
+    /* the MTP block's nextn tensors and buffers (the dense models' last part; its block in L[n_layer]) */
+    DMat      mtp_eh, mtp_enorm, mtp_hnorm, mtp_shnorm;
+    float    *mtp_hprev, *mtp_cat, *mtp_emb, *mtp_logits, *h_mtp_logits;
+    float    *mtp_hchain;               /* the last draft's normed output: the h of a chained draft */
     /* activations */
     float    *res, *xn, *mixed, *lo, *gate, *inject, *y, *routed;
     float    *fa_part;                     /* flash decode partials: segments x H x (D + 2) */
@@ -1023,13 +1027,13 @@ __global__ void __launch_bounds__(256) k_fattn_mma(const float *qf, const KT *kc
 template <typename KT, int DT>
 __global__ void __launch_bounds__(32) k_fattn_dec_mma(const float *qf, const KT *kc, const KT *vc, float *part,
                                                       const int *ppos, int H, int Hkv, const float *ks = NULL,
-                                                      const float *vs = NULL)
+                                                      const float *vs = NULL, int toff = 0)
 {
     extern __shared__ __align__(16) unsigned char smb[];
     __half *Qs = (__half *)smb, *Ks = Qs + 16 * (DT + FM_KP), *Vt = Ks + 16 * (DT + FM_KP);
     const int G = H / Hkv, kvh = blockIdx.x, seg = blockIdx.y, S = gridDim.y;
     const int lane = threadIdx.x, g = lane >> 2, tq = lane & 3;
-    const int T = *ppos + 1;
+    const int T = *ppos + toff + 1;                          /* toff: token toff of a few (verification) */
     const int L = ((T + S - 1) / S + 15) & ~15, k0 = seg * L, k1 = T < k0 + L ? T : k0 + L;
     const float scale = rsqrtf((float)DT);
     for (int e = lane; e < 16 * DT; e += 32) {
@@ -2074,12 +2078,16 @@ static void attn_t(Gpu *g, int il, const float *qf, float *out, int H, int Hkv, 
     const int wmma_asked = getenv("Q38_FA_KERNEL") && !strcmp(getenv("Q38_FA_KERNEL"), "wmma");
     if (!mma && !fa_ok(H, Hkv, D, sel)) {
         k_attn_t<<<dim3(H, N), 256, 0, st>>>(qf, (int64_t)H * 2 * D, kc, vc, out, (int64_t)H * D, g->d_pos, H, Hkv, D, sel, W, W);
-    } else if (N == 1 && mma) {
-        /* one token on mma.sync: FA_SEG_MMA one-warp blocks per K/V head, then the merge */
+    } else if (N <= 4 && mma) {
+        /* one token (or a few: a verification) on mma.sync: FA_SEG_MMA one-warp blocks per K/V head,
+         * then the merge; a few tokens one launch each, at their positions */
         const size_t sm = (size_t)(32 * (D + FM_KP) + D * FM_VS) * 2;
-        if (D == 256) k_fattn_dec_mma<KT, 256><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv);
-        else k_fattn_dec_mma<KT, 128><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv);
-        k_fattn_merge<<<dim3(H, 1), 256, 0, st>>>(g->fa_part, qf, out, H, D, 1, FA_SEG_MMA);
+        for (int t = 0; t < N; t++) {
+            const float *q = qf + (int64_t)t * H * 2 * D;
+            if (D == 256) k_fattn_dec_mma<KT, 256><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(q, kc, vc, g->fa_part, g->d_pos, H, Hkv, NULL, NULL, t);
+            else k_fattn_dec_mma<KT, 128><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(q, kc, vc, g->fa_part, g->d_pos, H, Hkv, NULL, NULL, t);
+            k_fattn_merge<<<dim3(H, 1), 256, 0, st>>>(g->fa_part, q, out + (int64_t)t * H * D, H, D, 1, FA_SEG_MMA);
+        }
     } else if (N == 1) {
         /* one token: QT = 1, every segment its own block, then the merge */
         k_fattn<KT, 1><<<dim3(Hkv, 1, FA_SEG), 256, fa_smem(1, D), st>>>(qf, kc, vc, out, g->fa_part, g->d_pos, H, Hkv, D, 1);
@@ -2104,11 +2112,14 @@ static void attn_q8(Gpu *g, int il, const float *qf, float *out, int H, int Hkv,
 {
     const int8_t *kc = (const int8_t *)g->kc[il], *vc = (const int8_t *)g->vc[il];
     const float *ks = g->ksc[il], *vs = g->vsc[il];
-    if (N == 1) {
+    if (N <= 4) {                                /* one token, or a few one launch each */
         const size_t sm = (size_t)(32 * (D + FM_KP) + D * FM_VS) * 2;
-        if (D == 256) k_fattn_dec_mma<int8_t, 256><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs);
-        else k_fattn_dec_mma<int8_t, 128><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs);
-        k_fattn_merge<<<dim3(H, 1), 256, 0, st>>>(g->fa_part, qf, out, H, D, 1, FA_SEG_MMA);
+        for (int t = 0; t < N; t++) {
+            const float *q = qf + (int64_t)t * H * 2 * D;
+            if (D == 256) k_fattn_dec_mma<int8_t, 256><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(q, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs, t);
+            else k_fattn_dec_mma<int8_t, 128><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(q, kc, vc, g->fa_part, g->d_pos, H, Hkv, ks, vs, t);
+            k_fattn_merge<<<dim3(H, 1), 256, 0, st>>>(g->fa_part, q, out + (int64_t)t * H * D, H, D, 1, FA_SEG_MMA);
+        }
     } else {
         const dim3 grid(Hkv, (N + 128 / (H / Hkv) - 1) / (128 / (H / Hkv)));
         if (D == 256) k_fattn_mma<int8_t, 256><<<grid, 256, fa_mma_smem(256), st>>>(qf, kc, vc, out, g->d_pos, H, Hkv, N, ks, vs);

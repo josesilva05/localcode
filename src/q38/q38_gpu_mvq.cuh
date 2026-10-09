@@ -173,6 +173,169 @@ __global__ void __launch_bounds__(128) k_mvq(const uint8_t *__restrict__ W, int6
     if (threadIdx.x == 0) y[r] = acc;
 }
 
+/* NC columns of one unit, the weights decoded once (into 8-bit lanes and their scales) and then
+ * multiplied with each column's x: decoding again for every column made 4 columns cost 1.6x (Q5_K)
+ * to 2.5x (IQ4_XS) one. xq/xd/xs: NC rows of ne0 (nb = ne0 / 32 scales a row). */
+template <int FIVE, int NC>
+__device__ __forceinline__ void unit_q45k(const uint8_t *row, int u, const int8_t *xq, const float *xd, const float *xs,
+                                          int ne0, float *acc)
+{
+    const int sb = u >> 2, j = u & 3, nb = ne0 / 32;
+    const uint8_t *blk = row + (int64_t)sb * (FIVE ? 176 : 144);
+    const float2 dm = __half22float2(*(const __half2 *)(const void *)blk);
+    int s1, m1, s2, m2;
+    k_scale_min(blk + 4, 2 * j, &s1, &m1);
+    k_scale_min(blk + 4, 2 * j + 1, &s2, &m2);
+    const uint8_t *qs = blk + (FIVE ? 48 : 16) + 32 * j;
+    int q[8], h[8], lo4[8], hi4[8];
+    *(int4 *)&q[0] = *(const int4 *)(const void *)qs; *(int4 *)&q[4] = *(const int4 *)(const void *)(qs + 16);
+    if (FIVE) { *(int4 *)&h[0] = *(const int4 *)(const void *)(blk + 16); *(int4 *)&h[4] = *(const int4 *)(const void *)(blk + 32); }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        lo4[i] = q[i] & 0x0F0F0F0F;
+        hi4[i] = (q[i] >> 4) & 0x0F0F0F0F;
+        if (FIVE) {
+            lo4[i] |= ((h[i] >> (2 * j)) & 0x01010101) << 4;
+            hi4[i] |= ((h[i] >> (2 * j + 1)) & 0x01010101) << 4;
+        }
+    }
+    const int b0 = sb * 8 + 2 * j, b1 = b0 + 1;
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const int8_t *x = xq + (int64_t)c * ne0;
+        int xa[8], xb[8];
+        *(int4 *)&xa[0] = *(const int4 *)(x + b0 * 32); *(int4 *)&xa[4] = *(const int4 *)(x + b0 * 32 + 16);
+        *(int4 *)&xb[0] = *(const int4 *)(x + b1 * 32); *(int4 *)&xb[4] = *(const int4 *)(x + b1 * 32 + 16);
+        int lo = 0, hi = 0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) { lo = __dp4a(lo4[i], xa[i], lo); hi = __dp4a(hi4[i], xb[i], hi); }
+        const float *d = xd + c * nb, *s = xs + c * nb;
+        acc[c] += dm.x * ((float)s1 * d[b0] * (float)lo + (float)s2 * d[b1] * (float)hi) - dm.y * ((float)m1 * s[b0] + (float)m2 * s[b1]);
+    }
+}
+
+template <int NC>
+__device__ __forceinline__ void unit_q6k(const uint8_t *row, int u, const int8_t *xq, const float *xd, int ne0, float *acc)
+{
+    const int sb = u >> 3, k = u & 7, n = k >> 2, qq = k & 3, nb = ne0 / 32;
+    const uint8_t *blk = row + (int64_t)sb * 210;
+    const uint8_t *ql = blk + 64 * n + 32 * (qq & 1), *qh = blk + 128 + 32 * n;
+    const int8_t *sc = (const int8_t *)(blk + 192) + 8 * n + 2 * qq;
+    const float d = __half2float(*(const __half *)(const void *)(blk + 208));
+    const int b = sb * 8 + 4 * n + qq;
+    const int sh = (int)((uintptr_t)ql & 3) * 8;
+    const int *qa = (const int *)(const void *)((uintptr_t)ql & ~(uintptr_t)3);
+    const int *ha = (const int *)(const void *)((uintptr_t)qh & ~(uintptr_t)3);
+    int wl[9], wh[9], v[8];
+#pragma unroll
+    for (int i = 0; i < 9; i++) { wl[i] = i < 8 || sh ? qa[i] : 0; wh[i] = i < 8 || sh ? ha[i] : 0; }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const int lw = (int)__funnelshift_r((unsigned)wl[i], (unsigned)wl[i + 1], sh);
+        const int hw = (int)__funnelshift_r((unsigned)wh[i], (unsigned)wh[i + 1], sh);
+        v[i] = ((lw >> (4 * (qq >> 1))) & 0x0F0F0F0F) | (((hw >> (2 * qq)) & 0x03030303) << 4);
+    }
+    const float s0 = (float)sc[0], s1 = (float)sc[1];
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const int8_t *x = xq + (int64_t)c * ne0 + b * 32;
+        int xv[8];
+        *(int4 *)&xv[0] = *(const int4 *)x; *(int4 *)&xv[4] = *(const int4 *)(x + 16);
+        int dot0 = 0, dot1 = 0, sx0 = 0, sx1 = 0;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            dot0 = __dp4a(v[i], xv[i], dot0); sx0 = __dp4a(0x01010101, xv[i], sx0);
+            dot1 = __dp4a(v[4 + i], xv[4 + i], dot1); sx1 = __dp4a(0x01010101, xv[4 + i], sx1);
+        }
+        acc[c] += d * xd[c * nb + b] * (s0 * (float)(dot0 - 32 * sx0) + s1 * (float)(dot1 - 32 * sx1));
+    }
+}
+
+/* IQ4_XS (sub-block u of 32) and IQ4_NL (block u): the table looked up once */
+template <int XS, int NC>
+__device__ __forceinline__ void unit_iq4(const uint8_t *row, int u, const int8_t *xq, const float *xd, int ne0, float *acc)
+{
+    const int nb = ne0 / 32;
+    float scale;
+    int lo[4], hi[4];
+    if (XS) {
+        const int sb = u >> 3, j = u & 7;
+        const uint8_t *blk = row + (int64_t)sb * 136;
+        const float d = __half2float(*(const __half *)(const void *)blk);
+        const int sh = blk[2] | (blk[3] << 8);
+        const int ls = ((blk[4 + j / 2] >> 4 * (j % 2)) & 0xf) | (((sh >> 2 * j) & 3) << 4);
+        scale = d * (float)(ls - 32);
+        const uint8_t *qs = blk + 8 + 16 * j;
+#pragma unroll
+        for (int i = 0; i < 4; i++) { const int q = ld_i32(qs + 4 * i); lo[i] = iq4_lut(q); hi[i] = iq4_lut(q >> 4); }
+    } else {
+        const uint8_t *blk = row + (int64_t)u * 18;
+        scale = __half2float(__ushort_as_half((unsigned short)(blk[0] | (blk[1] << 8))));
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int q = blk[2 + 4 * i] | (blk[3 + 4 * i] << 8) | (blk[4 + 4 * i] << 16) | (blk[5 + 4 * i] << 24);
+            lo[i] = iq4_lut(q);
+            hi[i] = iq4_lut(q >> 4);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const int8_t *x = xq + (int64_t)c * ne0 + u * 32;
+        int xv[8];
+        *(int4 *)&xv[0] = *(const int4 *)x; *(int4 *)&xv[4] = *(const int4 *)(x + 16);
+        int dot = 0;
+#pragma unroll
+        for (int i = 0; i < 4; i++) { dot = __dp4a(lo[i], xv[i], dot); dot = __dp4a(hi[i], xv[4 + i], dot); }
+        acc[c] += scale * xd[c * nb + u] * (float)dot;
+    }
+}
+
+/* NC vectors at once (a few tokens: speculative verification): each weight unit read and decoded
+ * once for all of them; x: NC rows of ne0 quantised */
+template <int TYPE, int NC>
+__global__ void __launch_bounds__(128) k_mvq_nc(const uint8_t *__restrict__ W, int64_t rb, int ne0, int rows,
+                                                const int8_t *__restrict__ xq, const float *__restrict__ xd,
+                                                const float *__restrict__ xs, float *__restrict__ y, int ldy)
+{
+    const int r = blockIdx.x * 4 + threadIdx.y;
+    if (r >= rows) return;
+    const uint8_t *row = W + (int64_t)r * rb;
+    const int units = TYPE == Q38_Q4_K || TYPE == Q38_Q5_K ? ne0 / 64 : ne0 / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; c++) acc[c] = 0.0f;
+    for (int u = threadIdx.x; u < units; u += 32) {
+        if (TYPE == Q38_Q4_K) unit_q45k<0, NC>(row, u, xq, xd, xs, ne0, acc);
+        else if (TYPE == Q38_Q5_K) unit_q45k<1, NC>(row, u, xq, xd, xs, ne0, acc);
+        else if (TYPE == Q38_Q6_K) unit_q6k<NC>(row, u, xq, xd, ne0, acc);
+        else if (TYPE == Q38_IQ4_XS) unit_iq4<1, NC>(row, u, xq, xd, ne0, acc);
+        else unit_iq4<0, NC>(row, u, xq, xd, ne0, acc);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const float v = warp_sum(acc[c]);
+        if (threadIdx.x == 0) y[(int64_t)c * ldy + r] = v;
+    }
+}
+
+/* NC rows of x (stride ldx) into blocks of 32: as k_q8x, the row c's blocks after row c-1's */
+__global__ void k_q8x_nc(const float *__restrict__ x, int ldx, int n, int NC, int8_t *__restrict__ q, float *__restrict__ d,
+                         float *__restrict__ s)
+{
+    const int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31, nb = n / 32;
+    if (b >= nb * NC) return;
+    const int c = b / nb, j = b % nb;
+    const float v = x[(int64_t)c * ldx + j * 32 + lane];
+    float a = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    const float inv = a > 0.0f ? 127.0f / a : 0.0f;
+    const int qi = __float2int_rn(v * inv);
+    q[(int64_t)c * n + j * 32 + lane] = (int8_t)qi;
+    int sum = qi;
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (lane == 0) { d[c * nb + j] = a / 127.0f; s[c * nb + j] = a / 127.0f * (float)sum; }
+}
+
 static int g_mvq = 0;               /* set by the dense models' open: their trunk goes through k_mvq */
 
 static int mvq_ok(int type)
