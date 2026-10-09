@@ -3,6 +3,7 @@
 
 #include "lc_tools.h"
 #include "lc_plugins.h"
+#include "lc_web.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -338,6 +339,7 @@ static int is_binary(const char *p, long n)
 #define T_PLAN  "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"PowerShell command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
 #define T_PLAN_SH "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"bash command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
 #define T_TEST  "{\"type\": \"function\", \"function\": {\"name\": \"test\", \"description\": \"Run the plan's test command (or command, when given) and tell whether it passes (exit code 0), with its output. Call it after every change.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"another test command; default the plan's\"}}, \"required\": []}}}"
+#define T_WEB   "{\"type\": \"function\", \"function\": {\"name\": \"webfetch\", \"description\": \"Fetch a web page (http or https URL) and read it as text: documentation, an API reference, an issue, a changelog. The user approves each fetch unless approval is automatic.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"url\": {\"type\": \"string\"}}, \"required\": [\"url\"]}}}"
 #define T_SKILL "{\"type\": \"function\", \"function\": {\"name\": \"skill\", \"description\": \"Load a skill listed in the instructions (or found by skill_search): its steps for a kind of task, to follow. name as listed (plugin:name when given so). file reads another file of the skill's folder.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, \"file\": {\"type\": \"string\"}}, \"required\": [\"name\"]}}}"
 #define T_SEARCH "{\"type\": \"function\", \"function\": {\"name\": \"skill_search\", \"description\": \"Find skills that are not in the list of the instructions: give a few English words of the task (for example: security audit, slides, react performance), even when the user writes in another language; it returns matching skills to load with skill.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}}"
 
@@ -396,7 +398,7 @@ const char *lc_tools_json(int level)
     const int sh = lc_tools_shell();
     Str *s = level <= 1 ? &l1[sh] : &l2[sh];
     if (s->p) return s->p;
-    s_str(s, T_READ "\n" T_LIST "\n" T_GLOB "\n" T_GREP);
+    s_str(s, T_READ "\n" T_LIST "\n" T_GLOB "\n" T_GREP "\n" T_WEB);
     if (level >= 2) s_str(s, sh ? "\n" T_WRITE "\n" T_EDIT "\n" T_RUN "\n" T_PLAN "\n" T_TEST
                                 : "\n" T_WRITE "\n" T_EDIT "\n" T_RUN_SH "\n" T_PLAN_SH "\n" T_TEST);
     if (*lc_skills_block()) s_str(s, "\n" T_SKILL "\n" T_SEARCH);   /* only where there are skills */
@@ -405,16 +407,17 @@ const char *lc_tools_json(int level)
 
 int lc_tool_allowed(const char *name, int level)
 {
-    static const char *reading[] = { "read_file", "list_dir", "glob", "grep", "skill", "skill_search" };
+    static const char *reading[] = { "read_file", "list_dir", "glob", "grep", "skill", "skill_search", "webfetch" };
     static const char *all[] = { "write_file", "edit_file", "run", "plan", "test" };
-    for (int i = 0; i < 6; i++) if (!strcmp(name, reading[i])) return level >= 1;
+    for (int i = 0; i < 7; i++) if (!strcmp(name, reading[i])) return level >= 1;
     for (int i = 0; i < 5; i++) if (!strcmp(name, all[i])) return level >= 2;
     return 0;
 }
 
 int lc_tool_needs_approval(const char *name)
 {
-    return !strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "run") || !strcmp(name, "test");
+    return !strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "run") || !strcmp(name, "test") ||
+           !strcmp(name, "webfetch");                /* it goes out to the network */
 }
 
 void lc_tool_title(const LcCall *c, char *buf, size_t cap)
@@ -424,6 +427,7 @@ void lc_tool_title(const LcCall *c, char *buf, size_t cap)
     else if (!strcmp(c->name, "glob") || !strcmp(c->name, "grep")) a = lc_call_arg(c, "pattern");
     else if (!strcmp(c->name, "skill")) a = lc_call_arg(c, "name");
     else if (!strcmp(c->name, "skill_search")) a = lc_call_arg(c, "query");
+    else if (!strcmp(c->name, "webfetch")) a = lc_call_arg(c, "url");
     else if (!strcmp(c->name, "plan")) a = "";
     char one[300];
     snprintf(one, sizeof one, "%s", a ? a : "");
@@ -1095,6 +1099,7 @@ char *lc_tool_run(const LcCall *c, volatile int *stop, char *summary, size_t sca
     summary[0] = 0;
     if (!strcmp(c->name, "skill"))      return t_skill(c, summary, scap, ok);
     if (!strcmp(c->name, "skill_search")) return t_skill_search(c, summary, scap, ok);
+    if (!strcmp(c->name, "webfetch"))   return lc_webfetch(lc_call_arg(c, "url"), 60000, summary, scap, ok);
     if (!strcmp(c->name, "read_file"))  return t_read(c, summary, scap, ok);
     if (!strcmp(c->name, "list_dir"))   return t_list(c, summary, scap, ok);
     if (!strcmp(c->name, "glob"))       return t_glob(c, summary, scap, ok);

@@ -24,6 +24,7 @@
 #include "lc_tools.h"
 #include "lc_hooks.h"
 #include "lc_mods.h"
+#include "lc_snap.h"
 
 #define MAX_CALLS   8          /* tool calls carried out from one model answer */
 #define ROOM        1024       /* positions kept free for the next step's start */
@@ -116,6 +117,45 @@ static const char LOW_EFFORT[] =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without "
     "unnecessary elaboration.";
 
+/* The project's rules, as opencode and Claude Code read them: AGENTS.md at the working directory's
+ * root (CLAUDE.md when there is none), then the user's own (%USERPROFILE%\\.localcode\\AGENTS.md),
+ * each up to RULES_MAX characters. */
+#define RULES_MAX 12000
+
+static void rules_file(Str *t, const char *path, const char *what)
+{
+    long n = 0;
+    char *text = lc_slurp(path, &n);
+    if (!text) return;
+    if (n > 0) {
+        s_fmt(t, "\n\n%s:\n", what);
+        if (n > RULES_MAX) { s_add(t, text, RULES_MAX); s_str(t, "\n[... cut: read the file for the rest]"); }
+        else s_add(t, text, (size_t)n);
+    }
+    free(text);
+}
+
+static void project_rules(Str *t)
+{
+    char path[4200];
+    snprintf(path, sizeof path, "%s/AGENTS.md", lc_tools_root());
+    char *a = lc_slurp(path, NULL);
+    if (a) { free(a); rules_file(t, path, "The project's rules (AGENTS.md; they come before the defaults above)"); }
+    else {
+        snprintf(path, sizeof path, "%s/CLAUDE.md", lc_tools_root());
+        rules_file(t, path, "The project's rules (CLAUDE.md; they come before the defaults above)");
+    }
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+#else
+    const char *home = getenv("HOME");
+#endif
+    if (home) {
+        snprintf(path, sizeof path, "%s/.localcode/AGENTS.md", home);
+        rules_file(t, path, "The user's own rules (for every project)");
+    }
+}
+
 static void system_block(Str *t, int level)
 {
     s_str(t, "<|im_start|>system\n");
@@ -158,6 +198,7 @@ static void system_block(Str *t, int level)
                  "from the workflow above, the skill's win. When none listed fits but one might exist, skill_search "
                  "with a few words of the task finds more.");
     }
+    project_rules(t);
     s_str(t, "\nWhen the user writes in Portuguese, answer in Brazilian Portuguese (pt-BR: \"arquivo\", \"rodar\", "
              "\"você\", \"me diga\"), never European Portuguese (\"ficheiro\", \"correr\", \"tu\", \"diz-me\").");
     s_str(t, "<|im_end|>\n");
@@ -483,8 +524,13 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     Str t = { 0 }, answer = { 0 }, actions = { 0 }, req = { 0 };
     lc_session_user(s, in->shown ? in->shown : in->prompt);
     /* /auto: the request carries the rule (the context's opening stays the same for every folder) */
+    {   /* the user's /undo or /redo since the last turn */
+        const char *un = lc_snap_note();
+        if (un) { s_str(&req, un); s_str(&req, "\n\n"); }
+    }
     s_str(&req, in->prompt);
     if (s->autonomous && level == 2) s_str(&req, AUTONOMOUS_NOTE);
+    if (level >= 2) lc_snap_turn();              /* the folder before this turn, for /undo */
     /* the hooks of the plugins the user allowed and of the project (lc_hooks.c) */
     lc_hooks_load(lc_tools_root());
     if (s->first && lc_hooks_any(LC_HOOK_SESSION_START)) {

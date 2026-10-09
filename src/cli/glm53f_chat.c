@@ -30,6 +30,7 @@
 #include "lc_tools.h"
 #include "lc_plugins.h"
 #include "lc_mods.h"
+#include "lc_snap.h"
 
 static double now_s(void)
 {
@@ -162,6 +163,9 @@ const Glm53fCommand glm53f_commands[] = {
     { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
     { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 2 },
     { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
+    { "/undo",      "",                "put the files back as they were before the agent's last turn (its commands' changes too)", 0 },
+    { "/redo",      "",                "put back what /undo took away", 0 },
+    { "/init",      "[FOCUS]",         "the agent studies this project and writes its rules in AGENTS.md (read by every conversation here)", 1 },
     { "/shell",     "bash|powershell", "the shell of the agent's run tool (bash: Git Bash, the default where it is found)", 2 },
     { "/plugin",    "[on|off NAME]",   "the plugins (skills, commands, hooks, mods), or one plugin or skill (plugin:name) on or off; /plugin hooks on|off NAME allows its hooks", 2 },
     { "/auto",      "[off]",           "this folder, remembered: the agent goes from start to finish without asking anything", 1 },
@@ -452,6 +456,24 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
                                            : "writes and commands ask first");
     } else if (!strncmp(line, "/approve", 8)) {
         in->note = dup_str("/approve takes ask or auto");
+    } else if (!strcmp(line, "/undo") || !strcmp(line, "/redo")) {
+        int changed = 0;
+        in->note = line[1] == 'u' ? lc_snap_undo(&changed) : lc_snap_redo(&changed);
+    } else if (!strcmp(line, "/init") || !strncmp(line, "/init ", 6)) {
+        /* opencode's /init: the agent studies the project and writes its rules */
+        const char *extra = line[5] ? line + 6 : "";
+        char buf[2400];
+        snprintf(buf, sizeof buf,
+                 "Study this project (list it, read its build files, README, main sources and tests) and create AGENTS.md "
+                 "at its root, or improve it if it exists, for coding agents that will work here: what the project is; the "
+                 "exact commands to build, run, test and lint it (try them); the code's conventions (naming, style, error "
+                 "handling, comments) as the code shows them; the layout (which folder holds what); what to avoid. Short, "
+                 "concrete, no generic advice, under 150 lines, in the language the project's docs use.%s%s",
+                 *extra ? " Also: " : "", extra);
+        in->prompt = dup_str(buf);
+        in->kind = GLM53F_IN_MESSAGE;
+        in->shown = dup_str(line);
+        in->note = dup_str("the agent writes AGENTS.md; the next conversation (/reset) reads it");
     } else if (!strcmp(line, "/shell bash") || !strcmp(line, "/shell powershell")) {
         const int ps = !strcmp(line, "/shell powershell");
         in->note = lc_tools_set_shell(ps) ? dup_str("Git Bash not found; run keeps PowerShell")
