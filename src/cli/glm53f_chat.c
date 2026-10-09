@@ -29,6 +29,7 @@
 #include "glm53f_chat.h"
 #include "lc_tools.h"
 #include "lc_plugins.h"
+#include "lc_mods.h"
 
 static double now_s(void)
 {
@@ -533,11 +534,22 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
             free(content);
         }
     } else {
-        /* a plugin's command, or a skill the user calls (lc_plugins.c) */
+        /* a mod's command (/replay), a plugin's command, or a skill the user calls */
         lc_plugins_load(lc_tools_root());
         char *note = NULL;
-        char *msg = lc_command_expand(line, &note);
-        if (msg) {
+        char *msg = NULL;
+        int modc = -1;
+        for (int i = 0; i < lc_mods_commands(); i++) {
+            const char *nm = lc_mods_command_name(i);
+            const size_t nl = strlen(nm);
+            if (!strncmp(line + 1, nm, nl) && (line[1 + nl] == 0 || line[1 + nl] == ' ')) modc = i;
+        }
+        if (modc >= 0) {
+            const char *nm = lc_mods_command_name(modc);
+            const char *a = line + 1 + strlen(nm);
+            while (*a == ' ') a++;
+            in->note = lc_mods_command_run(nm, a);
+        } else if ((msg = lc_command_expand(line, &note)) != NULL) {
             in->prompt = msg;
             in->kind = GLM53F_IN_MESSAGE;
             in->shown = dup_str(line);
@@ -805,6 +817,42 @@ static int read_line(char *buf, int cap)
     return (int)strlen(buf);
 }
 
+/* A mod's pane while it holds a call (plain front end): drawn once, answered by a line (a button's
+ * hotkey or the start of its label; an empty line or the end of the input stops what waits). */
+static void plain_mod_pump(void)
+{
+    static int answered = 0;
+    char title[160];
+    int esc = 0;
+    if (!lc_mods_pane(title, sizeof title, &esc)) { answered = 0; return; }
+    if (answered) return;
+    LcModView v;
+    if (!lc_mods_view("Pane", 78, 40, &v)) return;
+    printf("\n");
+    for (int i = 0; i < v.n; i++) printf("  %s\n", v.lines[i]);
+    printf("  ");
+    for (int i = 0; i < v.nb; i++) printf("%s[%s] %s", i ? " · " : "", v.button[i].hotkey, v.button[i].label);
+    printf("\n> ");
+    fflush(stdout);
+    char line[256];
+    int pressed = 0;
+    if (fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\r\n")] = 0;
+        for (int i = 0; i < v.nb && !pressed && line[0]; i++)
+            if (!strcmp(line, v.button[i].hotkey) || !strncmp(v.button[i].label, line, strlen(line))) {
+                printf("  (%s)\n", v.button[i].label);
+                lc_mods_press(v.button[i].id);
+                pressed = 1;
+            }
+    }
+    if (!pressed) {
+        if (esc) lc_mods_pane_close();
+        else lc_mods_abort();
+    }
+    answered = 1;
+    lc_mods_view_free(&v);
+}
+
 static int plain_run(Glm53fChat *s)
 {
 #ifdef _WIN32
@@ -817,7 +865,8 @@ static int plain_run(Glm53fChat *s)
     printf("localcode · %s · ready in %.1f s · /help for commands\n", s->e->name, s->load_s);
     if (s->start_note) printf("  %s\n", s->start_note);
     int rc = 0, shown = 0;
-    Glm53fTurnSink k = { plain_status, plain_reasoning, plain_thought, plain_answer, plain_done, &shown, plain_tool, plain_approve };
+    Glm53fTurnSink k = { plain_status, plain_reasoning, plain_thought, plain_answer, plain_done, &shown, plain_tool, plain_approve,
+                         plain_mod_pump };
     for (;;) {
         printf("\n> ");
         fflush(stdout);
@@ -838,9 +887,18 @@ static int plain_run(Glm53fChat *s)
     return rc;
 }
 
+void (*glm53f_mods_changed)(void) = NULL;
+
+static void mods_changed(void) { if (glm53f_mods_changed) glm53f_mods_changed(); }
+
 int glm53f_chat_run(Glm53fChat *s)
 {
     s->first = 1;
+    /* the mods the user allowed (lc_mods.c), beside localcode while it runs */
+    if (s->agent_level > 0) {
+        lc_mods_usage(s->e->cached, s->e->cap);
+        lc_mods_start(lc_tools_root(), mods_changed);
+    }
     if (s->resume) {                             /* --continue: the latest conversation here */
         int ok = 0;
         s->start_note = lc_session_resume(s, s->resume, &ok);
@@ -856,6 +914,7 @@ int glm53f_chat_run(Glm53fChat *s)
         printf("localcode · keeping this conversation's context for /resume…\n");
         fflush(stdout);
     }
+    lc_mods_stop();
     lc_session_end(s, 1);                        /* the context too, for an exact /resume */
     free(s->start_note);
     s->start_note = NULL;

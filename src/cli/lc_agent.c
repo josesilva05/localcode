@@ -23,6 +23,7 @@
 #include "glm53f_chat.h"
 #include "lc_tools.h"
 #include "lc_hooks.h"
+#include "lc_mods.h"
 
 #define MAX_CALLS   8          /* tool calls carried out from one model answer */
 #define ROOM        1024       /* positions kept free for the next step's start */
@@ -513,6 +514,10 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
         lc_hook_out_free(&ho);
     }
     const char *prompt = req.p ? req.p : in->prompt;
+    if (lc_mods_running()) {                     /* the mods: a turn starts */
+        lc_mods_usage(e->cached, e->cap);
+        free(lc_mods_event("turn.start", "{}", 5000, NULL));
+    }
     if (s->first) {
         open_context(s, k, &t, level, prompt);
     } else {
@@ -728,7 +733,7 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                 char *hinput = NULL;
                 LcHookOut pre;
                 memset(&pre, 0, sizeof pre);
-                if (lc_hooks_any(LC_HOOK_PRE_TOOL) || lc_hooks_any(LC_HOOK_POST_TOOL)) {
+                if (lc_hooks_any(LC_HOOK_PRE_TOOL) || lc_hooks_any(LC_HOOK_POST_TOOL) || lc_mods_running()) {
                     if (test_cmd) {
                         char *qc = lc_json_quote(test_cmd);
                         Str hi = { 0 };
@@ -741,7 +746,16 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                         hinput = lc_hook_tool_input(c);
                     }
                 }
-                if (lc_hooks_any(LC_HOOK_PRE_TOOL)) {
+                char *mod_why = NULL;
+                const int mod_no = lc_mods_running() && lc_mods_tool_call(hname, hinput, &mod_why, k->mod_pump);
+                if (mod_no) {                            /* a mod held it and the answer was no */
+                    pre.block = 1;
+                    pre.reason = mod_why;
+                    mod_why = NULL;
+                    if (k->tool) k->tool(k, "mod", pre.reason, 0);
+                }
+                free(mod_why);
+                if (!pre.block && lc_hooks_any(LC_HOOK_PRE_TOOL)) {
                     Str f = { 0 };
                     s_fmt(&f, "\"tool_name\": \"%s\", \"tool_input\": ", hname);
                     s_str(&f, hinput ? hinput : "{}");
@@ -751,9 +765,9 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
                 }
                 if (pre.block) {                         /* a hook said no: the model reads why */
                     go = 0;
-                    snprintf(sum, sizeof sum, "blocked by a hook");
+                    snprintf(sum, sizeof sum, mod_no ? "refused by a mod" : "blocked by a hook");
                     Str b = { 0 };
-                    s_fmt(&b, "A hook blocked this %s call: ", c->name);
+                    s_fmt(&b, mod_no ? "A mod refused this %s call: " : "A hook blocked this %s call: ", c->name);
                     s_str(&b, pre.reason ? pre.reason : "(no reason given)");
                     res = b.p;
                 } else if (pre.decision != 1 && ((lc_tool_needs_approval(c->name) && !s->auto_approve && !(s->always & (unsigned)bit)) ||
@@ -866,6 +880,10 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
              level, steps + 1, steps ? "s" : "", calls_done, calls_done == 1 ? "" : "s", dec_tok,
              dec_s > 0 ? dec_tok / dec_s : 0.0, pre_tok, pre_s, total, compacted ? " · compacted" : "",
              interrupted ? " · interrupted" : "");
+    if (lc_mods_running()) {                     /* the mods: the turn is over */
+        lc_mods_usage(e->cached, e->cap);
+        free(lc_mods_event("turn.complete", "{}", 5000, NULL));
+    }
     lc_session_answer(s, answer.p ? answer.p : (why_stop ? why_stop : ""), actions.p, stats);
     glm53f_chat_log(s, "## Você\n\n");
     glm53f_chat_log(s, in->shown ? in->shown : in->prompt);

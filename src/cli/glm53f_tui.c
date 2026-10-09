@@ -36,6 +36,7 @@
 
 #include "glm53f_chat.h"
 #include "lc_plugins.h"
+#include "lc_mods.h"
 #include "lc_tools.h"
 
 static Glm53fChat *g_s;   /* the session (set by glm53f_tui_run) */
@@ -293,7 +294,7 @@ typedef struct {
 static pthread_mutex_t g_mu;
 static Block *g_blocks;
 static int    g_nblocks, g_capblocks;
-static int    g_dirty = 1;
+static volatile int g_dirty = 1;
 
 static Block *block_new(int kind)
 {
@@ -1144,6 +1145,19 @@ static void menu_commands(const char *typed)
             glm53f_chat_command_value(g_s, c, it->value, sizeof it->value);
             it->submits = c->arg != 2;
         }
+    /* the mods' commands (/replay) */
+    for (int i = 0; i < lc_mods_commands(); i++) {
+        char slash[80];
+        snprintf(slash, sizeof slash, "/%s", lc_mods_command_name(i));
+        if (!starts_with_ci(slash, typed)) continue;
+        MenuItem *it = menu_add();
+        if (!it) return;
+        snprintf(it->tab, sizeof it->tab, "%s", slash);
+        snprintf(it->label, sizeof it->label, "%s", slash);
+        snprintf(it->hint, sizeof it->hint, "%s", lc_mods_command_desc(i));
+        snprintf(it->value, sizeof it->value, "mod");
+        it->submits = 1;
+    }
     /* the plugins' commands, then (after 3 letters) the skills the user can call by name */
     lc_plugins_load(lc_tools_root());
     for (int pass = 0; pass < 2; pass++)
@@ -1670,12 +1684,45 @@ static void submit(void)
     g_dirty = 1;
 }
 
+/* ------------------------------------------------------------------- mods ---- */
+
+/* What the mods draw (lc_mods.c): the band above the prompt, or their open pane in its place */
+static LcModView g_mband, g_mpane;
+static volatile int g_mods_dirty = 1;
+static int g_mods_w, g_mods_pane;
+
+/* from the mods' reader thread: no lock (the UI thread may be waiting on that thread) */
+static void tui_mods_changed(void) { g_mods_dirty = 1; g_dirty = 1; }
+
+static void mods_refresh(int W, int H)
+{
+    if (!lc_mods_running()) { g_mods_pane = 0; return; }
+    char *t = lc_mods_toast();
+    if (t) {
+        pthread_mutex_lock(&g_mu);
+        block_add(B_NOTE, t);
+        pthread_mutex_unlock(&g_mu);
+        free(t);
+    }
+    if (!g_mods_dirty && W == g_mods_w) return;
+    g_mods_dirty = 0;
+    g_mods_w = W;
+    lc_mods_view_free(&g_mpane);
+    lc_mods_view_free(&g_mband);
+    g_mods_pane = lc_mods_pane(NULL, 0, NULL) && lc_mods_view("Pane", W - 4, H / 2, &g_mpane) > 0;
+    if (!g_mods_pane) lc_mods_view("AbovePrompt", W - 4, 6, &g_mband);
+}
+
 /* ------------------------------------------------------------------- frame ---- */
 
 static void draw(Glm53fChat *s)
 {
     term_size();
     const int W = T.w, H = T.h;
+    mods_refresh(W, H);
+    const LcModView *band = g_mods_pane ? &g_mpane : &g_mband;
+    int nband = band->n;
+    if (nband > H / 2) nband = H / 2;
     Lines L = { 0 };
     pthread_mutex_lock(&g_mu);
     render_blocks(&L, s, W);
@@ -1713,7 +1760,7 @@ static void draw(Glm53fChat *s)
     menu_build();
     int mr = menu_rows();
     if (H - box - footer - 1 - mr < 3) mr = 0;          /* too short a window for it */
-    int view = H - box - footer - 1 - mr;
+    int view = H - box - footer - 1 - mr - nband;
     if (view < 1) view = 1;
     int maxoff = L.n - view;
     if (maxoff < 0) maxoff = 0;
@@ -1730,9 +1777,11 @@ static void draw(Glm53fChat *s)
         if (idx >= 0 && idx < L.n) buf_str(&f, L.v[idx].s);
     }
     if (mr) menu_draw(&f, view + 1, W);
-    buf_fmt(&f, "\033[%d;1H\033[2K", view + mr + 1);
+    for (int b = 0; b < nband; b++)                     /* the mods' band or pane */
+        buf_fmt(&f, "\033[%d;1H\033[2K  %s\033[0m", view + mr + 1 + b, band->lines[b]);
+    buf_fmt(&f, "\033[%d;1H\033[2K", view + mr + nband + 1);
 
-    int row = view + mr + 2;
+    int row = view + mr + nband + 2;
     const char *bar = C_PANEL C_BRIGHT "▌" C_TEXT "  ";
     buf_fmt(&f, "\033[%d;1H\033[2K  %s", row++, bar);
     spaces(&f, W - 7);
@@ -1826,6 +1875,51 @@ static int on_input(const char *p, int n, int view_rows)
     int i = 0;
     while (i < n) {
         const unsigned char c = (unsigned char)p[i];
+        if (g_mods_pane && g_mpane.nb) {                 /* a mod's pane takes the keys */
+            const int seq = c == 0x1b && i + 1 < n && (p[i + 1] == '[' || p[i + 1] == 'O');
+            if (seq) {                                   /* arrows: left/right move the focus */
+                int j = i + 2;
+                while (j < n && !((unsigned char)p[j] >= 0x40 && (unsigned char)p[j] <= 0x7e)) j++;
+                if (j < n && (p[j] == 'C' || p[j] == 'D')) {
+                    const int nb = g_mpane.nb, f0 = g_mpane.focus < 0 ? 0 : g_mpane.focus;
+                    lc_mods_focus(p[j] == 'C' ? (f0 + 1) % nb : (f0 + nb - 1) % nb);
+                    g_mods_dirty = 1;
+                }
+                i = j + 1;
+                g_dirty = 1;
+                continue;
+            }
+            if (c == 0x1b || c == 0x03) {                /* escape: close it, or stop what waits on it */
+                int esc = 0;
+                lc_mods_pane(NULL, 0, &esc);
+                if (esc) lc_mods_pane_close(); else lc_mods_abort();
+            } else if (c == '\t') {
+                const int nb = g_mpane.nb, f0 = g_mpane.focus < 0 ? 0 : g_mpane.focus;
+                lc_mods_focus((f0 + 1) % nb);
+            } else if (c == '\r' || c == '\n') {
+                const int f0 = g_mpane.focus < 0 ? 0 : g_mpane.focus;
+                lc_mods_press(g_mpane.button[f0].id);
+            } else {
+                for (int b = 0; b < g_mpane.nb; b++)
+                    if (g_mpane.button[b].hotkey[0] && ((unsigned char)g_mpane.button[b].hotkey[0] | 32) == (c | 32)) {
+                        lc_mods_press(g_mpane.button[b].id);
+                        break;
+                    }
+            }
+            i++;
+            g_mods_dirty = 1;
+            g_dirty = 1;
+            continue;
+        }
+        if (c == 0x1b && i + 1 < n && p[i + 1] != '[' && p[i + 1] != 'O' && g_mband.nb) {   /* alt+key: a band button */
+            int hit = 0;
+            for (int b = 0; b < g_mband.nb && !hit; b++)
+                if (g_mband.button[b].hotkey[0] && ((unsigned char)g_mband.button[b].hotkey[0] | 32) == ((unsigned char)p[i + 1] | 32)) {
+                    lc_mods_press(g_mband.button[b].id);
+                    hit = 1;
+                }
+            if (hit) { i += 2; g_mods_dirty = 1; g_dirty = 1; continue; }
+        }
         if (g_ask_state == 1) {                          /* an open question takes the keys */
             if (c == 0x1b && i + 1 < n && (p[i + 1] == '[' || p[i + 1] == 'O')) {   /* arrows, mouse: not an answer */
                 int j = i + 2;
@@ -1974,6 +2068,7 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
 {
     if (term_open(forced) != 0) return -1;
     g_s = s;
+    glm53f_mods_changed = tui_mods_changed;
     pthread_mutex_init(&g_mu, NULL);
     pthread_cond_init(&g_ask_cv, NULL);
     g_recent = lc_session_recent(s, 3);

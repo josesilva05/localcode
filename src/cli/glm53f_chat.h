@@ -147,7 +147,13 @@ typedef struct Glm53fTurnSink {
      * 1 yes, 2 yes for this tool until the session ends. NULL approve: always no. */
     void (*tool)(struct Glm53fTurnSink *k, const char *title, const char *summary, int ok);
     int  (*approve)(struct Glm53fTurnSink *k, const char *title, const char *detail);
+    /* called while a mod holds a tool call (lc_mods.c): the plain front end answers its pane here;
+     * NULL where another thread does (the full-screen one) */
+    void (*mod_pump)(void);
 } Glm53fTurnSink;
+
+/* Set by the full-screen front end: what the mods draw changed (called from another thread). */
+extern void (*glm53f_mods_changed)(void);
 
 /* What a line typed by the user asks for. */
 typedef struct {

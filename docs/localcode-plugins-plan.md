@@ -80,3 +80,23 @@ Fase 5, subagentes dos plugins (`agents/*.md`):
 Fase 6:
 - Testar cada um dos 35 itens com o Qwen local: ativa quando deve, muda o comportamento, não quebra.
 - Depois, as partes próprias do localcode também viram plugins.
+
+## Estado (2026-10-09)
+
+- **Fase 1, feita (f013137).** O carregador acha 73 plugins, 446 skills e 161 comandos em 0,4 s.
+  - O prompt lista as skills ligadas dentro de 7000 caracteres, com as do guia primeiro; `skill_search` acha as outras.
+  - O 27B achou as skills de auditoria de dependências pela busca e carregou `test-driven-development` numa tarefa de TDD.
+  - Falta: com a skill carregada, ele ainda não roda o teste novo para vê-lo falhar antes de implementar.
+- **Fase 2, feita (0484b6e).** `/nome` roda os comandos dos plugins e as skills chamadas pelo usuário, com o prefixo curto do plugin quando há conflito. O `/caveman-review` funcionou com o agente.
+- **Fase 3, feita (bb6ca68).** Hooks de comando do Claude Code, só depois de `/plugin hooks on NOME`, e os do projeto (`.claude/settings.json`).
+  - Com o 27B, funcionaram UserPromptSubmit, PreToolUse (bloqueou `rm`), PostToolUse e Stop.
+  - O SessionStart do superpowers funcionou.
+- **Fase 4, feita.** O `modhost.mjs` em Node roda os três mods do playground sem mudar uma linha.
+  - Blast Radius segurou `git clean -f velho.bak`, mediu "remove 1 untracked path", desenhou o painel, e o Cancel recusou o comando.
+  - Replay Theater registrou a edição e respondeu ao `/replay`.
+  - Token Weather desenhou a faixa acima do prompt na TUI.
+  - Painel na TUI: Tab e as setas movem o foco, Enter e as teclas de atalho apertam, Esc fecha ou interrompe. Na faixa, Alt+tecla aperta. No modo texto, o painel é impresso e respondido por uma linha.
+- **Incompatibilidade.** A ferramenta `run` do localcode usa PowerShell, mas skills, hooks e mods do ecossistema do Claude Code supõem bash.
+  - Exemplo: o Blast Radius não reconhece `Remove-Item -Recurse -Force`.
+  - A decidir: oferecer a bash (Git Bash, como o Claude Code no Windows) como shell do `run`.
+- **Fases 5 e 6, por fazer:** subagentes dos plugins; testar os 35 itens com o Qwen local; tudo como plugin.
