@@ -602,6 +602,7 @@ int main(int argc, char **argv)
     s.reasoning = QWEN_LEVELS[li].name;
     s.agent_level = agent_level < 0 ? 0 : agent_level > 2 ? 2 : agent_level;
     if (lc_tools_init(NULL) != 0) s.agent_level = 0;   /* no working directory: chat only */
+    if (s.agent_level && lc_auto_dir(lc_tools_root())) s.autonomous = s.auto_approve = 1;   /* /auto here before */
     if (gen >= e.cap) gen = e.cap / 2;
     s.gen = gen;
     s.resume = resume;

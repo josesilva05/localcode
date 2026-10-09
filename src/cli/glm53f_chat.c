@@ -27,6 +27,7 @@
 #endif
 
 #include "glm53f_chat.h"
+#include "lc_tools.h"
 
 static double now_s(void)
 {
@@ -159,6 +160,7 @@ const Glm53fCommand glm53f_commands[] = {
     { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
     { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 2 },
     { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
+    { "/auto",      "[off]",           "this folder, remembered: the agent goes from start to finish without asking anything", 1 },
     { "/reasoning", "LEVEL",           "reasoning effort of level 0 chat (set when a conversation opens)", 2 },
     { "/gen",       "N",               "tokens to generate per answer", 2 },
     { "/thinking",  "",                "show or fold the model's reasoning", 0 },
@@ -202,6 +204,7 @@ void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char
     if (!strcmp(n, "/reasoning"))     snprintf(buf, cap, "%s", s->reasoning);
     else if (!strcmp(n, "/level"))    snprintf(buf, cap, "%s", s->agent_level == 2 ? "2 agent" : s->agent_level == 1 ? "1 quick" : "0 chat");
     else if (!strcmp(n, "/approve"))  snprintf(buf, cap, "%s", s->auto_approve ? "auto" : "ask");
+    else if (!strcmp(n, "/auto"))     snprintf(buf, cap, "%s", s->autonomous ? "on" : "off");
     else if (!strcmp(n, "/gen"))      snprintf(buf, cap, "%d", s->gen);
     else if (!strcmp(n, "/thinking")) snprintf(buf, cap, "%s", s->show_thinking ? "shown" : "folded");
     else if (!strcmp(n, "/stats") && s->last_spt > 0.0)
@@ -421,9 +424,21 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
                                : v == 1 ? "level 1 · quick: reads the project's files to answer · new conversation"
                                         : "level 0 · chat, no tools · new conversation");
         }
+    } else if (!strcmp(line, "/auto") || !strcmp(line, "/auto on") || !strcmp(line, "/auto off")) {
+        /* the folder joins (or leaves) the autonomous list: no approvals, no questions */
+        const int on = strcmp(line, "/auto off") != 0;
+        const char *dir = lc_tools_root();
+        s->autonomous = on;
+        s->auto_approve = on;
+        if (!on) s->always = 0;
+        const int saved = dir && lc_auto_dir_set(dir, on) == 0;
+        in->note = on ? fmt_str("modo autônomo em %s: o agente vai do início ao fim sem pedir aprovação nem fazer "
+                                "perguntas%s · /auto off desliga", dir ? dir : "esta pasta",
+                                saved ? " (fica lembrado para esta pasta)" : "")
+                      : dup_str("modo autônomo desligado nesta pasta: escritas e comandos voltam a pedir aprovação");
     } else if (!strcmp(line, "/approve ask") || !strcmp(line, "/approve auto")) {
         s->auto_approve = !strcmp(line, "/approve auto");
-        if (!s->auto_approve) s->always = 0;
+        if (!s->auto_approve) { s->always = 0; s->autonomous = 0; }
         in->note = dup_str(s->auto_approve ? "writes and commands run without asking (inside the working directory)"
                                            : "writes and commands ask first");
     } else if (!strncmp(line, "/approve", 8)) {

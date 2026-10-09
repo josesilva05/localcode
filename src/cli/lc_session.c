@@ -807,3 +807,53 @@ int lc_compact(Glm53fChat *s, Glm53fTurnSink *k, const char *request, const char
     glm53f_chat_log(s, logl);
     return 0;
 }
+
+/* ------------------------------------------------------- autonomous folders ---- */
+/* %LOCALAPPDATA%\localcode\auto_dirs.txt: one folder a line, where the agent works without
+ * asking (/auto on). */
+static int auto_path(char *path, size_t cap)
+{
+    char dir[1024];
+    if (sess_dir(dir, sizeof dir)) return -1;            /* creates localcode\ */
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base) base = getenv("HOME");
+    snprintf(path, cap, "%s/localcode/auto_dirs.txt", base);
+    return 0;
+}
+
+int lc_auto_dir(const char *dir)
+{
+    char path[1100], line[2048];
+    if (!dir || auto_path(path, sizeof path)) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int hit = 0;
+    while (!hit && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        hit = line[0] && same_dir(line, dir);
+    }
+    fclose(f);
+    return hit;
+}
+
+int lc_auto_dir_set(const char *dir, int on)
+{
+    char path[1100], line[2048];
+    if (!dir || auto_path(path, sizeof path)) return -1;
+    Str keep = { 0 };
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (line[0] && !same_dir(line, dir)) { s_str(&keep, line); s_str(&keep, "\n"); }
+        }
+        fclose(f);
+    }
+    if (on) { s_str(&keep, dir); s_str(&keep, "\n"); }
+    f = fopen(path, "wb");
+    if (!f) { free(keep.p); return -1; }
+    if (keep.n) fwrite(keep.p, 1, keep.n, f);
+    fclose(f);
+    free(keep.p);
+    return 0;
+}

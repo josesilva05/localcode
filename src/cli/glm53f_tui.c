@@ -1731,6 +1731,7 @@ static void draw(Glm53fChat *s)
                  lvl ? (lvl == 1 ? "low" : "medium") : s->reasoning);
         if (g_ask_state == 1)  snprintf(right, sizeof right, C_YELLOW "S sim · A sempre · N não");
         else if (g_busy)       snprintf(right, sizeof right, C_DIM "esc interrompe%s", g_nqueue ? " · na fila" : "");
+        else if (lvl == 2 && s->autonomous) snprintf(right, sizeof right, C_YELLOW "⏵⏵ autônomo nesta pasta");
         else if (lvl == 2)     snprintf(right, sizeof right, s->auto_approve ? C_YELLOW "⏵⏵ aprovação automática"
                                                                            : C_DIM "pede antes de editar ou rodar");
         else                   snprintf(right, sizeof right, C_DIM "%s", g_nqueue ? "na fila" : "");

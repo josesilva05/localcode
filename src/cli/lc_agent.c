@@ -26,6 +26,12 @@
 #define MAX_CALLS   8          /* tool calls carried out from one model answer */
 #define ROOM        1024       /* positions kept free for the next step's start */
 
+/* what /auto adds to each request of the folder */
+static const char AUTONOMOUS_NOTE[] =
+    "\n\n[localcode] Modo autônomo nesta pasta: não faça perguntas nem peça confirmação ao usuário. "
+    "Quando algo for ambíguo, escolha a opção mais razoável, diga qual escolheu e siga até terminar a tarefa "
+    "(com o teste passando, se houver).";
+
 static double now_s(void)
 {
     struct timespec t;
@@ -444,13 +450,17 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     char line[512];
     *stop = 0;
 
-    Str t = { 0 }, answer = { 0 }, actions = { 0 };
+    Str t = { 0 }, answer = { 0 }, actions = { 0 }, req = { 0 };
     lc_session_user(s, in->shown ? in->shown : in->prompt);
+    /* /auto: the request carries the rule (the context's opening stays the same for every folder) */
+    s_str(&req, in->prompt);
+    if (s->autonomous && level == 2) s_str(&req, AUTONOMOUS_NOTE);
+    const char *prompt = req.p ? req.p : in->prompt;
     if (s->first) {
-        open_context(s, k, &t, level, in->prompt);
+        open_context(s, k, &t, level, prompt);
     } else {
         s_str(&t, "<|im_end|>\n<|im_start|>user\n");
-        s_str(&t, in->prompt);
+        s_str(&t, prompt);
         s_str(&t, "<|im_end|>\n<|im_start|>assistant\n<think>\n");
     }
 
@@ -466,7 +476,7 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
         if (n <= 0) { why_stop = "could not tokenise the step"; failed = 1; break; }
         const int step_gen = s->gen < 4096 ? s->gen : 4096;
         if (lc_compact_due(s, n + step_gen)) {
-            const int rc = compact_step(s, k, &t, level, in->prompt);
+            const int rc = compact_step(s, k, &t, level, prompt);
             if (rc < 0) { why_stop = "the engine failed while compacting"; fatal = 1; break; }
             if (rc == 0) { compacted++; continue; }   /* an esc stops at the next answer's start */
         }
@@ -700,6 +710,7 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     s->last_answer = answer.p;
     answer.p = NULL;
     free(t.p);
+    free(req.p);
     free(actions.p);
     free(fl.test_cmd);
     if (why_stop && failed) { k->done(k, why_stop, 2); return 0; }

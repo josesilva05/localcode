@@ -98,6 +98,7 @@ typedef struct {
     /* the agent (lc_agent.c): 0 plain chat, 1 quick (reading tools), 2 agent (every tool) */
     int          agent_level;
     int          auto_approve;   /* 1: writes and commands run without asking  */
+    int          autonomous;     /* 1: /auto in this folder: no approvals, no questions, to the end */
     unsigned     always;         /* tools the user allowed for the session (bit per tool) */
     /* the conversation on disk and its compaction (lc_session.c) */
     void        *sess;           /* the session file being written; NULL until the first message */
@@ -176,6 +177,9 @@ char *lc_session_resume(Glm53fChat *s, const char *arg, int *ok);
 /* 1 when a step of need positions calls for a compaction first: it would leave fewer free
  * than a compaction needs, and the conversation holds enough to be worth summarising. */
 int   lc_compact_due(const Glm53fChat *s, int need);
+/* Autonomous folders (/auto): the agent works there without asking, remembered across runs. */
+int   lc_auto_dir(const char *dir);
+int   lc_auto_dir_set(const char *dir, int on);
 /* The model summarises the context (request: the request in progress, kept word for word;
  * focus: what /compact asked to keep), the context is emptied and the summary waits in
  * s->preface. Returns 0, 1 when there is no room even for the summary, -1 engine failure. */

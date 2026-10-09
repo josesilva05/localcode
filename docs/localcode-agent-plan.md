@@ -63,6 +63,11 @@ Planejar → programar → testar → (depurar → corrigir → retestar)* → f
 - Passou: o agente finaliza na hora (resposta curta: o que mudou e o teste que passou). Se passar de primeira, acabou.
 - Uma resposta final depois de mudar arquivos sem testar é devolvida para testar (no máximo 2 vezes).
 - Uma pergunta que não muda nada é respondida direto, sem plano nem teste. O agente segue direto, sem esperar aprovação do plano.
+- `/auto` (modo autônomo da pasta, lembrado em `%LOCALAPPDATA%\localcode\auto_dirs.txt`):
+  - escritas e comandos rodam sem pedir aprovação;
+  - cada pedido leva a regra de não fazer perguntas: o modelo escolhe a opção mais razoável, diz qual escolheu e vai até o fim;
+  - o rodapé mostra "⏵⏵ autônomo nesta pasta"; `/auto off` desliga.
+  - Os limites do ciclo continuam valendo (5 tentativas, a mesma falha 3 vezes) e as ferramentas continuam presas à pasta de trabalho.
 
 **Skills**: pastas com `SKILL.md` (cabeçalho `name:` / `description:` entre `---`, depois as instruções) em `.localcode/skills` e `.claude/skills` da pasta de trabalho e em `%USERPROFILE%\.localcode\skills`. O agente vê nomes e descrições; `skill(name)` carrega as instruções (e `file` outros arquivos da pasta da skill). Quando uma skill cobre a tarefa, ela vale sobre o ciclo padrão.
 
