@@ -37,8 +37,8 @@ static int64_t need_int(const q38_gguf *g, const char *key, int *bad)
 static int read_cfg(q38_cfg *c, const q38_gguf *g)
 {
     const char *arch = q38_gguf_str(g, "general.architecture");
-    if (!arch || (strcmp(arch, "qwen4exp") && strcmp(arch, "qwen35moe"))) {
-        fprintf(stderr, "q38: architecture %s is not supported yet (qwen4exp, qwen35moe)\n", arch ? arch : "(none)");
+    if (!arch || (strcmp(arch, "qwen4exp") && strcmp(arch, "qwen35moe") && strcmp(arch, "qwen35"))) {
+        fprintf(stderr, "q38: architecture %s is not supported yet (qwen4exp, qwen35moe, qwen35)\n", arch ? arch : "(none)");
         return -1;
     }
     int bad = 0;
@@ -56,10 +56,16 @@ static int read_cfg(q38_cfg *c, const q38_gguf *g)
     c->n_rot      = (int)need_int(g, K("rope.dimension_count"), &bad);
     c->rope_base  = q38_gguf_float(g, K("rope.freq_base"), 10000.0);
     c->eps        = (float)q38_gguf_float(g, K("attention.layer_norm_rms_epsilon"), 1e-6);
-    c->n_exp      = (int)need_int(g, K("expert_count"), &bad);
-    c->n_exp_used = (int)need_int(g, K("expert_used_count"), &bad);
-    c->ff_exp     = (int)need_int(g, K("expert_feed_forward_length"), &bad);
-    c->ff_shexp   = (int)need_int(g, K("expert_shared_feed_forward_length"), &bad);
+    if (!strcmp(arch, "qwen35")) {
+        /* Qwen3.5/3.6/3.8 dense: one FFN a layer, held in the shared expert's fields (ungated) */
+        c->dense      = 1;
+        c->ff_shexp   = (int)need_int(g, K("feed_forward_length"), &bad);
+    } else {
+        c->n_exp      = (int)need_int(g, K("expert_count"), &bad);
+        c->n_exp_used = (int)need_int(g, K("expert_used_count"), &bad);
+        c->ff_exp     = (int)need_int(g, K("expert_feed_forward_length"), &bad);
+        c->ff_shexp   = (int)need_int(g, K("expert_shared_feed_forward_length"), &bad);
+    }
     c->interval   = (int)q38_gguf_int(g, K("full_attention_interval"), 4);
     c->ctx_train  = (int)q38_gguf_int(g, K("context_length"), 262144);
     c->conv_k     = (int)need_int(g, K("ssm.conv_kernel"), &bad);
@@ -239,6 +245,12 @@ static int bind_all(q38_model *m)
             B(ple_norm_conv, "blk.%d.ple_norm_conv.weight", hcE, 1);
             B(ple_conv, "blk.%d.ple_conv1d.weight", c->ple_kern, hcE);
         }
+        if (c->dense) {
+            B(sh_gate, "blk.%d.ffn_gate.weight", E, c->ff_shexp);
+            B(sh_up, "blk.%d.ffn_up.weight", E, c->ff_shexp);
+            B(sh_down, "blk.%d.ffn_down.weight", c->ff_shexp, E);
+            continue;
+        }
         B(router, "blk.%d.ffn_gate_inp.weight", E, c->n_exp);
         B(shexp_gate_inp, "blk.%d.ffn_gate_inp_shexp.weight", E, 1);
         B(sh_gate, "blk.%d.ffn_gate_shexp.weight", E, c->ff_shexp);
@@ -252,7 +264,7 @@ static int bind_all(q38_model *m)
 }
 
 /* -------------------------------------------------------------------- kernels -- */
-#define MAX_NE0 16384
+#define MAX_NE0 32768          /* the dense 27B's down rows: 17408 */
 #define MAX_THREADS 64
 static float g_rowbuf[MAX_THREADS][MAX_NE0];
 
@@ -1180,9 +1192,25 @@ static int experts_compute(q38_model *m, int il, const float *x, const int *ids,
     return 0;
 }
 
+/* The dense FFN (qwen35): down(silu(gate x) * up x), float activations */
+static int dense_ffn(q38_model *m, int il, const float *x, float *y)
+{
+    const q38_layer *l = &m->L[il];
+    const int F = m->c.ff_shexp;
+    float *gu = m->moe_gu, *h = m->moe_h;
+    const double t0 = now_s();
+    matvec(&l->sh_gate, x, gu);
+    matvec(&l->sh_up, x, gu + F);
+    for (int i = 0; i < F; i++) h[i] = siluf_(gu[i]) * gu[F + i];
+    matvec(&l->sh_down, h, y);
+    m->t_experts += now_s() - t0;
+    return 0;
+}
+
 /* The MoE block on the host (the CPU path). */
 static int moe(q38_model *m, int il, const float *x, float *y)
 {
+    if (m->c.dense) return dense_ffn(m, il, x, y);
     float *logits = m->tmp;
     int top[64];
     float w[64];
@@ -1666,7 +1694,9 @@ const float *q38_model_forward_batch(q38_model *m, const int *toks, int n)
         bmin = e ? atoi(e) : 256;
         if (bmin < 2) bmin = 2;
     }
-    if (m->gpu && n >= bmin && !m->tap && !(getenv("Q38_NO_BATCH") && atoi(getenv("Q38_NO_BATCH")))) {
+    /* dense models: a batch beats token by token from a few tokens (each token reads all the weights) */
+    const int bm = m->c.dense && !getenv("Q38_BATCH_MIN") ? 16 : bmin;
+    if (m->gpu && n >= bm && !m->tap && !(getenv("Q38_NO_BATCH") && atoi(getenv("Q38_NO_BATCH")))) {
         const double t0 = now_s();
         m->token_stamp++;
         if (q38_gpu_forward_batch(m, toks, n)) return NULL;
@@ -1714,7 +1744,7 @@ int q38_model_open(q38_model *m, const char *path, int max_ctx)
     }
     /* default: 128k for the plain models (their K/V is small: 10 attention layers of 2 heads,
      * half precision on the device above 32k); 8k for Flash-Next, whose VRAM goes to expert slots */
-    if (max_ctx <= 0) max_ctx = c->plain ? 131072 : 8192;
+    if (max_ctx <= 0) max_ctx = c->dense ? 32768 : c->plain ? 131072 : 8192;   /* dense: its weights fill the VRAM */
     if (c->idx_top_k <= 0 && max_ctx > c->max_dense_ctx) max_ctx = c->max_dense_ctx;
     if (max_ctx > c->ctx_train) max_ctx = c->ctx_train;
     m->max_ctx = max_ctx;
@@ -1755,12 +1785,13 @@ int q38_model_open(q38_model *m, const char *path, int max_ctx)
     m->big = (float *)calloc((size_t)big, sizeof(float));
     m->logits = (float *)calloc((size_t)c->n_vocab, sizeof(float));
     const int NX = c->n_exp_used + 1;
-    m->table = (q38_slot **)calloc((size_t)c->n_layer * c->n_exp, sizeof(q38_slot *));
-    m->moe_gu = (float *)calloc((size_t)NX * 2 * c->ff_exp, sizeof(float));
-    m->moe_h = (float *)calloc((size_t)NX * c->ff_exp, sizeof(float));
+    const int64_t ffw = (int64_t)NX * c->ff_exp > c->ff_shexp ? (int64_t)NX * c->ff_exp : c->ff_shexp;  /* dense: one FFN */
+    m->table = (q38_slot **)calloc((size_t)c->n_layer * c->n_exp + 1, sizeof(q38_slot *));
+    m->moe_gu = (float *)calloc((size_t)2 * ffw, sizeof(float));
+    m->moe_h = (float *)calloc((size_t)ffw, sizeof(float));
     m->moe_dn = (float *)calloc((size_t)NX * E, sizeof(float));
     m->moe_bsum = (float *)calloc((size_t)NX * (c->ff_exp / 32 + 1), sizeof(float));
-    m->use = (float *)calloc((size_t)c->n_layer * c->n_exp, sizeof(float));
+    m->use = (float *)calloc((size_t)c->n_layer * c->n_exp + 1, sizeof(float));
     q38_model_set_cache(m, -1);
     if (!m->toks || !m->res || !m->big || !m->logits || !m->table || !m->moe_gu || !m->moe_h || !m->moe_dn ||
         !m->moe_bsum || 4 * 4096 + E > 65536 || 3 * c->ff_exp > 4 * 4096 || c->n_embd > MAX_NE0 ||

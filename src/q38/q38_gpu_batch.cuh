@@ -1425,6 +1425,7 @@ static int forward_batch_chunk(q38_model *m, const int *toks, int N, int want_la
 extern "C" int q38_gpu_forward_batch(void *model, const int *toks, int n)
 {
     q38_model *m = (q38_model *)model;
+    if (m->c.dense) return dense_forward_batch(m, toks, n);   /* q38_gpu_dense_batch.cuh */
     if (!GB && bat_open(m, 0)) return -1;
     G->warm_want = 1;
     for (int i = 0; i < n; i += GB->nb) {

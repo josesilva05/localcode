@@ -49,6 +49,7 @@ typedef struct {
      * x + mixer(norm(x)), then + moe(norm(x)), and a silu (not sigmoid) DeltaNet output gate */
     char    arch[32], name[96];
     int     plain;                           /* hc is 1 then */
+    int     dense;                           /* qwen35: dense FFN in sh_*, no experts */
     int     gdn_silu;
     int     n_nextn;                         /* MTP blocks after the n_layer ones (not run yet) */
 } q38_cfg;

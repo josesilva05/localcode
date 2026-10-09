@@ -92,7 +92,19 @@ Ordem: (1) o ciclo do agente — feito; (2) perfil de modelo; (3) núcleo comum 
 | Qwen3.8-Flash-Next UD-Q4_K_XL / UD-IQ4_XS | `qwen4exp` | validado (float64) | ~12 tok/s (limitado por RAM/disco) |
 | Qwen3.6-35B-A3B-MTP | `qwen35moe` | validado (float64: CPU 3e-6, GPU 5e-7); contexto 128k | 32,8 tok/s; agente 31,2 tok/s; 13,5 tok/s a 118k |
 | Qwen3.6-35B-A3B-Uncensored | `qwen35moe` | roda | 35,5 tok/s |
-| Qwen3.8-27B | `qwen35` (denso) | próximo: FFN densa + camadas divididas entre as GPUs | — |
+| Qwen3.8-27B UD-Q5_K_M | `qwen35` (denso) | roda na CPU e nas 2 GPUs; contexto 32k | 14,6 tok/s (llama.cpp: 15,4); prompt 435 tok/s (llama.cpp: 489); agente 14,5 tok/s |
+
+**O 27B (2026-10-09).**
+- Denso: uma FFN por camada (guardada nos campos do especialista compartilhado, sem o portão).
+- As 64 camadas dividem-se entre as duas 3060 (19,4 GB de pesos): cada GPU é uma "parte" com suas camadas, K/V e estado; o resíduo do token passa de uma para a outra pelo host (`q38_gpu_dense.cuh`).
+- Escrita: os pesos ficam nos tipos do GGUF e o produto matriz×vetor usa ativações em 8 bits e `dp4a` (o `mmvq` do llama.cpp, `q38_gpu_mvq.cuh`); `Q38_ACT8=0` volta ao caminho float exato.
+- Prompt (`q38_gpu_dense_batch.cuh`):
+  - em pedaços de 1024 tokens; cada matriz é desquantizada para fp16 e multiplicada no cuBLAS;
+  - as duas GPUs trabalham em paralelo (a GPU 1 começa o pedaço seguinte enquanto a 0 faz o anterior);
+  - a partir de 16 tokens o lote já ganha de token a token.
+- A atenção nos tensor cores aceita grupos de 6 cabeças por cabeça K/V.
+- O estado salvo (prefixos, `/resume`, `--continue`) cobre as duas GPUs.
+- Contexto: 32k por padrão; o K/V em fp16 de 64k não cabe junto com os pesos nos 24 GB.
 
 Depois: MTP (geração especulativa com a camada multi-token do 35B-MTP e do 27B).
 

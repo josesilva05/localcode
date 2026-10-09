@@ -71,6 +71,8 @@ typedef struct {
     /* activations */
     float    *res, *xn, *mixed, *lo, *gate, *inject, *y, *routed;
     float    *fa_part;                     /* flash decode partials: segments x H x (D + 2) */
+    int8_t   *q8x;                         /* x in 8 bits for k_mvq (dense trunks), its scales and sums */
+    float    *q8d, *q8s;
     float    *qkv, *z, *o, *beta, *g, *qf, *aout;
     float    *router, *sh_gu, *sh_h, *sh_dn, *sg, *logits;
     /* state */
@@ -879,18 +881,18 @@ __global__ void __launch_bounds__(256) k_fattn_mma(const float *qf, const KT *kc
 {
     extern __shared__ __align__(16) unsigned char smb[];
     __half *Qs = (__half *)smb, *Ks = Qs + 128 * (DT + FM_KP), *Vt = Ks + 16 * (DT + FM_KP);
-    const int G = H / Hkv, QT = 128 / G;
+    const int G = H / Hkv, QT = 128 / G, RV = QT * G;       /* rows from RV on: padding (G = 6) */
     const int kvh = blockIdx.x, tq0 = blockIdx.y * QT;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3;
     const int p0 = *ppos;
     const float scale = rsqrtf((float)DT);
     for (int e = threadIdx.x; e < 128 * DT; e += blockDim.x) {
-        const int r = e / DT, i = e % DT, t = tq0 + r / G;
+        const int r = e / DT, i = e % DT, t = r < RV ? tq0 + r / G : N;
         Qs[r * (DT + FM_KP) + i] =
             __float2half(t < N ? qf[(int64_t)t * H * 2 * DT + (int64_t)(kvh * G + r % G) * 2 * DT + i] * scale : 0.0f);
     }
     const int r0 = wp * 16 + g, r1 = r0 + 8;                 /* this lane's two rows */
-    const int t0 = tq0 + r0 / G, t1 = tq0 + r1 / G;
+    const int t0 = r0 < RV ? tq0 + r0 / G : N, t1 = r1 < RV ? tq0 + r1 / G : N;
     float o[DT / 8][4];
 #pragma unroll
     for (int j = 0; j < DT / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
@@ -1778,6 +1780,8 @@ __global__ void k_mv_q6_K(const uint8_t *w, int64_t row_bytes, int ne0, int rows
 
 /* --------------------------------------------------------------------- host -- */
 static Gpu *G;
+static Gpu *GD[2];                  /* dense models: the parts in layer order (q38_gpu_dense.cuh) */
+static int  GD_n, GD_split;         /* parts; the first layer of GD[1] */
 
 static int upload(DMat *d, const q38_mat *w, Gpu *g)
 {
@@ -1828,10 +1832,104 @@ static int upload(DMat *d, const q38_mat *w, Gpu *g)
     return 0;
 }
 
+/* y = W x for a matrix kept in its GGUF type (Q4_K, Q5_K, IQ4_XS ...: the dense models' trunk);
+ * a warp per row, lane_dot's native layouts, x read through the cache */
+__global__ void k_mv_native(const uint8_t *__restrict__ W, int64_t rb, int ne0, int rows, int type,
+                            const float *__restrict__ x, float *__restrict__ y)
+{
+    const int r = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (r >= rows) return;
+    const float s = warp_sum(lane_dot(type, W + (int64_t)r * rb, x, ne0, threadIdx.x));
+    if (threadIdx.x == 0) y[r] = s;
+}
+
+#include "q38_gpu_mvq.cuh"
+
+/* Chunk c of a native Q4_K/Q5_K row as 8 weights: super-block c / 32, its 64-element quarter j,
+ * bytes p..p+3 of that quarter's 32: low nibbles are elements 64j+p.. (*o0), high ones 64j+32+p..
+ * (*o1); lane_dot's arithmetic, one chunk at a time */
+__device__ __forceinline__ void kq_chunk(int five, const uint8_t *w, int c, float *wt, int *o0, int *o1)
+{
+    const int sb = c >> 5, j = (c >> 3) & 3, p = (c & 7) * 4;
+    const uint8_t *blk = w + (int64_t)sb * (five ? 176 : 144);
+    const float2 dd = __half22float2(*(const __half2 *)(const void *)blk);
+    float s1, m1, s2, m2;
+    kscales(blk, j, &s1, &m1, &s2, &m2);
+    const uint32_t q = *(const uint32_t *)(const void *)(blk + (five ? 48 : 16) + 32 * j + p);
+    const uint32_t qh = five ? *(const uint32_t *)(const void *)(blk + 16 + p) : 0u;
+    const float a1 = dd.x * s1, b1 = dd.y * m1, a2 = dd.x * s2, b2 = dd.y * m2;
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+        const int qb = (q >> (8 * u)) & 0xFF, hb = (qh >> (8 * u)) & 0xFF;
+        wt[u] = a1 * (float)((qb & 15) + (five ? (((hb >> (2 * j)) & 1) << 4) : 0)) - b1;
+        wt[4 + u] = a2 * (float)((qb >> 4) + (five ? (((hb >> (2 * j + 1)) & 1) << 4) : 0)) - b2;
+    }
+    *o0 = 256 * sb + 64 * j + p;
+    *o1 = *o0 + 32;
+}
+
+/* y = W x, a block of 128 threads per MVR rows: thread t takes the 8-weight chunks t, t+128, ...
+ * of each row (coalesced 4-byte loads, many in flight), x read once for the rows. One warp per
+ * row (k_mv_native) ran the 27B's trunk at ~140 GB/s. */
+#define MVR 2
+__global__ void __launch_bounds__(128) k_mv_rows(const uint8_t *__restrict__ W, int64_t rb, int ne0, int rows, int type,
+                                                 const float *__restrict__ x, float *__restrict__ y)
+{
+    __shared__ float part[MVR][4];
+    const int r0 = blockIdx.x * MVR, t = threadIdx.x;
+    const int kq = type == Q38_Q4_K || type == Q38_Q5_K, five = type == Q38_Q5_K;
+    const int nch = kq ? (ne0 / 256) * 32 : iq_chunks(type, ne0);
+    float acc[MVR];
+#pragma unroll
+    for (int r = 0; r < MVR; r++) acc[r] = 0.0f;
+    for (int c = t; c < nch; c += 128) {
+        float wt[8];
+        int o0, o1;
+        float xv[8];
+#pragma unroll
+        for (int r = 0; r < MVR; r++) {
+            if (r0 + r >= rows) break;
+            const uint8_t *row = W + (int64_t)(r0 + r) * rb;
+            if (kq) kq_chunk(five, row, c, wt, &o0, &o1);
+            else iq_chunk(type, row, c, wt, &o0, &o1);
+            if (r == 0) {
+                const float4 a = __ldg((const float4 *)(x + o0)), b = __ldg((const float4 *)(x + o1));
+                xv[0] = a.x; xv[1] = a.y; xv[2] = a.z; xv[3] = a.w; xv[4] = b.x; xv[5] = b.y; xv[6] = b.z; xv[7] = b.w;
+            }
+            float s2 = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; k++) s2 += wt[k] * xv[k];
+            acc[r] += s2;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MVR; r++) {
+        const float v = warp_sum(acc[r]);
+        if ((t & 31) == 0) part[r][t >> 5] = v;
+    }
+    __syncthreads();
+    if (t < MVR && r0 + t < rows) y[r0 + t] = part[t][0] + part[t][1] + part[t][2] + part[t][3];
+}
+
 static int mv(const DMat *w, const float *x, float *y, cudaStream_t st)
 {
     const dim3 blk(32, ROWS_PER_BLOCK);
     const int grid = (int)((w->rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    if (mvq_ok(w->type) && G && G->q8x && w->ne0 % 256 == 0 && w->ne0 <= 32768) {
+        const int nb = (int)(w->ne0 / 32);
+        k_q8x<<<(nb + 3) / 4, 128, 0, st>>>(x, (int)w->ne0, G->q8x, G->q8d, G->q8s);
+        const dim3 b4(32, 4);
+        const int g4 = (int)((w->rows + 3) / 4);
+        const uint8_t *W = (const uint8_t *)w->d;
+        switch (w->type) {
+        case Q38_Q4_K:   k_mvq<Q38_Q4_K><<<g4, b4, 0, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, y); break;
+        case Q38_Q5_K:   k_mvq<Q38_Q5_K><<<g4, b4, 0, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, y); break;
+        case Q38_Q6_K:   k_mvq<Q38_Q6_K><<<g4, b4, 0, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, y); break;
+        case Q38_IQ4_XS: k_mvq<Q38_IQ4_XS><<<g4, b4, 0, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, y); break;
+        default:         k_mvq<Q38_IQ4_NL><<<g4, b4, 0, st>>>(W, w->row_bytes, (int)w->ne0, (int)w->rows, G->q8x, G->q8d, G->q8s, y); break;
+        }
+        return 0;
+    }
     if (w->type == Q38_Q8R) {
         const int8_t *q = (const int8_t *)w->d;
         if (w->rows <= 512 && w->ne0 >= 2048) {
@@ -1852,8 +1950,15 @@ static int mv(const DMat *w, const float *x, float *y, cudaStream_t st)
         k_mv_f32_blk<<<(int)w->rows, 256, 0, st>>>((const float *)w->d, (int)w->ne0, x, y);
     } else if (w->type == Q38_F32) {
         k_mv_f32<<<grid, blk, 0, st>>>((const float *)w->d, (int)w->ne0, (int)w->rows, x, y);
+    } else if ((w->type == Q38_Q4_K || w->type == Q38_Q5_K || w->type == Q38_IQ4_XS || w->type == Q38_IQ4_NL ||
+                w->type == Q38_IQ3_S || (w->type == Q38_Q6_K && getenv("Q38_MV_ROWS_Q6"))) && !getenv("Q38_MV_OLD")) {
+        k_mv_rows<<<(int)((w->rows + MVR - 1) / MVR), 128, 0, st>>>((const uint8_t *)w->d, w->row_bytes, (int)w->ne0,
+                                                                     (int)w->rows, w->type, x, y);
     } else if (w->type == Q38_Q6_K) {
         k_mv_q6_K<<<grid, blk, 0, st>>>((const uint8_t *)w->d, w->row_bytes, (int)w->ne0, (int)w->rows, x, y);
+    } else if (w->type == Q38_Q4_K || w->type == Q38_Q5_K || w->type == Q38_Q5_1 || w->type == Q38_IQ4_XS ||
+               w->type == Q38_IQ4_NL || w->type == Q38_IQ3_S) {
+        k_mv_native<<<grid, blk, 0, st>>>((const uint8_t *)w->d, w->row_bytes, (int)w->ne0, (int)w->rows, w->type, x, y);
     } else {
         fprintf(stderr, "q38_gpu: no device kernel for type %s\n", q38_type_name(w->type));
         return -1;
@@ -1911,9 +2016,13 @@ static void attn_t(Gpu *g, int il, const float *qf, float *out, int H, int Hkv, 
     /* the fp16 tensor-core kernels go with the fp16 cache (long contexts: llama.cpp's precision);
      * a float cache keeps float attention, exact against the reference */
     const int tc = sizeof(KT) == 2 && !getenv("Q38_NO_FA_TC");
-    if (!fa_ok(H, Hkv, D, sel)) {
+    /* the mma kernels take any head group up to 16 (the 27B's is 6); the CUDA-core flash ones
+     * need it to divide 8, the WMMA one too */
+    const int mma = (D == 256 || D == 128) && H % Hkv == 0 && H / Hkv <= 16 && tc && !sel;
+    const int wmma_asked = getenv("Q38_FA_KERNEL") && !strcmp(getenv("Q38_FA_KERNEL"), "wmma");
+    if (!mma && !fa_ok(H, Hkv, D, sel)) {
         k_attn_t<<<dim3(H, N), 256, 0, st>>>(qf, (int64_t)H * 2 * D, kc, vc, out, (int64_t)H * D, g->d_pos, H, Hkv, D, sel, W, W);
-    } else if (N == 1 && (D == 256 || D == 128) && H / Hkv <= 16 && tc) {
+    } else if (N == 1 && mma) {
         /* one token on mma.sync: FA_SEG_MMA one-warp blocks per K/V head, then the merge */
         const size_t sm = (size_t)(32 * (D + FM_KP) + D * FM_VS) * 2;
         if (D == 256) k_fattn_dec_mma<KT, 256><<<dim3(Hkv, FA_SEG_MMA), 32, sm, st>>>(qf, kc, vc, g->fa_part, g->d_pos, H, Hkv);
@@ -1923,8 +2032,8 @@ static void attn_t(Gpu *g, int il, const float *qf, float *out, int H, int Hkv, 
         /* one token: QT = 1, every segment its own block, then the merge */
         k_fattn<KT, 1><<<dim3(Hkv, 1, FA_SEG), 256, fa_smem(1, D), st>>>(qf, kc, vc, out, g->fa_part, g->d_pos, H, Hkv, D, 1);
         k_fattn_merge<<<dim3(H, 1), 256, 0, st>>>(g->fa_part, qf, out, H, D, 1, FA_SEG);
-    } else if ((D == 256 || D == 128) && tc && !(getenv("Q38_FA_KERNEL") && !strcmp(getenv("Q38_FA_KERNEL"), "wmma"))) {
-        /* a prompt batch: mma.sync, 16 tokens a block */
+    } else if (mma && (!wmma_asked || !fa_ok(H, Hkv, D, sel))) {
+        /* a prompt batch: mma.sync, 128 / G tokens a block */
         const dim3 grid(Hkv, (N + 128 / (H / Hkv) - 1) / (128 / (H / Hkv)));
         if (D == 256) k_fattn_mma<KT, 256><<<grid, 256, fa_mma_smem(256), st>>>(qf, kc, vc, out, g->d_pos, H, Hkv, N);
         else k_fattn_mma<KT, 128><<<grid, 256, fa_mma_smem(128), st>>>(qf, kc, vc, out, g->d_pos, H, Hkv, N);
@@ -2367,7 +2476,7 @@ extern "C" int q38_gpu_prefill(void *model)
 {
     q38_model *m = (q38_model *)model;
     const q38_cfg *c = &m->c;
-    if (!G || !G->nvs || !m->use) return 0;
+    if (!G || !G->nvs || !m->use || c->dense) return 0;
     const int n = c->n_layer * c->n_exp;
     int *ord = (int *)malloc((size_t)n * sizeof(int));
     if (!ord) return 0;
@@ -2406,6 +2515,9 @@ extern "C" void q38_gpu_warm(void *model, int on)
 }
 
 static int bat_open(q38_model *m, int nb);    /* q38_gpu_batch.cuh */
+static int dense_open(q38_model *m, int device);   /* q38_gpu_dense.cuh */
+static void dense_reset(q38_model *m);
+static void dense_close(q38_model *m);
 static int launcher_start(q38_model *m);
 static void launcher_stop(void);
 
@@ -2420,6 +2532,7 @@ extern "C" int q38_gpu_open(void *model, int device)
         fprintf(stderr, "q38_gpu: no CUDA device %d (%d found)\n", device, n_dev);
         return -1;
     }
+    if (c->dense) return dense_open(m, device);
     /* the expert kernels (lane_dot, lane_dot_rp, the tiles) know these types; another one
      * would add nothing there, silently: such a model runs on the CPU, which has them all */
     for (int il = 0; il < c->n_layer; il++) {
@@ -2608,6 +2721,7 @@ extern "C" void q38_gpu_reset(void *model)
     q38_model *m = (q38_model *)model;
     const q38_cfg *c = &m->c;
     if (!G) return;
+    if (c->dense) { dense_reset(m); return; }
     const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
     cudaSetDevice(G->dev);
     for (int il = 0; il < c->n_layer; il++) {
@@ -2621,7 +2735,7 @@ extern "C" int q38_gpu_state(void *model, int save)
 {
     q38_model *m = (q38_model *)model;
     const q38_cfg *c = &m->c;
-    if (!G) return -1;
+    if (!G || c->dense) return -1;                    /* dense: not yet (the parts' layers) */
     const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
     const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
     const size_t ring_b = G->ple_ring ? (size_t)(c->ple_kern - 1) * c->ple_ngram * c->hc * c->n_embd * sizeof(float) : 0;
@@ -2686,8 +2800,11 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     if (ok && (size_t)n * ix_row > big) big = (size_t)n * ix_row;
     uint8_t *buf = ok ? (uint8_t *)malloc(big) : NULL;
     if (!buf) ok = 0;
+    /* the dense models' layers live on two devices (their parts): each layer's own */
+    Gpu *const parts[2] = { G, c->dense && GD_n == 2 ? GD[1] : NULL };
+    for (int p = 0; p < 2 && ok; p++)
+        if (parts[p]) { cudaSetDevice(parts[p]->dev); if (cudaDeviceSynchronize() != cudaSuccess) ok = 0; }
     cudaSetDevice(G->dev);
-    if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = 0;
     /* the file side in 8 MB pieces, each after the disk governor's quiet window */
     auto fio = [&](uint8_t *p, size_t bytes) {
         for (size_t done = 0; done < bytes;) {
@@ -2709,14 +2826,17 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     };
     if (ok) ok = save ? fwrite(m->toks, sizeof(int), (size_t)n, f) == (size_t)n : fread(m->toks, sizeof(int), (size_t)n, f) == (size_t)n;
     for (int il = 0; il < c->n_layer && ok; il++) {
-        if (G->conv[il]) io(G->conv[il], conv_b);
-        if (G->ssm[il]) io(G->ssm[il], ssm_b);
-        if (G->kc[il]) { io(G->kc[il], (size_t)n * kv_row); io(G->vc[il], (size_t)n * kv_row); }
-        if (G->idx_raw[il]) {
-            io(G->idx_raw[il], (size_t)n * ix_row);
-            io(G->idx_pool[il], (size_t)(n / c->idx_ratio + 1) * ix_row);   /* with the partial block */
+        Gpu *gl = parts[1] && il >= GD_split ? parts[1] : G;
+        cudaSetDevice(gl->dev);
+        if (gl->conv[il]) io(gl->conv[il], conv_b);
+        if (gl->ssm[il]) io(gl->ssm[il], ssm_b);
+        if (gl->kc[il]) { io(gl->kc[il], (size_t)n * kv_row); io(gl->vc[il], (size_t)n * kv_row); }
+        if (gl->idx_raw[il]) {
+            io(gl->idx_raw[il], (size_t)n * ix_row);
+            io(gl->idx_pool[il], (size_t)(n / c->idx_ratio + 1) * ix_row);   /* with the partial block */
         }
     }
+    cudaSetDevice(G->dev);
     if (ring_b) io(G->ple_ring, ring_b);
     free(buf);
     if (fclose(f) != 0) ok = 0;
@@ -2798,6 +2918,7 @@ extern "C" void q38_gpu_close(void *model)
 {
     q38_model *m = (q38_model *)model;
     if (!G) return;
+    if (m->c.dense) { dense_close(m); return; }
     launcher_stop();
     if (G->vram_hits + G->vram_misses)
         fprintf(stderr, "q38: routed experts on the GPUs %.1f%% (%lld of %lld; %lld on the second), %lld uploaded to VRAM\n",
@@ -2937,6 +3058,16 @@ static int seg_front(q38_model *m, int il, int capturing)
     if (hc_mix(m, NORM_FFN(il), &LM(il, hc_ffn_down), &LM(il, hc_ffn_up), &LM(il, hc_ffn_inject),
                G->mixed, G->inject)) return -1;
     if (m->tap && !capturing) { snprintf(nm, sizeof nm, "hc_mixed_ffn-%d", il); tap(m, nm, G->mixed, E); }
+    if (c->dense) {                                 /* the FFN on the device: res += down(silu(gate) * up) */
+        const int F = c->ff_shexp;
+        if (mv(&LM(il, sh_gate), G->mixed, G->sh_gu, st) || mv(&LM(il, sh_up), G->mixed, G->sh_gu + F, st)) return -1;
+        k_swiglu<<<(F + 255) / 256, 256, 0, st>>>(G->sh_gu, G->sh_h, F);
+        if (mv(&LM(il, sh_down), G->sh_h, G->y, st)) return -1;
+        if (m->tap && !capturing) { snprintf(nm, sizeof nm, "ffn_out-%d", il); tap(m, nm, G->y, E); }
+        k_hc_combine<<<(hcE + 255) / 256, 256, 0, st>>>(G->res, G->y, G->inject, E, hc);
+        if (m->tap && !capturing) { snprintf(nm, sizeof nm, "l_out-%d", il); tap(m, nm, G->res, E); }
+        return 0;
+    }
     /* router on the device; x and the logits to the host; the shared expert meanwhile */
     if (mv(&LM(il, router), G->mixed, G->router, st)) return -1;
     /* the next layers' routers (int8 copies: guesses only) on this MoE input, for reading ahead */
@@ -3080,12 +3211,12 @@ static int build_segment(q38_model *m, int id, int capturing)
 {
     const q38_cfg *c = &m->c;
     if (id == 0) return seg_start(m);
-    if (id == GT) return seg_post(m, c->n_layer - 1, capturing) || seg_head(m, capturing) ? -1 : 0;
+    if (id == GT) return (!c->dense && seg_post(m, c->n_layer - 1, capturing)) || seg_head(m, capturing) ? -1 : 0;
     if (id == GP) return (c->ple_layer > 0 && seg_post(m, c->ple_layer - 1, capturing)) || seg_res_out() ? -1 : 0;
     if (id >= GX(0)) return seg_experts(m, id - GX(0));
     const int il = id - GF(0);
     if (il > 0 && G->launcher) k_wait_flag<<<1, 1, 0, G->st>>>(G->d_flag + (il - 1), G->d_seen + (il - 1));
-    if (il > 0 && seg_post(m, il - 1, capturing)) return -1;
+    if (il > 0 && !c->dense && seg_post(m, il - 1, capturing)) return -1;
     if (il == c->ple_layer && seg_ple(m, il)) return -1;
     return seg_front(m, il, capturing);
 }
@@ -3243,9 +3374,12 @@ static void predict_next(q38_model *m, int il, const float *logits, int slot)
     }
 }
 
+#include "q38_gpu_dense.cuh"
+
 extern "C" int q38_gpu_forward(void *model, int token)
 {
     q38_model *m = (q38_model *)model;
+    if (m->c.dense) return dense_forward(m, token);
     const q38_cfg *c = &m->c;
     const int E = c->n_embd, K = c->n_exp_used, F = c->ff_exp;
     cudaSetDevice(G->dev);
@@ -3373,3 +3507,4 @@ extern "C" int q38_gpu_forward(void *model, int token)
 }
 
 #include "q38_gpu_batch.cuh"
+#include "q38_gpu_dense_batch.cuh"

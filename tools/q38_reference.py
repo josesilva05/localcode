@@ -58,8 +58,8 @@ class Model:
         self.n_head_kv = kv[a + "attention.head_count_kv"]
         self.head_dim = kv[a + "attention.key_length"]
         self.eps = float(kv[a + "attention.layer_norm_rms_epsilon"])
-        self.n_exp = kv[a + "expert_count"]
-        self.k_exp = kv[a + "expert_used_count"]
+        self.n_exp = kv.get(a + "expert_count", 0)       # qwen35 (dense): none, one FFN a layer
+        self.k_exp = kv.get(a + "expert_used_count", 0)
         self.n_rot = kv[a + "rope.dimension_count"]
         self.rope_base = float(kv[a + "rope.freq_base"])
         self.interval = kv[a + "full_attention_interval"]
@@ -293,6 +293,10 @@ class Ref:
     def ffn(self, il, x):
         m = self.m
         p = f"blk.{il}."
+        if m.n_exp == 0:                  # dense: down(silu(gate x) * up x)
+            g = m.w(p + "ffn_gate.weight") @ x
+            u = m.w(p + "ffn_up.weight") @ x
+            return m.w(p + "ffn_down.weight") @ (silu(g) * u)
         logits = m.w(p + "ffn_gate_inp.weight") @ x
         pr = np.exp(logits - logits.max())
         pr /= pr.sum()
