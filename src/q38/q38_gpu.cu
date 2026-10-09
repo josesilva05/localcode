@@ -2951,10 +2951,13 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
 
 /* Times each trunk matrix-vector product of one recurrent and one attention layer on the
  * device (kept busy, so at full clocks) and the per-token total they add up to. */
+static int dense_mvnbench(q38_model *m);   /* q38_gpu_dense_batch.cuh */
+
 extern "C" int q38_gpu_mvbench(void *model)
 {
     q38_model *m = (q38_model *)model;
     const q38_cfg *c = &m->c;
+    if (c->dense) return dense_mvnbench(m);
     static const char *nm[] = { "hc_attn_norm", "hc_attn_down", "hc_attn_up", "hc_attn_inject", "hc_ffn_norm",
                                 "hc_ffn_down", "hc_ffn_up", "hc_ffn_inject", "qkv", "gate", "beta", "alpha", "dt_bias",
                                 "a", "conv", "ssm_norm", "ssm_out", "wq", "wk", "wv", "wo", "q_norm", "k_norm", "idx_q",

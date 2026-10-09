@@ -214,7 +214,17 @@ __device__ __forceinline__ void unit_q45k(const uint8_t *row, int u, const int8_
     }
 }
 
-template <int NC>
+/* x in shared memory (k_mvq_ncs): its 16-byte chunks swizzled, chunk c at c ^ ((c >> 3) & 7). A lane's
+ * unit reads x 64 bytes (Q4_K/Q5_K) or 32 bytes (the others) after the previous lane's, so 8 lanes of a
+ * 16-byte load hit 2 (or 4) of the 8 bank groups: 4-way (2-way) conflicts. Swizzled, they hit all 8. */
+__device__ __forceinline__ int sw16(int off) { return (((off >> 4) ^ ((off >> 7) & 7)) << 4) | (off & 15); }
+template <int SW>
+__device__ __forceinline__ int4 ld_x16(const int8_t *x, int off)
+{
+    return *(const int4 *)(const void *)(x + (SW ? sw16(off) : off));
+}
+
+template <int NC, int SW = 0>
 __device__ __forceinline__ void unit_q6k(const uint8_t *row, int u, const int8_t *xq, const float *xd, int ne0, float *acc)
 {
     const int sb = u >> 3, k = u & 7, n = k >> 2, qq = k & 3, nb = ne0 / 32;
@@ -238,9 +248,9 @@ __device__ __forceinline__ void unit_q6k(const uint8_t *row, int u, const int8_t
     const float s0 = (float)sc[0], s1 = (float)sc[1];
 #pragma unroll
     for (int c = 0; c < NC; c++) {
-        const int8_t *x = xq + (int64_t)c * ne0 + b * 32;
+        const int o = c * ne0 + b * 32;
         int xv[8];
-        *(int4 *)&xv[0] = *(const int4 *)x; *(int4 *)&xv[4] = *(const int4 *)(x + 16);
+        *(int4 *)&xv[0] = ld_x16<SW>(xq, o); *(int4 *)&xv[4] = ld_x16<SW>(xq, o + 16);
         int dot0 = 0, dot1 = 0, sx0 = 0, sx1 = 0;
 #pragma unroll
         for (int i = 0; i < 4; i++) {
@@ -252,7 +262,7 @@ __device__ __forceinline__ void unit_q6k(const uint8_t *row, int u, const int8_t
 }
 
 /* IQ4_XS (sub-block u of 32) and IQ4_NL (block u): the table looked up once */
-template <int XS, int NC>
+template <int XS, int NC, int SW = 0>
 __device__ __forceinline__ void unit_iq4(const uint8_t *row, int u, const int8_t *xq, const float *xd, int ne0, float *acc)
 {
     const int nb = ne0 / 32;
@@ -280,9 +290,9 @@ __device__ __forceinline__ void unit_iq4(const uint8_t *row, int u, const int8_t
     }
 #pragma unroll
     for (int c = 0; c < NC; c++) {
-        const int8_t *x = xq + (int64_t)c * ne0 + u * 32;
+        const int o = c * ne0 + u * 32;
         int xv[8];
-        *(int4 *)&xv[0] = *(const int4 *)x; *(int4 *)&xv[4] = *(const int4 *)(x + 16);
+        *(int4 *)&xv[0] = ld_x16<SW>(xq, o); *(int4 *)&xv[4] = ld_x16<SW>(xq, o + 16);
         int dot = 0;
 #pragma unroll
         for (int i = 0; i < 4; i++) { dot = __dp4a(lo[i], xv[i], dot); dot = __dp4a(hi[i], xv[4 + i], dot); }
@@ -362,18 +372,18 @@ __device__ __forceinline__ void q45_math(const Q45Raw &w, int u, const int8_t *x
             hi4[i] |= ((h[i] >> (2 * j + 1)) & 0x01010101) << 4;
         }
     }
-    const int b0 = sb * 8 + 2 * j, b1 = b0 + 1;
+    const int b0 = sb * 8 + 2 * j;
 #pragma unroll
     for (int c = 0; c < NC; c++) {
-        const int8_t *x = xq + (int64_t)c * ne0;
+        const int o = c * ne0 + b0 * 32;
         int xa[8], xb[8];
-        *(int4 *)&xa[0] = *(const int4 *)(x + b0 * 32); *(int4 *)&xa[4] = *(const int4 *)(x + b0 * 32 + 16);
-        *(int4 *)&xb[0] = *(const int4 *)(x + b1 * 32); *(int4 *)&xb[4] = *(const int4 *)(x + b1 * 32 + 16);
+        *(int4 *)&xa[0] = ld_x16<1>(xq, o); *(int4 *)&xa[4] = ld_x16<1>(xq, o + 16);
+        *(int4 *)&xb[0] = ld_x16<1>(xq, o + 32); *(int4 *)&xb[4] = ld_x16<1>(xq, o + 48);
         int lo = 0, hi = 0;
 #pragma unroll
         for (int i = 0; i < 8; i++) { lo = __dp4a(lo4[i], xa[i], lo); hi = __dp4a(hi4[i], xb[i], hi); }
-        const float *d = xd + c * nb, *s = xs + c * nb;
-        acc[c] += dm.x * ((float)s1 * d[b0] * (float)lo + (float)s2 * d[b1] * (float)hi) - dm.y * ((float)m1 * s[b0] + (float)m2 * s[b1]);
+        const float2 d = *(const float2 *)(xd + c * nb + b0), s = *(const float2 *)(xs + c * nb + b0);   /* b0 even */
+        acc[c] += dm.x * ((float)s1 * d.x * (float)lo + (float)s2 * d.y * (float)hi) - dm.y * ((float)m1 * s.x + (float)m2 * s.y);
     }
 }
 
@@ -389,7 +399,7 @@ __global__ void __launch_bounds__(256) k_mvq_ncs(const uint8_t *__restrict__ W, 
     const int nb = ne0 / 32, tid = threadIdx.y * 32 + threadIdx.x;
     int8_t *q = (int8_t *)sx;
     float *d = (float *)(sx + NC * ne0), *s = d + NC * nb;
-    for (int i = tid * 16; i < NC * ne0; i += 256 * 16) *(int4 *)(q + i) = *(const int4 *)(xq + i);
+    for (int i = tid * 16; i < NC * ne0; i += 256 * 16) *(int4 *)(q + sw16(i)) = *(const int4 *)(xq + i);
     for (int i = tid; i < NC * nb; i += 256) { d[i] = xd[i]; s[i] = xs[i]; }
     __syncthreads();
     const int units = TYPE == Q38_Q4_K || TYPE == Q38_Q5_K ? ne0 / 64 : ne0 / 32;
@@ -412,9 +422,9 @@ __global__ void __launch_bounds__(256) k_mvq_ncs(const uint8_t *__restrict__ W, 
             }
         } else {
             for (int u = threadIdx.x; u < units; u += 32) {
-                if (TYPE == Q38_Q6_K) unit_q6k<NC>(row, u, q, d, ne0, acc);
-                else if (TYPE == Q38_IQ4_XS) unit_iq4<1, NC>(row, u, q, d, ne0, acc);
-                else unit_iq4<0, NC>(row, u, q, d, ne0, acc);
+                if (TYPE == Q38_Q6_K) unit_q6k<NC, 1>(row, u, q, d, ne0, acc);
+                else if (TYPE == Q38_IQ4_XS) unit_iq4<1, NC, 1>(row, u, q, d, ne0, acc);
+                else unit_iq4<0, NC, 1>(row, u, q, d, ne0, acc);
             }
         }
 #pragma unroll

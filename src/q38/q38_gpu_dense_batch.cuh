@@ -509,3 +509,79 @@ static void dense_batch_close(void)
         GDB[p] = NULL;
     }
 }
+
+/* --mv-bench on a dense model: each matrix of one recurrent and one attention layer, one vector
+ * (the decode's mv) against 2..4 (a verification's mvn), and what that makes per token */
+static int dense_mvnbench(q38_model *m)
+{
+    const q38_cfg *c = &m->c;
+    const int p = GD_n - 1;
+    G = GD[p];
+    CK(cudaSetDevice(G->dev));
+    float *x = NULL, *y = NULL;
+    CK(cudaMalloc(&x, (size_t)4 * 32768 * sizeof(float)));
+    CK(cudaMalloc(&y, (size_t)4 * c->n_vocab * sizeof(float)));
+    CK(cudaMemset(x, 0, (size_t)4 * 32768 * sizeof(float)));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    const int l0 = p == 0 ? 0 : GD_split, l1 = p == 0 ? GD_split : c->n_layer;
+    int lr = -1, la = -1, nr = 0, na = 0;
+    for (int il = 0; il < c->n_layer; il++) { if (m->L[il].recurrent) nr++; else na++; }
+    for (int il = l0; il < l1; il++) {
+        if (m->L[il].recurrent && lr < 0) lr = il;
+        if (!m->L[il].recurrent && la < 0) la = il;
+    }
+    double tok[5] = { 0 };
+    const int layers[2] = { lr, la };
+    for (int li = 0; li < 2; li++) {
+        const int il = layers[li];
+        if (il < 0) continue;
+        for (int i = 0; i < NMAT; i++) {
+            const DMat *w = &G->L[il][i];
+            if (!w->d || w->rows < 2 || w->ne0 < 2 || w->ne0 > 32768) continue;
+            const double bytes = w->type == Q38_Q8R ? (double)w->rows * w->ne0 * (1.0 + 4.0 / 32) :
+                                 w->type == Q38_F32 ? (double)w->rows * w->ne0 * 4 : (double)w->rows * w->row_bytes;
+            double us[5] = { 0 };
+            for (int N = 1; N <= 4; N++) {
+                const int reps = 200;
+                for (int r = 0; r < 10; r++) if (N == 1 ? mv(w, x, y, G->st) : mvn(w, x, (int)w->ne0, y, (int)w->rows, N, G->st)) return -1;
+                CK(cudaEventRecord(e0, G->st));
+                for (int r = 0; r < reps; r++) if (N == 1 ? mv(w, x, y, G->st) : mvn(w, x, (int)w->ne0, y, (int)w->rows, N, G->st)) return -1;
+                CK(cudaEventRecord(e1, G->st));
+                CK(cudaEventSynchronize(e1));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                us[N] = 1e3 * ms / reps;
+                tok[N] += us[N] * (m->L[il].recurrent ? nr : na);
+            }
+            printf("mvn layer %2d mat %2d %6lld x %6lld %-6s  1: %7.1f us %5.0f GB/s   2: %.2fx  3: %.2fx  4: %.2fx (%5.0f GB/s)\n",
+                   il, i, (long long)w->ne0, (long long)w->rows, w->type == Q38_Q8R ? "q8r" : q38_type_name(w->type), us[1],
+                   bytes / us[1] / 1e3, us[2] / us[1], us[3] / us[1], us[4] / us[1], bytes / us[4] / 1e3);
+        }
+    }
+    {
+        const DMat *w = &G->output;
+        double us[5] = { 0 };
+        for (int N = 1; N <= 4; N += 3) {
+            for (int r = 0; r < 3; r++) if (N == 1 ? mv(w, x, y, G->st) : mvn(w, x, (int)w->ne0, y, (int)w->rows, N, G->st)) return -1;
+            CK(cudaEventRecord(e0, G->st));
+            for (int r = 0; r < 30; r++) if (N == 1 ? mv(w, x, y, G->st) : mvn(w, x, (int)w->ne0, y, (int)w->rows, N, G->st)) return -1;
+            CK(cudaEventRecord(e1, G->st));
+            CK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            us[N] = 1e3 * ms / 30;
+        }
+        tok[1] += us[1];
+        tok[4] += us[4];
+        printf("mvn output head %lld x %lld %s  1: %.1f us   4: %.2fx\n", (long long)w->ne0, (long long)w->rows,
+               w->type == Q38_Q8R ? "q8r" : q38_type_name(w->type), us[1], us[4] / us[1]);
+    }
+    printf("matrix-vector products of the whole model: 1 token %.1f ms, 2: %.1f, 3: %.1f, 4: %.1f ms (%.2fx)\n",
+           tok[1] / 1e3, tok[2] / 1e3, tok[3] / 1e3, tok[4] / 1e3, tok[4] / tok[1]);
+    cudaFree(x);
+    cudaFree(y);
+    G = GD[0];
+    return 0;
+}
