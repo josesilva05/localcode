@@ -24,6 +24,14 @@ typedef struct { uint64_t hits, misses, ahead, bytes; double wait; } Glm53fCount
 
 typedef struct { const char *name, *help; } Glm53fLevel;
 
+/* How the next token is chosen (glm53f_sample). temp 0: the highest logit (greedy). Otherwise
+ * the top_k highest logits (at most 256; 0 means 256) softened by temp, cut to the smallest set
+ * holding top_p of the probability and to those at least min_p of the best one's, and one of
+ * them drawn. Qwen's advice with thinking: temp 0.6, top_p 0.95, top_k 20, min_p 0; greedy
+ * decoding makes long reasoning repeat itself. */
+typedef struct { float temp, top_p, min_p; int top_k; uint64_t rng; } Glm53fSampler;
+int glm53f_sample(Glm53fSampler *p, const float *logits, int n);
+
 typedef struct Glm53fEngine {
     const char *name;                    /* "Qwen3.8-Flash-Next" */
     const Glm53fLevel *levels;           /* reasoning levels, as /reasoning takes them; the
@@ -37,8 +45,12 @@ typedef struct Glm53fEngine {
     int  (*forward)(struct Glm53fEngine *e, const int *ids, int n, float *logits);
     /* Optional, speculative decoding: feeds tok (the token the logits chose) and the guesses after
      * it the model agrees with, up to GLM53F_SPEC_MAX of them, into extra; logits those after the
-     * last one. Returns how many extra tokens were fed (never an end-of-turn one), -1 on failure. */
-    int  (*forward_spec)(struct Glm53fEngine *e, int tok, int *extra, float *logits);
+     * last one. Returns how many extra tokens were fed (never an end-of-turn one), -1 on failure.
+     * With a sampler (temp > 0) each guess's position draws a token with it: the guess stands
+     * when the draw is the guess, and the first draw that differs is the next token, in *next
+     * (not fed yet); *next is -1 when the caller draws from logits. The tokens come with the
+     * sampler's probabilities exactly, as without guesses. */
+    int  (*forward_spec)(struct Glm53fEngine *e, int tok, int *extra, float *logits, Glm53fSampler *smp, int *next);
     void (*reset)(struct Glm53fEngine *e);
     int  (*encode)(struct Glm53fEngine *e, const char *text, int len, int *out, int max);
     int  (*decode)(struct Glm53fEngine *e, const int *ids, int n, char *out, int max);
@@ -73,6 +85,7 @@ typedef struct {
     Glm53fEngine *e;
     const char  *reasoning;      /* one of e->levels[].name */
     int          gen;            /* tokens per answer            */
+    Glm53fSampler smp;           /* how tokens are chosen (/temp); zero: greedy */
     int          show_thinking;  /* 1: show the reasoning text, 0: fold it into one line */
     double       load_s;         /* seconds spent opening the model */
 

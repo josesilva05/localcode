@@ -117,6 +117,15 @@ Ordem: (1) o ciclo do agente — feito; (2) perfil de modelo; (3) núcleo comum 
 - Saída: o texto pode diferir do modo normal num quase-empate (os núcleos do lote somam em outra ordem), como no llama.cpp.
 - O 35B-MTP tem um bloco MTP com especialistas (MoE): ainda não feito.
 
+**Amostragem (2026-10-09).**
+- O chat e o agente sorteiam o próximo token: temperatura 0,6, top_p 0,95, top_k 20 (o conselho da Qwen com raciocínio). O modo guloso fazia o raciocínio longo entrar em laço. `/temp 0` ou `LOCALCODE_TEMP=0` volta ao guloso; `LOCALCODE_SEED` fixa os sorteios (`src/cli/lc_sample.c`).
+- Com MTP o resultado continua exato: em cada posição de chute o motor sorteia com as mesmas regras; o chute fica quando o sorteio é o chute, e o primeiro sorteio diferente é o próximo token. Como o chute é o mais provável do bloco MTP, isso é a aceitação da amostragem especulativa.
+- Conferido:
+  - `lc_sample_check`: 2 milhões de sorteios por caso contra as probabilidades calculadas à parte; pior desvio 2,8 σ.
+  - 27B a 0,6: 29–31 tok/s com MTP, ~88% dos chutes certos (92% no guloso), 14,2 sem MTP.
+  - No guloso, os ids são os mesmos de antes da mudança.
+  - O agente corrigiu um projeto de teste em 53 s, escrevendo a 23 tok/s.
+
 ## Próxima implementação: a API em Lua (pedido de 2026-10-07)
 
 Reescrever a API (hoje `tools/q38_server.py`, Python sobre `q38api.dll`) em Lua integrada ao C, na linha do Kong (OpenResty/LuaJIT): o servidor HTTP e o roteamento em C ou LuaJIT, as rotas, o formato OpenAI/llama-server, os prefixos e o estacionamento de conversas em Lua, o motor chamado direto pela FFI do LuaJIT (sem processo Python no meio). Também candidato: perfis de modelo e ferramentas do agente escritos em Lua (plugins sem recompilar).

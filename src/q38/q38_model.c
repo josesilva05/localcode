@@ -1287,8 +1287,10 @@ static int argmax_v(const float *v, int n)
     return b;
 }
 
-int q38_model_forward_spec(q38_model *m, int tok, const int *stop, int n_stop, int *extra)
+int q38_model_forward_spec(q38_model *m, int tok, const int *stop, int n_stop, int *extra,
+                           int (*pick)(void *pick_ctx, const float *logits, int n), void *pick_ctx, int *next)
 {
+    if (next) *next = -1;
 #ifdef Q38_CUDA
     static int want = -1;
     if (want < 0) {
@@ -1321,8 +1323,14 @@ int q38_model_forward_spec(q38_model *m, int tok, const int *stop, int n_stop, i
             kept = rv;
             m->spec_t[1] += now_s() - t1;
             m->spec_tries += nd;
-            int a = 0;                            /* the guesses the model agrees with, in order */
-            while (a < nd && argmax_v(lg + (int64_t)a * V, V) == toks[a + 1]) a++;
+            int a = 0, x = -1;                    /* the guesses the model agrees with, in order */
+            while (a < nd) {
+                const float *la = lg + (int64_t)a * V;
+                x = pick ? pick(pick_ctx, la, V) : argmax_v(la, V);
+                if (x != toks[a + 1]) break;
+                a++;
+            }
+            if (a < nd && pick && next) *next = x;   /* drawn where the guess failed: the next token */
             m->spec_hits += a;
             if (a < nd && rv == 1) {              /* the state after token a, copied back */
                 if (q38_gpu_spec_keep(m, a, nd + 1)) return -1;
@@ -1340,7 +1348,7 @@ int q38_model_forward_spec(q38_model *m, int tok, const int *stop, int n_stop, i
         }
     }
 #endif
-    (void)stop; (void)n_stop; (void)extra;
+    (void)stop; (void)n_stop; (void)extra; (void)pick; (void)pick_ctx;
     return q38_model_forward(m, tok) ? 0 : -1;
 }
 

@@ -163,6 +163,7 @@ const Glm53fCommand glm53f_commands[] = {
     { "/auto",      "[off]",           "this folder, remembered: the agent goes from start to finish without asking anything", 1 },
     { "/reasoning", "LEVEL",           "reasoning effort of level 0 chat (set when a conversation opens)", 2 },
     { "/gen",       "N",               "tokens to generate per answer", 2 },
+    { "/temp",      "T",               "sampling temperature: 0 always the most likely token; 0.6 Qwen's advice (top_p 0.95, top_k 20)", 2 },
     { "/thinking",  "",                "show or fold the model's reasoning", 0 },
     { "/stats",     "",                "measured speed, disk reads and expert cache of this session", 0 },
     { "/params",    "",                "the settings in force", 0 },
@@ -206,6 +207,7 @@ void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char
     else if (!strcmp(n, "/approve"))  snprintf(buf, cap, "%s", s->auto_approve ? "auto" : "ask");
     else if (!strcmp(n, "/auto"))     snprintf(buf, cap, "%s", s->autonomous ? "on" : "off");
     else if (!strcmp(n, "/gen"))      snprintf(buf, cap, "%d", s->gen);
+    else if (!strcmp(n, "/temp"))     snprintf(buf, cap, s->smp.temp > 0.0f ? "%.2g" : "0 greedy", s->smp.temp);
     else if (!strcmp(n, "/thinking")) snprintf(buf, cap, "%s", s->show_thinking ? "shown" : "folded");
     else if (!strcmp(n, "/stats") && s->last_spt > 0.0)
         snprintf(buf, cap, "%.1f tok/s · %.3f s/token", 1.0 / s->last_spt, s->last_spt);
@@ -313,8 +315,11 @@ static char *params_note(const Glm53fChat *s)
 {
     char line[600], settings[300];
     s->e->describe(s->e, GLM53F_DESC_SETTINGS, settings, sizeof settings);
-    snprintf(line, sizeof line, "context %d of %d used · %s · reasoning %s · thinking %s · gen %d",
-             s->e->cached, s->e->cap, settings, s->reasoning, s->show_thinking ? "shown" : "folded", s->gen);
+    char smp[80];
+    if (s->smp.temp > 0.0f) snprintf(smp, sizeof smp, "temp %.2g · top_p %.2g · top_k %d", s->smp.temp, s->smp.top_p, s->smp.top_k);
+    else snprintf(smp, sizeof smp, "temp 0 (greedy)");
+    snprintf(line, sizeof line, "context %d of %d used · %s · reasoning %s · thinking %s · gen %d · %s",
+             s->e->cached, s->e->cap, settings, s->reasoning, s->show_thinking ? "shown" : "folded", s->gen, smp);
     return dup_str(line);
 }
 
@@ -445,6 +450,14 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
         in->note = dup_str("/approve takes ask or auto");
     } else if (!strcmp(line, "/save") || !strncmp(line, "/save ", 6)) {
         in->note = save(s, line[5] ? line + 6 : NULL);
+    } else if (!strncmp(line, "/temp ", 6)) {
+        char *end;
+        const double v = strtod(line + 6, &end);
+        if (end != line + 6 && v >= 0.0 && v <= 2.0) {
+            s->smp.temp = (float)v;
+            if (s->smp.temp > 0.0f && s->smp.top_p <= 0.0f) { s->smp.top_p = 0.95f; s->smp.top_k = 20; }
+            in->note = params_note(s);
+        } else in->note = dup_str("/temp takes a number from 0 (greedy) to 2");
     } else if (!strncmp(line, "/gen ", 5)) {
         const int v = atoi(line + 5);
         if (v > 0 && v <= GLM53F_CHAT_MAX_GEN) s->gen = v;
@@ -589,12 +602,14 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     if (e->counters) e->counters(e, &c0);
     const double td = now_s();
     int pend[GLM53F_SPEC_MAX], npend = 0, ipend = 0;   /* guesses already fed (forward_spec) */
+    int next = -1;                                     /* a token forward_spec drew, not fed yet */
     for (int step = 0; step < s->gen; step++) {
         if (g_stop) { interrupted = 1; break; }
         const int fed = ipend < npend;
-        int best = 0;
+        int best;
         if (fed) best = pend[ipend++];
-        else for (int i = 1; i < e->n_vocab; i++) if (s->logits[i] > s->logits[best]) best = i;
+        else if (next >= 0) { best = next; next = -1; }
+        else best = glm53f_sample(&s->smp, s->logits, e->n_vocab);
         if (e->is_eos(e, best)) { stopped = 1; break; }
         s->out[nout++] = best;
         const int len = e->decode(e, s->out, nout, s->text, s->text_cap - 1);
@@ -624,7 +639,7 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
         if (fed || step + 1 >= s->gen) continue;
         int frc = 0;
         if (e->forward_spec && s->gen - step > GLM53F_SPEC_MAX + 1) {
-            frc = e->forward_spec(e, best, pend, s->logits);
+            frc = e->forward_spec(e, best, pend, s->logits, &s->smp, &next);
             if (frc >= 0) { npend = frc; ipend = 0; }
         } else frc = e->forward(e, &best, 1, s->logits);
         if (frc < 0) {

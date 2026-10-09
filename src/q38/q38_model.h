@@ -223,8 +223,14 @@ const float *q38_model_mtp_draft(q38_model *m, int tok);
  * chained guesses for the tokens after it (Q38_SPEC_N, default 3, at most Q38_SPEC_MAX), all in one
  * pass of the model; the guesses the model agrees with are kept. A guess that is one of the n_stop
  * stop tokens ends the chain. Returns the tokens fed beyond tok (in extra), m->logits those after the
- * last one; -1 on failure. Without an MTP block or a GPU it is q38_model_forward. */
-int q38_model_forward_spec(q38_model *m, int tok, const int *stop, int n_stop, int *extra);
+ * last one; -1 on failure. Without an MTP block or a GPU it is q38_model_forward.
+ * pick NULL: a guess stands when it is the highest logit at its position, and *next (if given) is
+ * -1. With pick, each guess's position draws a token with pick(pick_ctx, logits, n_vocab): the
+ * guess stands when the draw is the guess (the guesses are the block's highest, so this is
+ * speculative sampling's acceptance, exact), and the first draw that differs goes to *next, the
+ * next token (not fed); *next is -1 when every guess stood and the caller draws from m->logits. */
+int q38_model_forward_spec(q38_model *m, int tok, const int *stop, int n_stop, int *extra,
+                           int (*pick)(void *pick_ctx, const float *logits, int n), void *pick_ctx, int *next);
 #define Q38_SPEC_MAX 3                       /* drafts a step at most (extra holds that many) */
 
 #endif

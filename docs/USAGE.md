@@ -143,6 +143,7 @@ runs on its own thread, so the screen stays responsive while it works. Answers m
 | `/thinking` | show the reasoning as it is written, or fold it again |
 | `/reasoning max\|high\|low` | Reasoning Effort for the following turns |
 | `/gen N` | tokens to generate per answer |
+| `/temp T` | sampling temperature (default 0.6 with top_p 0.95 and top_k 20, Qwen's advice with thinking; `0` always takes the most likely token). `LOCALCODE_TEMP` sets it at start and `LOCALCODE_SEED` fixes the draws |
 | `/stats` | what this session measured: tokens written and s/token (with a bar per answer), prompt reading speed, experts per token split into from RAM / read ahead from the SSD / read on demand, GB read per token, the share of a token spent waiting on the disk, and which of disk or compute is the limit |
 | `/copy` | put the last answer, without its reasoning, on the clipboard (Windows clipboard; OSC 52 elsewhere) |
 | `/params` | the settings in force and the context used |

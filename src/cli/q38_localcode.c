@@ -80,12 +80,15 @@ static int qw_forward(Glm53fEngine *e, const int *ids, int n, float *logits)
     return 0;
 }
 
+static int qw_pick(void *ctx, const float *logits, int n) { return glm53f_sample((Glm53fSampler *)ctx, logits, n); }
+
 /* the MTP block's guesses (q38_model_forward_spec): tok and the right guesses in one pass */
-static int qw_forward_spec(Glm53fEngine *e, int tok, int *extra, float *logits)
+static int qw_forward_spec(Glm53fEngine *e, int tok, int *extra, float *logits, Glm53fSampler *smp, int *next)
 {
     QwenEngine *q = (QwenEngine *)e->impl;
     const double t0 = now_s();
-    const int k = q38_model_forward_spec(q->m, tok, q->eos, q->n_eos, extra);
+    const int sampled = smp && smp->temp > 0.0f;
+    const int k = q38_model_forward_spec(q->m, tok, q->eos, q->n_eos, extra, sampled ? qw_pick : NULL, smp, next);
     e->cached = q->m->n_past;
     if (k < 0) return -1;
     g_dec.n += 1 + k;
@@ -621,6 +624,14 @@ int main(int argc, char **argv)
     if (s.agent_level && lc_auto_dir(lc_tools_root())) s.autonomous = s.auto_approve = 1;   /* /auto here before */
     if (gen >= e.cap) gen = e.cap / 2;
     s.gen = gen;
+    {   /* Qwen's sampling with thinking; LOCALCODE_TEMP=0 is greedy */
+        const char *tv = getenv("LOCALCODE_TEMP");
+        s.smp.temp = tv ? (float)atof(tv) : 0.6f;
+        s.smp.top_p = 0.95f;
+        s.smp.top_k = 20;
+        s.smp.rng = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)&s;
+        if (getenv("LOCALCODE_SEED")) s.smp.rng = (uint64_t)strtoull(getenv("LOCALCODE_SEED"), NULL, 10);
+    }
     s.resume = resume;
     s.load_s = now_s() - t0;
     printf("\r%*s\r", 40, "");

@@ -13,6 +13,7 @@
 #include "q38_kernels.h"
 #include "q38_quant.h"
 #include "q38_tok.h"
+#include "glm53f_chat.h"                  /* glm53f_sample (src/cli/lc_sample.c) for --temp */
 #ifdef Q38_CUDA
 #include "q38_gpu.h"
 #endif
@@ -71,6 +72,8 @@ static void top5(const float *l, int n, int *out)
     }
 }
 
+static int pick(void *ctx, const float *logits, int n) { return glm53f_sample((Glm53fSampler *)ctx, logits, n); }
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -83,6 +86,7 @@ int main(int argc, char **argv)
     const char *logits_dir = NULL;
     int mtp = 0, mtp_hit = 0, mtp_n = 0, mtp_draft = -1;   /* --mtp: how often the MTP block guesses right */
     int spec = 0;                     /* --spec: generate with speculative decoding */
+    Glm53fSampler smp = { 0.0f, 0.95f, 0.0f, 20, 1 };   /* --temp T [--seed S]: --spec draws with it */
     int from = 0, quiet = 0, batch = 0, text = 0, vbench = 0, xbench = 0, d8check = 0, mvbench = 0, lbench = 0;
     static int gtoks[8192];
     double preload = 0;               /* GB of experts read at start from localcode's usage profile */  /* --batch: the prompt in one batched pass */     /* logits only, without taps (taps force plain GPU launches) */
@@ -98,6 +102,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--batch")) batch = 1;
         else if (!strcmp(argv[i], "--mtp")) mtp = 1;
         else if (!strcmp(argv[i], "--spec")) spec = 1;
+        else if (!strcmp(argv[i], "--temp") && i + 1 < argc) smp.temp = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) smp.rng = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--text")) text = 1;
         else if (!strcmp(argv[i], "--verify-bench")) vbench = 1;
         else if (!strcmp(argv[i], "--expert-bench")) xbench = 1;
@@ -216,15 +222,15 @@ int main(int argc, char **argv)
     if (spec && gen > 0) {            /* the answer with speculative decoding (the MTP block's guesses) */
         const double ts = now_s();
         int produced = 0;
+        if (smp.temp > 0.0f) next = glm53f_sample(&smp, m.logits, m.c.n_vocab);   /* the first one drawn too */
         while (produced < gen && produced < 8191) {
             int extra[Q38_SPEC_MAX];
             gtoks[produced++] = next;
-            const int k = q38_model_forward_spec(&m, next, NULL, 0, extra);
+            int nx = -1;
+            const int k = q38_model_forward_spec(&m, next, NULL, 0, extra, smp.temp > 0.0f ? pick : NULL, &smp, &nx);
             if (k < 0) return 1;
             for (int i = 0; i < k && produced < 8192; i++) gtoks[produced++] = extra[i];
-            int b = 0;
-            for (int v = 1; v < m.c.n_vocab; v++) if (m.logits[v] > m.logits[b]) b = v;
-            next = b;
+            next = nx >= 0 ? nx : glm53f_sample(&smp, m.logits, m.c.n_vocab);
         }
         const double dt = now_s() - ts;
         const double nt = m.spec_tries ? (double)m.spec_tries : 1.0;
