@@ -525,7 +525,18 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
             free(content);
         }
     } else {
-        in->note = dup_str("unknown command; /help lists them");
+        /* a plugin's command, or a skill the user calls (lc_plugins.c) */
+        lc_plugins_load(lc_tools_root());
+        char *note = NULL;
+        char *msg = lc_command_expand(line, &note);
+        if (msg) {
+            in->prompt = msg;
+            in->kind = GLM53F_IN_MESSAGE;
+            in->shown = dup_str(line);
+            in->note = note;
+        } else {
+            in->note = dup_str("unknown command; /help lists them, /plugin the plugins'");
+        }
     }
     free(line);
 }

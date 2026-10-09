@@ -58,4 +58,13 @@ int lc_plugin_switch(const char *what, int on);
 /* /plugin's text: every plugin with its parts, on or off, where it is. */
 char *lc_plugins_report(void);
 
+/* What /name calls command i of a plugin that is on: name, or plugin:name when another command has
+ * the name; 0 when its plugin is off. */
+int lc_command_label(int i, char *out, int cap);
+/* A typed "/name args" as the message it stands for: a plugin's command (its text with $ARGUMENTS,
+ * $1.. and ${CLAUDE_PLUGIN_ROOT} put in), or a skill called by the user (the model is asked to load
+ * it and follow it with the arguments). malloc'd, or NULL when no command or skill is named so;
+ * *note gets one line for the screen. */
+char *lc_command_expand(const char *line, char **note);
+
 #endif

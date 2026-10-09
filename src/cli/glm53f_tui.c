@@ -35,6 +35,8 @@
 #endif
 
 #include "glm53f_chat.h"
+#include "lc_plugins.h"
+#include "lc_tools.h"
 
 static Glm53fChat *g_s;   /* the session (set by glm53f_tui_run) */
 
@@ -1141,6 +1143,38 @@ static void menu_commands(const char *typed)
             snprintf(it->hint, sizeof it->hint, "%s", c->help);
             glm53f_chat_command_value(g_s, c, it->value, sizeof it->value);
             it->submits = c->arg != 2;
+        }
+    /* the plugins' commands, then (after 3 letters) the skills the user can call by name */
+    lc_plugins_load(lc_tools_root());
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < lc_commands_n(); i++) {
+            char lab[600], slash[608];
+            if (!lc_command_label(i, lab, sizeof lab)) continue;
+            snprintf(slash, sizeof slash, "/%s", lab);
+            const int pre = starts_with_ci(slash, typed);
+            if (pass == 0 ? !pre : (pre || !subsequence(slash + 1, typed + 1))) continue;
+            const LcCommand *c = lc_command_at(i);
+            MenuItem *it = menu_add();
+            if (!it) return;
+            snprintf(it->tab, sizeof it->tab, "%s ", slash);
+            snprintf(it->label, sizeof it->label, "%s%s%s", slash, c->hint[0] ? " " : "", c->hint);
+            snprintf(it->hint, sizeof it->hint, "%s", c->desc);
+            snprintf(it->value, sizeof it->value, "%s", c->plugin);
+            it->submits = 0;
+        }
+    if (strlen(typed) >= 4)
+        for (int i = 0; i < lc_skills_n(); i++) {
+            const LcSkill *k = lc_skill_at(i);
+            char slash[200];
+            snprintf(slash, sizeof slash, "/%s", k->name);
+            if (!k->on || !lc_plugin_at(k->plugin)->on || !starts_with_ci(slash, typed)) continue;
+            MenuItem *it = menu_add();
+            if (!it) return;
+            snprintf(it->tab, sizeof it->tab, "%s ", slash);
+            snprintf(it->label, sizeof it->label, "%s", slash);
+            snprintf(it->hint, sizeof it->hint, "skill: %s", k->desc);
+            snprintf(it->value, sizeof it->value, "%s", lc_plugin_at(k->plugin)->name);
+            it->submits = 0;
         }
 }
 

@@ -583,6 +583,20 @@ const LcCommand *lc_command_at(int i) { return i >= 0 && i < nC ? &C[i] : NULL; 
 
 static int skill_live(int i) { return S[i].on && P[S[i].plugin].on; }
 
+/* a plugin's short name, its prefix in plugin:name ("ChristopherKahler/paul" -> "paul") */
+static const char *pshort(int pi)
+{
+    const char *s = strrchr(P[pi].name, '/');
+    return s ? s + 1 : P[pi].name;
+}
+
+/* the n characters at s name plugin pi, by its name or its short name */
+static int pmatch(int pi, const char *s, size_t n)
+{
+    const char *sh = pshort(pi);
+    return (strlen(P[pi].name) == n && !strncmp(P[pi].name, s, n)) || (strlen(sh) == n && !strncmp(sh, s, n));
+}
+
 const LcSkill *lc_skill_find(const char *name)
 {
     if (!name) return NULL;
@@ -592,7 +606,7 @@ const LcSkill *lc_skill_find(const char *name)
             if (!skill_live(i)) continue;
             if (pass == 0 && colon) {
                 const size_t pl = (size_t)(colon - name);
-                if (strlen(P[S[i].plugin].name) == pl && !strncmp(P[S[i].plugin].name, name, pl) && !strcmp(S[i].name, colon + 1))
+                if (pmatch(S[i].plugin, name, pl) && !strcmp(S[i].name, colon + 1))
                     return &S[i];
             } else if (pass == 1 && !strcmp(S[i].name, name)) {
                 return &S[i];
@@ -606,7 +620,7 @@ static void skill_label(int i, char *out, size_t cap)
 {
     int dup = 0;
     for (int j = 0; j < nS && !dup; j++) dup = j != i && skill_live(j) && !strcmp(S[j].name, S[i].name);
-    if (dup) snprintf(out, cap, "%s:%s", P[S[i].plugin].name, S[i].name);
+    if (dup) snprintf(out, cap, "%s:%s", pshort(S[i].plugin), S[i].name);
     else snprintf(out, cap, "%s", S[i].name);
 }
 
@@ -712,7 +726,7 @@ int lc_plugin_switch(const char *what, int on)
         snprintf(kind, sizeof kind, "skill");
         const size_t pl = (size_t)(colon - what);
         for (int i = 0; i < nS; i++)
-            if (strlen(P[S[i].plugin].name) == pl && !strncmp(P[S[i].plugin].name, what, pl) && !strcmp(S[i].name, colon + 1)) {
+            if (pmatch(S[i].plugin, what, pl) && !strcmp(S[i].name, colon + 1)) {
                 S[i].on = on;
                 found = 1;
             }
@@ -762,4 +776,89 @@ char *lc_plugins_report(void)
         b_fmt(&b, " · %s\n", P[i].origin);
     }
     return b.p ? b.p : xdup("");
+}
+
+/* ------------------------------------------------------------- commands ---- */
+
+int lc_command_label(int i, char *out, int cap)
+{
+    if (i < 0 || i >= nC || !P[C[i].pi].on) return 0;
+    int dup = 0;
+    for (int j = 0; j < nC && !dup; j++) dup = j != i && P[C[j].pi].on && !strcmp(C[j].name, C[i].name);
+    if (dup) snprintf(out, (size_t)cap, "%s:%s", pshort(C[i].pi), C[i].name);
+    else snprintf(out, (size_t)cap, "%s", C[i].name);
+    return 1;
+}
+
+/* the text of a .md after its header */
+static const char *md_body(const char *t)
+{
+    if (strncmp(t, "---", 3)) return t;
+    const char *e = strstr(t + 3, "\n---");
+    if (!e) return t;
+    e += 4;
+    while (*e && *e != '\n') e++;
+    while (*e == '\n' || *e == '\r') e++;
+    return e;
+}
+
+/* the arguments one by one ("quoted" ones kept whole) */
+static int split_args(const char *a, char out[][256], int max)
+{
+    int n = 0;
+    while (*a && n < max) {
+        while (*a == ' ') a++;
+        if (!*a) break;
+        int k = 0;
+        if (*a == '"') { a++; while (*a && *a != '"') { if (k < 255) out[n][k++] = *a; a++; } if (*a) a++; }
+        else while (*a && *a != ' ') { if (k < 255) out[n][k++] = *a; a++; }
+        out[n++][k] = 0;
+    }
+    return n;
+}
+
+char *lc_command_expand(const char *line, char **note)
+{
+    if (note) *note = NULL;
+    if (!line || line[0] != '/') return NULL;
+    const char *sp = strchr(line, ' ');
+    char name[300];
+    snprintf(name, sizeof name, "%.*s", (int)(sp ? (size_t)(sp - line - 1) : strlen(line + 1)), line + 1);
+    const char *args = sp ? sp + 1 : "";
+    while (*args == ' ') args++;
+    int ci = -1;
+    for (int i = 0; i < nC && ci < 0; i++) {           /* plugin:name, then the label */
+        if (!P[C[i].pi].on) continue;
+        char full[600], sh[600], lab[600];
+        snprintf(full, sizeof full, "%s:%s", C[i].plugin, C[i].name);
+        snprintf(sh, sizeof sh, "%s:%s", pshort(C[i].pi), C[i].name);
+        if (!strcmp(full, name) || !strcmp(sh, name) || (lc_command_label(i, lab, sizeof lab) && !strcmp(lab, name))) ci = i;
+    }
+    if (ci >= 0) {
+        char *text = lc_slurp(C[ci].file, NULL);
+        if (!text) return NULL;
+        char av[9][256];
+        const int na = split_args(args, av, 9);
+        Buf b = { 0 };
+        for (const char *p = md_body(text); *p;) {
+            if (!strncmp(p, "$ARGUMENTS", 10)) { b_str(&b, args); p += 10; continue; }
+            if (p[0] == '$' && p[1] >= '1' && p[1] <= '9') {
+                const int k = p[1] - '1';
+                if (k < na) b_str(&b, av[k]);
+                p += 2;
+                continue;
+            }
+            if (!strncmp(p, "${CLAUDE_PLUGIN_ROOT}", 21)) { b_str(&b, P[C[ci].pi].dir); p += 21; continue; }
+            b_add(&b, p, 1);
+            p++;
+        }
+        free(text);
+        if (note) *note = xfmt("/%s from the plugin %s", C[ci].name, C[ci].plugin);
+        return b.p ? b.p : xdup("");
+    }
+    const LcSkill *sk = lc_skill_find(name);              /* a skill the user calls */
+    if (!sk) return NULL;
+    if (note) *note = xfmt("the skill %s of the plugin %s", sk->name, P[sk->plugin].name);
+    return xfmt("Call skill with name \"%s:%s\" first and follow it%s%s", pshort(sk->plugin), sk->name,
+                *args ? " for this: " : ".", args);
 }

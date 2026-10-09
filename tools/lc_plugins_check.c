@@ -1,7 +1,7 @@
 /* lc_plugins_check.c - what localcode finds of the plugins (src/cli/lc_plugins.c), for a folder:
  * the time to find them, /plugin's report, the skills list of the prompt and skill_search's answers.
  *
- *     lc_plugins_check [folder] [query ...]
+ *     lc_plugins_check [folder] [query or /command args ...]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +29,13 @@ int main(int argc, char **argv)
         printf("/%s:%s  %s %.80s\n", c->plugin, c->name, c->hint, c->desc);
     }
     for (int i = 2; i < argc; i++) {
+        if (argv[i][0] == '/') {                 /* a command: what it expands to */
+            char *note = NULL, *m = lc_command_expand(argv[i], &note);
+            printf("---- %s -> %s\n%.700s\n", argv[i], note ? note : "(no such command)", m ? m : "");
+            free(m);
+            free(note);
+            continue;
+        }
         char *s = lc_skill_search(argv[i], 6);
         printf("---- skill_search(%s):\n%s\n", argv[i], s);
         free(s);
