@@ -2868,7 +2868,10 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     const size_t kv_row = (size_t)c->n_head_kv * c->head_dim * (G->kv_q8 ? 1 : G->kv_half ? 2 : 4), ix_row = (size_t)c->idx_dim * sizeof(float);
     const size_t sc_row = G->kv_q8 ? (size_t)c->n_head_kv * (c->head_dim / 32) * sizeof(float) : 0;   /* int8 K/V: the scales */
     /* what the file's layout depends on: a state from another shape is refused */
-    const int64_t shape[10] = { Q38_STATE_MAGIC, Q38_STATE_VERSION, c->n_layer, (int64_t)kv_row, (int64_t)ix_row,
+    /* the dense models' MTP block: its K/V and hidden follow the layers (a version of its own, so the
+     * states of models without one stay readable) */
+    Gpu *const mtpg = c->dense && GD_n > 0 && GD[GD_n - 1]->mtp_eh.d ? GD[GD_n - 1] : NULL;
+    const int64_t shape[10] = { Q38_STATE_MAGIC, Q38_STATE_VERSION + (mtpg ? 100 : 0), c->n_layer, (int64_t)kv_row, (int64_t)ix_row,
                                 c->idx_ratio, (int64_t)conv_b, (int64_t)ssm_b, (int64_t)ring_b, c->n_vocab };
     FILE *f = fopen(path, save ? "wb" : "rb");
     if (!f) return -1;
@@ -2927,6 +2930,15 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     }
     cudaSetDevice(G->dev);
     if (ring_b) io(G->ple_ring, ring_b);
+    if (mtpg && ok) {
+        const int il = c->n_layer;
+        cudaSetDevice(mtpg->dev);
+        io(mtpg->kc[il], (size_t)n * kv_row);
+        io(mtpg->vc[il], (size_t)n * kv_row);
+        if (mtpg->ksc[il]) { io(mtpg->ksc[il], (size_t)n * sc_row); io(mtpg->vsc[il], (size_t)n * sc_row); }
+        io(mtpg->mtp_hprev, (size_t)c->n_embd * sizeof(float));
+        cudaSetDevice(G->dev);
+    }
     free(buf);
     if (fclose(f) != 0) ok = 0;
     if (!ok) {
