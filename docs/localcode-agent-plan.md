@@ -92,7 +92,7 @@ Ordem: (1) o ciclo do agente — feito; (2) perfil de modelo; (3) núcleo comum 
 | Qwen3.8-Flash-Next UD-Q4_K_XL / UD-IQ4_XS | `qwen4exp` | validado (float64) | ~12 tok/s (limitado por RAM/disco) |
 | Qwen3.6-35B-A3B-MTP | `qwen35moe` | validado (float64: CPU 3e-6, GPU 5e-7); contexto 128k | 32,8 tok/s; agente 31,2 tok/s; 13,5 tok/s a 118k |
 | Qwen3.6-35B-A3B-Uncensored | `qwen35moe` | roda | 35,5 tok/s |
-| Qwen3.8-27B UD-Q5_K_M | `qwen35` (denso) | roda na CPU e nas 2 GPUs; contexto 32k | 14,6 tok/s (llama.cpp: 15,4); prompt 435 tok/s (llama.cpp: 489); agente 14,5 tok/s |
+| Qwen3.8-27B UD-Q5_K_M | `qwen35` (denso) | validado (float64: CPU 8e-7, GPU 3e-7; MTP 6e-7); contexto 64k (K/V int8) | 14,6 tok/s sem MTP; **30,8 com MTP** (llama.cpp: 15,4 / 34,7); prompt 435 tok/s (llama.cpp: 489); agente 22 tok/s |
 
 **O 27B (2026-10-09).**
 - Denso: uma FFN por camada (guardada nos campos do especialista compartilhado, sem o portão).
@@ -106,7 +106,16 @@ Ordem: (1) o ciclo do agente — feito; (2) perfil de modelo; (3) núcleo comum 
 - O estado salvo (prefixos, `/resume`, `--continue`) cobre as duas GPUs.
 - Contexto: 32k por padrão; o K/V em fp16 de 64k não cabe junto com os pesos nos 24 GB.
 
-Depois: MTP (geração especulativa com a camada multi-token do 35B-MTP e do 27B).
+**MTP / geração especulativa (2026-10-09), no 27B:**
+- O bloco MTP (`nextn`, depois das camadas) roda em todo token lido, com o par (h da posição anterior, token), e assim enche o próprio K/V. Para chutar, ele roda com (h_t, x_{t+1}) e encadeia até 3 chutes com a própria saída (como o `graph_mtp` do llama.cpp).
+- Verificação: o modelo passa os 4 tokens de uma vez.
+  - Produtos dp4a de vários vetores lendo os pesos uma vez, com os vetores na memória compartilhada.
+  - Atenção dos tokens num só lançamento.
+  - O estado do GDN fica guardado depois de cada token: um chute errado custa uma cópia de volta, não uma segunda passada.
+- Acerto: ~92% por chute em código. 27B: 30,8 tok/s contra 14,6 sem MTP.
+- No localcode: `forward_spec` no motor, no agente e no chat (`LOCALCODE_SPEC=0` desliga). O estado salvo inclui o K/V do MTP.
+- Saída: o texto pode diferir do modo normal num quase-empate (os núcleos do lote somam em outra ordem), como no llama.cpp.
+- O 35B-MTP tem um bloco MTP com especialistas (MoE): ainda não feito.
 
 ## Próxima implementação: a API em Lua (pedido de 2026-10-07)
 
