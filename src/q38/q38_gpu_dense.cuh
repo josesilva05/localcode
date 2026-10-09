@@ -11,6 +11,29 @@
 
 static int  dense_forward_batch(q38_model *m, const int *toks, int n);   /* q38_gpu_dense_batch.cuh */
 static void dense_batch_close(void);
+/* q38_gpu_tp.cuh: the layers by tensor parallel */
+static int  tp_open(q38_model *m, int kvb, const int *devs, const int64_t *room);
+static int  tp_forward(q38_model *m, int token);
+static int  tp_mtp_draft(q38_model *m, int tok, int j);
+static void tp_close(void);
+
+/* the host keeps the embedding table only (looked up per token): the trunk's weights, freed */
+static void dense_free_host(q38_model *m)
+{
+    const int L = m->c.n_layer;
+    for (int il = 0; il < L; il++) {
+        q38_mat *w = (q38_mat *)&m->L[il];
+        for (int i = 0; i < NMAT; i++) {
+            if (!w[i].data) continue;
+            free(w[i].data);
+            w[i].data = NULL;
+        }
+        free(m->kcache[il]); free(m->vcache[il]);
+        m->kcache[il] = m->vcache[il] = NULL;
+    }
+    free(m->output.data);
+    m->output.data = NULL;
+}
 
 static int64_t dense_layer_bytes(const q38_model *m, int il)
 {
@@ -146,6 +169,10 @@ static int dense_open(q38_model *m, int device)
         room[d] = (int64_t)fr - (int64_t)800 * 1000 * 1000;
     }
     const int L = c->n_layer;
+    if (nd == 2) {                               /* both devices, half of every layer each */
+        const int rc = tp_open(m, kvb, devs, room);
+        if (rc <= 0) return rc;
+    }
     int64_t lay[Q38_MAX_LAYERS], all = 0;
     int64_t head = m->output.row_bytes * m->output.rows + (int64_t)c->n_vocab * 4 + (int64_t)c->n_embd * 4;
     if (m->mtp)                                  /* the MTP block and its nextn tensors go with the head */
@@ -184,22 +211,9 @@ static int dense_open(q38_model *m, int device)
     if (GD_n == 2 && dense_part(m, devs[1], split, L, 1, kvb, &GD[1])) return -1;
     G = GD[0];
     m->gpu = GD[0];
-    /* the host keeps the embedding table only (looked up per token) */
-    int64_t freed = 0;
-    for (int il = 0; il < L; il++) {
-        q38_mat *w = (q38_mat *)&m->L[il];
-        for (int i = 0; i < NMAT; i++) {
-            if (!w[i].data) continue;
-            freed += w[i].row_bytes * w[i].rows;
-            free(w[i].data);
-            w[i].data = NULL;
-        }
-        free(m->kcache[il]); free(m->vcache[il]);
-        m->kcache[il] = m->vcache[il] = NULL;
-    }
-    freed += m->output.row_bytes * m->output.rows;
-    free(m->output.data);
-    m->output.data = NULL;
+    int64_t freed = m->output.row_bytes * m->output.rows;
+    for (int il = 0; il < L; il++) freed += dense_layer_bytes(m, il);
+    dense_free_host(m);
     cudaDeviceProp p;
     cudaGetDeviceProperties(&p, devs[0]);
     fprintf(stderr, "q38: dense trunk on GPU %d (%s): layers 0-%d, %.2f GB", devs[0], p.name, split - 1, GD[0]->bytes / 1e9);
@@ -264,6 +278,7 @@ static int dense_forward(q38_model *m, int token)
 {
     const q38_cfg *c = &m->c;
     const int E = c->n_embd;
+    if (GD[0]->tp) return tp_forward(m, token);
     Gpu *a = GD[0];
     G = a;
     CK(cudaSetDevice(a->dev));
@@ -305,13 +320,13 @@ static int dense_forward(q38_model *m, int token)
 static void dense_reset(q38_model *m)
 {
     const q38_cfg *c = &m->c;
-    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
+    const int S = c->d_state;
     for (int p = 0; p < GD_n; p++) {
         Gpu *g = GD[p];
         cudaSetDevice(g->dev);
         for (int il = 0; il < c->n_layer; il++) {
-            if (g->conv[il]) cudaMemset(g->conv[il], 0, (size_t)(c->conv_k - 1) * ch * sizeof(float));
-            if (g->ssm[il]) cudaMemset(g->ssm[il], 0, (size_t)c->n_vh * S * S * sizeof(float));
+            if (g->conv[il]) cudaMemset(g->conv[il], 0, (size_t)(c->conv_k - 1) * gdn_ch(g, c) * sizeof(float));
+            if (g->ssm[il]) cudaMemset(g->ssm[il], 0, (size_t)gdn_hv(g, c) * S * S * sizeof(float));
         }
         if (g->mtp_hprev) cudaMemset(g->mtp_hprev, 0, (size_t)c->n_embd * sizeof(float));
         cudaDeviceSynchronize();
@@ -322,6 +337,7 @@ static void dense_reset(q38_model *m)
 static void dense_close(q38_model *m)
 {
     dense_batch_close();
+    tp_close();
     for (int p = 0; p < GD_n; p++) {
         cudaSetDevice(GD[p]->dev);
         cudaDeviceSynchronize();
@@ -341,6 +357,7 @@ extern "C" int q38_gpu_mtp_draft(void *model, int tok, int j)
     q38_model *m = (q38_model *)model;
     Gpu *g = GD[GD_n - 1];
     if (!g || !g->mtp_eh.d) return -1;
+    if (g->tp) return tp_mtp_draft(m, tok, j);
     G = g;
     CK(cudaSetDevice(g->dev));
     k_set_int<<<1, 1, 0, g->st>>>(g->d_pos, m->n_past + j);

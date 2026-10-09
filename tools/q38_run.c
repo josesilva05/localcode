@@ -87,7 +87,7 @@ int main(int argc, char **argv)
     int mtp = 0, mtp_hit = 0, mtp_n = 0, mtp_draft = -1;   /* --mtp: how often the MTP block guesses right */
     int spec = 0;                     /* --spec: generate with speculative decoding */
     Glm53fSampler smp = { 0.0f, 0.95f, 0.0f, 20, 1 };   /* --temp T [--seed S]: --spec draws with it */
-    int from = 0, quiet = 0, batch = 0, text = 0, vbench = 0, xbench = 0, d8check = 0, mvbench = 0, lbench = 0;
+    int from = 0, quiet = 0, batch = 0, text = 0, vbench = 0, xbench = 0, d8check = 0, mvbench = 0, lbench = 0, vcheck = 0, vfrom = 0;
     static int gtoks[8192];
     double preload = 0;               /* GB of experts read at start from localcode's usage profile */  /* --batch: the prompt in one batched pass */     /* logits only, without taps (taps force plain GPU launches) */
     for (int i = 3; i < argc; i++) {
@@ -106,6 +106,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) smp.rng = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--text")) text = 1;
         else if (!strcmp(argv[i], "--verify-bench")) vbench = 1;
+        else if (!strcmp(argv[i], "--verify-check")) vcheck = 1;
+        else if (!strcmp(argv[i], "--verify-from") && i + 1 < argc) vfrom = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--expert-bench")) xbench = 1;
         else if (!strcmp(argv[i], "--dot8-check")) d8check = 1;
         else if (!strcmp(argv[i], "--mv-bench")) mvbench = 1;
@@ -196,6 +198,24 @@ int main(int argc, char **argv)
         double t0 = now_s(), r0 = m.t_read, e0 = m.t_experts, w0 = m.t_gpu_wait, p0 = m.t_ple, l0 = m.t_tail;
         g_cur = i;
         g_from = from;
+#ifdef Q38_CUDA
+        if (vfrom > 0 && i == vfrom && i < n && gpu >= 0) {
+            /* --verify-from K: tokens K.. (up to 4) in one verification, their logits rows after those of
+             * the tokens before (one at a time): against a reference, the verification's own error */
+            const int N = n - i < 4 ? n - i : 4;
+            float *lv = (float *)malloc((size_t)N * m.c.n_vocab * sizeof(float));
+            if (!lv || q38_gpu_verify(&m, toks + i, N, lv) < 0) return 1;
+            if (logits_dir) {
+                char path[1024];
+                snprintf(path, sizeof path, "%s/logits.f32", logits_dir);
+                FILE *lf = fopen(path, "ab");
+                if (lf) { fwrite(lv, sizeof(float), (size_t)N * m.c.n_vocab, lf); fclose(lf); }
+            }
+            free(lv);
+            printf("verified tokens %d-%d in one pass\n", i, i + N - 1);
+            break;
+        }
+#endif
         const float *lg = q38_model_forward(&m, tok);
         if (!lg) return 1;
         if (logits_dir && i >= from) {
@@ -219,6 +239,40 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
     if (mtp) printf("mtp: %d of %d drafts right (%.1f%%)\n", mtp_hit, mtp_n, mtp_n ? 100.0 * mtp_hit / mtp_n : 0.0);
+#ifdef Q38_CUDA
+    if (vcheck && gpu >= 0 && m.c.dense && n >= 4) {
+        /* --verify-check: a verification of N tokens (one pass) against the same tokens one at a time,
+         * from the same state (copied aside and put back around each) */
+        const int V = m.c.n_vocab, n0 = m.n_past, vt[4] = { next, toks[1], toks[2], toks[3] };
+        float *lv = (float *)malloc((size_t)4 * V * sizeof(float)), *lf = (float *)malloc((size_t)4 * V * sizeof(float));
+        if (!lv || !lf || q38_gpu_spec_state(&m, 0)) return 1;
+        for (int N = 2; N <= 4; N++) {
+            if (q38_gpu_verify(&m, vt, N, lv) < 0 || q38_gpu_spec_state(&m, 1)) return 1;
+            m.n_past = n0;
+            for (int t = 0; t < N; t++) {
+                const float *lg = q38_model_forward(&m, vt[t]);
+                if (!lg) return 1;
+                memcpy(lf + (int64_t)t * V, lg, (size_t)V * sizeof(float));
+            }
+            if (q38_gpu_spec_state(&m, 1)) return 1;
+            m.n_past = n0;
+            for (int t = 0; t < N; t++) {
+                const float *a = lv + (int64_t)t * V, *b = lf + (int64_t)t * V;
+                double d = 0, mb = 0;
+                int ia = 0, ib = 0;
+                for (int v = 0; v < V; v++) {
+                    if (fabs((double)a[v] - b[v]) > d) d = fabs((double)a[v] - b[v]);
+                    if (fabs((double)b[v]) > mb) mb = fabs((double)b[v]);
+                    if (a[v] > a[ia]) ia = v;
+                    if (b[v] > b[ib]) ib = v;
+                }
+                printf("verify-check N %d row %d: rel %.3e, argmax %d vs %d\n", N, t, mb > 0 ? d / mb : d, ia, ib);
+            }
+        }
+        free(lv);
+        free(lf);
+    }
+#endif
     if (spec && gen > 0) {            /* the answer with speculative decoding (the MTP block's guesses) */
         const double ts = now_s();
         int produced = 0;

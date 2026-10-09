@@ -99,7 +99,9 @@ __global__ void k_mv_q8r_nc(const int8_t *__restrict__ Q, const float *__restric
  * other types a vector at a time */
 static int mvn(const DMat *w, const float *X, int ldx, float *Y, int ldy, int N, cudaStream_t st)
 {
-    if (w->type == Q38_Q8R && N > 1 && w->ne0 % 512 == 0 && ldx % 4 == 0) {
+    static int q8nc = -1;                        /* Q38_Q8R_NC=0: a vector at a time */
+    if (q8nc < 0) q8nc = !(getenv("Q38_Q8R_NC") && !atoi(getenv("Q38_Q8R_NC")));
+    if (w->type == Q38_Q8R && q8nc && N > 1 && w->ne0 % 512 == 0 && ldx % 4 == 0) {
         const dim3 b8(32, 8);
         const int g8 = (int)((w->rows + 7) / 8);
         const int8_t *Q = (const int8_t *)w->d;
@@ -141,6 +143,7 @@ static int mvn(const DMat *w, const float *X, int ldx, float *Y, int ldy, int N,
 /* Y [N][rows] (row stride ldy) = W . X for N tokens */
 static int dmm(DBat *d, const DMat *w, const float *X, int ldx, float *Y, int ldy, int N, cudaStream_t st)
 {
+    if (N == 1) return mv(w, X, Y, st);                  /* a token: the decode's product */
     if (N <= 4) return mvn(w, X, ldx, Y, ldy, N, st);   /* a verification: the decode's products */
     const int64_t n = w->rows * w->ne0;
     if (w->type == Q38_F32) {
@@ -218,12 +221,27 @@ static int dbat_open(q38_model *m, int p, int l0, int l1, int nb)
     return 0;
 }
 
-/* layer il for the N tokens in d->res (positions *d_pos ..) */
+/* res += y for N rows; under tensor parallel res += y + the other device's y (q38_gpu_tp.cuh),
+ * all-reduce k of the pass */
+static int tp_add(q38_model *m, DBat *d, int N, int k, cudaStream_t st);
+
+static int combine_b(q38_model *m, DBat *d, int N, int k, cudaStream_t st)
+{
+    const int E = m->c.n_embd;
+    if (G->tp) return tp_add(m, d, N, k, st);
+    k_hc_combine_b<<<nblocks((int64_t)N * E, 256), 256, 0, st>>>(d->res, d->y, d->inject, E, 1, N);
+    return 0;
+}
+
+/* layer il for the N tokens in d->res (positions *d_pos ..); under tensor parallel this device's
+ * heads and FFN rows, the two sums with the other device's */
 static int dense_layer_b(q38_model *m, DBat *d, int il, int N, cudaStream_t st)
 {
     const q38_cfg *c = &m->c;
     const q38_layer *l = &m->L[il];
-    const int E = c->n_embd, S = c->d_state, Hk = c->n_kh, Hv = c->n_vh, F = c->ff_shexp;
+    const int tp = G->tp;
+    const int E = c->n_embd, S = c->d_state, Hk = tp ? G->tp_Hk : c->n_kh, Hv = tp ? G->tp_Hv : c->n_vh;
+    const int F = tp ? G->tp_F : c->ff_shexp;
     const int ch = 2 * Hk * S + Hv * S;
     k_rmsnorm_rows_w<<<N, 256, 0, st>>>(d->res, (const float *)LM(il, attn_norm).d, d->mixed, E, c->eps, 1);
     if (l->recurrent) {
@@ -240,7 +258,7 @@ static int dense_layer_b(q38_model *m, DBat *d, int il, int N, cudaStream_t st)
         k_norm_gate<<<N * Hv, 128, 0, st>>>(d->o, d->z, (const float *)LM(il, ssm_norm).d, S, c->eps, c->gdn_silu);
         if (dmm(d, &LM(il, ssm_out), d->o, Hv * S, d->y, E, N, st)) return -1;
     } else {
-        const int H = c->n_head, Hkv = c->n_head_kv, D = c->head_dim;
+        const int H = tp ? G->tp_H : c->n_head, Hkv = tp ? G->tp_Hkv : c->n_head_kv, D = c->head_dim;
         if (dmm(d, &LM(il, wq), d->mixed, E, d->qf, H * 2 * D, N, st) || dmm(d, &LM(il, wk), d->mixed, E, d->knew, Hkv * D, N, st) ||
             dmm(d, &LM(il, wv), d->mixed, E, d->vnew, Hkv * D, N, st)) return -1;
         k_norm_rope_b<<<N * H, 256, 0, st>>>(d->qf, 2 * D, H, (int64_t)H * 2 * D, (const float *)LM(il, q_norm).d, D,
@@ -251,14 +269,13 @@ static int dense_layer_b(q38_model *m, DBat *d, int il, int N, cudaStream_t st)
         attn(G, il, d->qf, d->aout, H, Hkv, D, NULL, c->max_dense_ctx, N, st);
         if (dmm(d, &LM(il, wo), d->aout, H * D, d->y, E, N, st)) return -1;
     }
-    k_hc_combine_b<<<nblocks((int64_t)N * E, 256), 256, 0, st>>>(d->res, d->y, d->inject, E, 1, N);
+    if (combine_b(m, d, N, 2 * il, st)) return -1;
     k_rmsnorm_rows_w<<<N, 256, 0, st>>>(d->res, (const float *)LM(il, post_norm).d, d->mixed, E, c->eps, 1);
     if (dmm(d, &LM(il, sh_gate), d->mixed, E, d->shgu, 2 * F, N, st) ||
         dmm(d, &LM(il, sh_up), d->mixed, E, d->shgu + F, 2 * F, N, st)) return -1;
     k_swiglu_b<<<nblocks((int64_t)N * F, 256), 256, 0, st>>>(d->shgu, d->shh, F, N);
     if (dmm(d, &LM(il, sh_down), d->shh, F, d->y, E, N, st)) return -1;
-    k_hc_combine_b<<<nblocks((int64_t)N * E, 256), 256, 0, st>>>(d->res, d->y, d->inject, E, 1, N);
-    return 0;
+    return combine_b(m, d, N, 2 * il + 1, st);
 }
 
 
@@ -275,15 +292,20 @@ static int dense_bat_ready(q38_model *m)
     int nb = e ? atoi(e) : 1024;                 /* 1024: 435 tok/s on the 27B, 512: 421, 256: 379 */
     if (nb < 16) nb = 16;
     if (nb > 2048) nb = 2048;
-    const int rc = dbat_open(m, 0, 0, GD_split, nb) || (GD_n == 2 && dbat_open(m, 1, GD_split, m->c.n_layer, nb)) ? -1 : 0;
+    const int L = m->c.n_layer, tp = GD[0]->tp;      /* tensor parallel: every layer on both */
+    const int rc = dbat_open(m, 0, 0, tp ? L : GD_split, nb) || (GD_n == 2 && dbat_open(m, 1, tp ? 0 : GD_split, L, nb)) ? -1 : 0;
     G = GD[0];
     return rc;
 }
+
+static int tp_forward_batch(q38_model *m, const int *toks, int n);   /* q38_gpu_tp.cuh */
+static int tp_verify(q38_model *m, const int *toks, int N, float *logits);
 
 static int dense_forward_batch(q38_model *m, const int *toks, int n)
 {
     const q38_cfg *c = &m->c;
     const int E = c->n_embd;
+    if (GD[0]->tp) return tp_forward_batch(m, toks, n);
     if (dense_bat_ready(m)) return -1;
     const int nb = GDB[0]->nb, p00 = m->n_past;
     const double t0 = now_s();
@@ -363,15 +385,16 @@ static int mtp_catchup_b(q38_model *m, DBat *d, const int *toks, int N, cudaStre
 static int keep_open(q38_model *m)
 {
     const q38_cfg *c = &m->c;
-    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
+    const int S = c->d_state;
     for (int p = 0; p < GD_n; p++) {
         DBat *d = GDB[p];
+        const int ch = gdn_ch(GD[p], c), Hv = gdn_hv(GD[p], c);
         if (d->keep_ok) continue;
         CK(cudaSetDevice(GD[p]->dev));
         for (int il = 0; il < c->n_layer; il++) {
             if (!GD[p]->conv[il]) continue;
             if (cudaMalloc(&d->keep_conv[il], (size_t)Q38_SPEC_MAX * (c->conv_k - 1) * ch * sizeof(float)) != cudaSuccess ||
-                cudaMalloc(&d->keep_ssm[il], (size_t)Q38_SPEC_MAX * c->n_vh * S * S * sizeof(float)) != cudaSuccess) {
+                cudaMalloc(&d->keep_ssm[il], (size_t)Q38_SPEC_MAX * Hv * S * S * sizeof(float)) != cudaSuccess) {
                 cudaGetLastError();
                 return -1;
             }
@@ -387,6 +410,7 @@ extern "C" int q38_gpu_verify(void *model, const int *toks, int N, float *logits
     q38_model *m = (q38_model *)model;
     const q38_cfg *c = &m->c;
     const int E = c->n_embd, p0 = m->n_past;
+    if (GD[0]->tp) return tp_verify(m, toks, N, logits);
     if (N < 1 || N > 4 || dense_bat_ready(m)) return -1;
     static int keep = -1;                        /* the states kept per token: when their buffers fit */
     if (keep < 0) keep = !(getenv("Q38_SPEC_KEEP") && !atoi(getenv("Q38_SPEC_KEEP"))) && keep_open(m) == 0;
@@ -418,7 +442,7 @@ extern "C" int q38_gpu_verify(void *model, const int *toks, int N, float *logits
             if (!(d->lgv = dalloc((size_t)4 * c->n_vocab, G))) { G = GD[0]; return -1; }
             CK(cudaMallocHost(&d->h_lgv, (size_t)4 * c->n_vocab * sizeof(float)));
         }
-        k_rmsnorm_rows<<<N, 256, 0, st>>>(d->res, (const float *)G->output_norm.d, d->mixed, E, c->eps);
+        k_rmsnorm_rows_w<<<N, 256, 0, st>>>(d->res, (const float *)G->output_norm.d, d->mixed, E, c->eps, 1);   /* one weight row for all */
         if (mvn(&G->output, d->mixed, E, d->lgv, c->n_vocab, N, st)) { G = GD[0]; return -1; }
         CK(cudaMemcpyAsync(d->h_lgv, d->lgv, (size_t)N * c->n_vocab * sizeof(float), cudaMemcpyDeviceToHost, st));
         if (d->keeping) CK(cudaMemcpyAsync(d->keep_h, d->res, (size_t)N * E * sizeof(float), cudaMemcpyDeviceToDevice, st));
@@ -441,12 +465,12 @@ extern "C" int q38_gpu_spec_keep(void *model, int a, int N)
 {
     q38_model *m = (q38_model *)model;
     const q38_cfg *c = &m->c;
-    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
-    const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
+    const int S = c->d_state;
     if (a >= N - 1) return 0;
     for (int p = 0; p < GD_n; p++) {
         Gpu *g = GD[p];
         DBat *d = GDB[p];
+        const size_t conv_b = (size_t)(c->conv_k - 1) * gdn_ch(g, c) * sizeof(float), ssm_b = (size_t)gdn_hv(g, c) * S * S * sizeof(float);
         CK(cudaSetDevice(g->dev));
         for (int il = 0; il < c->n_layer; il++) {
             if (!g->conv[il]) continue;
@@ -468,12 +492,12 @@ extern "C" int q38_gpu_spec_state(void *model, int restore)
 {
     q38_model *m = (q38_model *)model;
     const q38_cfg *c = &m->c;
-    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
-    const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
+    const int S = c->d_state;
     if (dense_bat_ready(m)) return -1;
     for (int p = 0; p < GD_n; p++) {
         Gpu *g = GD[p];
         DBat *d = GDB[p];
+        const size_t conv_b = (size_t)(c->conv_k - 1) * gdn_ch(g, c) * sizeof(float), ssm_b = (size_t)gdn_hv(g, c) * S * S * sizeof(float);
         CK(cudaSetDevice(g->dev));
         for (int il = 0; il < c->n_layer; il++) {
             if (!g->conv[il]) continue;
@@ -525,7 +549,7 @@ static int dense_mvnbench(q38_model *m)
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
-    const int l0 = p == 0 ? 0 : GD_split, l1 = p == 0 ? GD_split : c->n_layer;
+    const int l0 = p == 0 || G->tp ? 0 : GD_split, l1 = p == 0 && !G->tp ? GD_split : c->n_layer;
     int lr = -1, la = -1, nr = 0, na = 0;
     for (int il = 0; il < c->n_layer; il++) { if (m->L[il].recurrent) nr++; else na++; }
     for (int il = l0; il < l1; il++) {

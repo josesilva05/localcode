@@ -180,7 +180,19 @@ typedef struct {
 #else
     pthread_t    warm_thread;
 #endif
+    /* tensor parallel (the dense models on two devices, q38_gpu_tp.cuh): every layer on both, each
+     * device with its half of the heads and FFN rows (tp_*: its own counts) and of the vocabulary */
+    int       tp, tp_rank, tp_H, tp_Hkv, tp_Hk, tp_Hv, tp_F, tp_V0, tp_V;
+    int      *d_pass;                     /* passes so far: numbers the all-reduces of each */
+    cudaGraphExec_t tpg[4][Q38_MAX_LAYERS];   /* layer il for N = 1..4 tokens */
 } Gpu;
+
+/* a device's Gated DeltaNet value heads and channels (its half under tensor parallel) */
+static int gdn_hv(const Gpu *g, const q38_cfg *c) { return g && g->tp ? g->tp_Hv : c->n_vh; }
+static int gdn_ch(const Gpu *g, const q38_cfg *c)
+{
+    return g && g->tp ? (2 * g->tp_Hk + g->tp_Hv) * c->d_state : (2 * c->n_kh + c->n_vh) * c->d_state;
+}
 
 /* ------------------------------------------------------------------- kernels -- */
 __device__ __forceinline__ float warp_sum(float v)
@@ -2862,16 +2874,18 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     q38_model *m = (q38_model *)model;
     const q38_cfg *c = &m->c;
     if (!G) return -1;
-    const int S = c->d_state, ch = 2 * c->n_kh * S + c->n_vh * S;
-    const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)c->n_vh * S * S * sizeof(float);
+    /* tensor parallel: both devices hold every layer, each its half (its heads), saved one after the other */
+    const int tp = c->dense && GD_n == 2 && GD[0]->tp;
+    const int S = c->d_state, ch = gdn_ch(G, c), kvh = tp ? G->tp_Hkv : c->n_head_kv;
+    const size_t conv_b = (size_t)(c->conv_k - 1) * ch * sizeof(float), ssm_b = (size_t)gdn_hv(G, c) * S * S * sizeof(float);
     const size_t ring_b = G->ple_ring ? (size_t)(c->ple_kern - 1) * c->ple_ngram * c->hc * c->n_embd * sizeof(float) : 0;
-    const size_t kv_row = (size_t)c->n_head_kv * c->head_dim * (G->kv_q8 ? 1 : G->kv_half ? 2 : 4), ix_row = (size_t)c->idx_dim * sizeof(float);
-    const size_t sc_row = G->kv_q8 ? (size_t)c->n_head_kv * (c->head_dim / 32) * sizeof(float) : 0;   /* int8 K/V: the scales */
+    const size_t kv_row = (size_t)kvh * c->head_dim * (G->kv_q8 ? 1 : G->kv_half ? 2 : 4), ix_row = (size_t)c->idx_dim * sizeof(float);
+    const size_t sc_row = G->kv_q8 ? (size_t)kvh * (c->head_dim / 32) * sizeof(float) : 0;   /* int8 K/V: the scales */
     /* what the file's layout depends on: a state from another shape is refused */
     /* the dense models' MTP block: its K/V and hidden follow the layers (a version of its own, so the
      * states of models without one stay readable) */
     Gpu *const mtpg = c->dense && GD_n > 0 && GD[GD_n - 1]->mtp_eh.d ? GD[GD_n - 1] : NULL;
-    const int64_t shape[10] = { Q38_STATE_MAGIC, Q38_STATE_VERSION + (mtpg ? 100 : 0), c->n_layer, (int64_t)kv_row, (int64_t)ix_row,
+    const int64_t shape[10] = { Q38_STATE_MAGIC, Q38_STATE_VERSION + (mtpg ? 100 : 0) + (tp ? 200 : 0), c->n_layer, (int64_t)kv_row, (int64_t)ix_row,
                                 c->idx_ratio, (int64_t)conv_b, (int64_t)ssm_b, (int64_t)ring_b, c->n_vocab };
     FILE *f = fopen(path, save ? "wb" : "rb");
     if (!f) return -1;
@@ -2916,8 +2930,9 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
         }
     };
     if (ok) ok = save ? fwrite(m->toks, sizeof(int), (size_t)n, f) == (size_t)n : fread(m->toks, sizeof(int), (size_t)n, f) == (size_t)n;
-    for (int il = 0; il < c->n_layer && ok; il++) {
-        Gpu *gl = parts[1] && il >= GD_split ? parts[1] : G;
+    for (int k = 0; k < c->n_layer * (tp ? 2 : 1) && ok; k++) {
+        const int il = tp ? k / 2 : k;
+        Gpu *gl = tp ? GD[k & 1] : parts[1] && il >= GD_split ? parts[1] : G;
         cudaSetDevice(gl->dev);
         if (gl->conv[il]) io(gl->conv[il], conv_b);
         if (gl->ssm[il]) io(gl->ssm[il], ssm_b);
@@ -2930,13 +2945,16 @@ extern "C" int q38_gpu_state_file(void *model, const char *path, int save)
     }
     cudaSetDevice(G->dev);
     if (ring_b) io(G->ple_ring, ring_b);
-    if (mtpg && ok) {
+    for (int p = 0; mtpg && ok && p < (tp ? 2 : 1); p++) {
         const int il = c->n_layer;
-        cudaSetDevice(mtpg->dev);
-        io(mtpg->kc[il], (size_t)n * kv_row);
-        io(mtpg->vc[il], (size_t)n * kv_row);
-        if (mtpg->ksc[il]) { io(mtpg->ksc[il], (size_t)n * sc_row); io(mtpg->vsc[il], (size_t)n * sc_row); }
-        io(mtpg->mtp_hprev, (size_t)c->n_embd * sizeof(float));
+        Gpu *gm = tp ? GD[p] : mtpg;
+        cudaSetDevice(gm->dev);
+        io(gm->kc[il], (size_t)n * kv_row);
+        io(gm->vc[il], (size_t)n * kv_row);
+        if (gm->ksc[il]) { io(gm->ksc[il], (size_t)n * sc_row); io(gm->vsc[il], (size_t)n * sc_row); }
+        if (p == 0) io(gm->mtp_hprev, (size_t)c->n_embd * sizeof(float));
+        else if (ok && !save)                    /* the hidden is on both: the second's from the first */
+            ok = cudaMemcpyPeer(gm->mtp_hprev, gm->dev, GD[0]->mtp_hprev, GD[0]->dev, (size_t)c->n_embd * sizeof(float)) == cudaSuccess;
         cudaSetDevice(G->dev);
     }
     free(buf);
@@ -3612,3 +3630,4 @@ extern "C" int q38_gpu_forward(void *model, int token)
 
 #include "q38_gpu_batch.cuh"
 #include "q38_gpu_dense_batch.cuh"
+#include "q38_gpu_tp.cuh"
