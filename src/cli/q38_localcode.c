@@ -566,7 +566,9 @@ int main(int argc, char **argv)
 
     Glm53fEngine e;
     memset(&e, 0, sizeof e);
-    e.name = m.c.name;                   /* general.name: Qwen3.8-Flash-Next, Qwen3.6-35B-A3B ... */
+    /* the name shown is the one the user controls (the model's folder, else its file), not the
+     * GGUF's general.name, which the quantiser wrote and a rename does not change */
+    e.name = variant;
     e.levels = QWEN_LEVELS;
     e.n_levels = 3;
     e.n_vocab = m.c.n_vocab;

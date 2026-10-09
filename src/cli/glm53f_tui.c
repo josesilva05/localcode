@@ -759,8 +759,7 @@ static void render_splash(Lines *L, const Glm53fChat *s, int W)
     for (int r = 0; r < 4; r++) { char m[64]; mascot_row(m, sizeof m, r); ADD(left, nl, C_BRIGHT, 1, "%s", m); }
     ADD(left, nl, "", 1, "%s", "");
     static const char *lv[] = { "chat", "nível 1 · rápido", "nível 2 · agente" };
-    ADD(left, nl, C_DIM, 1, "%s%s%s · %s", s->e->name, s->e->variant ? " " : "", s->e->variant ? s->e->variant : "",
-        lv[s->agent_level > 0 && s->e->agent ? s->agent_level : 0]);
+    ADD(left, nl, C_DIM, 1, "%s · %s", s->e->name, lv[s->agent_level > 0 && s->e->agent ? s->agent_level : 0]);
     {
         char cap[24];
         fmt_k(cap, sizeof cap, s->e->cap);
@@ -1706,8 +1705,8 @@ static void draw(Glm53fChat *s)
         char left[400], right[160];
         static const char *mode[] = { "Chat", "Rápido", "Agente" };
         const int lvl = s->agent_level > 0 && s->e->agent ? s->agent_level : 0;
-        snprintf(left, sizeof left, C_BOLD C_BRIGHT "%s" C_NOBOLD C_DIM " · " C_TEXT "%s" C_DIM " %s" C_DIM " · " C_YELLOW "%s",
-                 mode[lvl], s->e->name, s->e->variant ? s->e->variant : "local",
+        snprintf(left, sizeof left, C_BOLD C_BRIGHT "%s" C_NOBOLD C_DIM " · " C_TEXT "%s" C_DIM " · " C_YELLOW "%s",
+                 mode[lvl], s->e->name,
                  lvl ? (lvl == 1 ? "low" : "medium") : s->reasoning);
         if (g_ask_state == 1)  snprintf(right, sizeof right, C_YELLOW "s sim · a sempre · n não");
         else if (g_busy)       snprintf(right, sizeof right, C_DIM "esc interrompe%s", g_nqueue ? " · na fila" : "");
