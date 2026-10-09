@@ -162,6 +162,7 @@ const Glm53fCommand glm53f_commands[] = {
     { "/level",     "0|1|2",           "agent level: 0 chat, 1 quick (reads files), 2 agent (edits, runs commands); starts a new conversation", 2 },
     { "/model",     "[N|NAME]",        "the model files on this machine, or switch to one (the conversation goes on in it)", 2 },
     { "/approve",   "ask|auto",        "writes and commands: ask before each (default) or run without asking", 2 },
+    { "/shell",     "bash|powershell", "the shell of the agent's run tool (bash: Git Bash, the default where it is found)", 2 },
     { "/plugin",    "[on|off NAME]",   "the plugins (skills, commands, hooks, mods), or one plugin or skill (plugin:name) on or off; /plugin hooks on|off NAME allows its hooks", 2 },
     { "/auto",      "[off]",           "this folder, remembered: the agent goes from start to finish without asking anything", 1 },
     { "/reasoning", "LEVEL",           "reasoning effort of level 0 chat (set when a conversation opens)", 2 },
@@ -451,6 +452,13 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
                                            : "writes and commands ask first");
     } else if (!strncmp(line, "/approve", 8)) {
         in->note = dup_str("/approve takes ask or auto");
+    } else if (!strcmp(line, "/shell bash") || !strcmp(line, "/shell powershell")) {
+        const int ps = !strcmp(line, "/shell powershell");
+        in->note = lc_tools_set_shell(ps) ? dup_str("Git Bash not found; run keeps PowerShell")
+                                          : dup_str(ps ? "run uses PowerShell from the next conversation (/reset)"
+                                                       : "run uses bash (Git Bash) from the next conversation (/reset)");
+    } else if (!strncmp(line, "/shell", 6)) {
+        in->note = dup_str(lc_tools_shell() ? "run uses PowerShell · /shell bash switches" : "run uses bash · /shell powershell switches");
     } else if (!strcmp(line, "/plugin") || !strcmp(line, "/plugins")) {
         lc_plugins_load(lc_tools_root());
         in->note = lc_plugins_report();

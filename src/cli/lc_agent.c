@@ -132,7 +132,9 @@ static void system_block(Str *t, int level)
                  "concretely in the user's language, naming the files and lines you rely on.", lc_tools_root());
     } else {
         s_fmt(t, "You are localcode, a coding agent working in the folder %s on the user's Windows computer, "
-                 "through the functions above (paths relative to that folder; run uses PowerShell).\n", lc_tools_root());
+                 "through the functions above (paths relative to that folder; %s).\n", lc_tools_root(),
+              lc_tools_shell() ? "run uses PowerShell"
+                               : "run uses bash (Git Bash: Unix commands and syntax; Windows paths as C:/...)");
         s_str(t, "For a task that changes code, work in this order:\n");
         if (*lc_skills_block())
             s_str(t, "0. Skills: when a skill listed below covers the task, or a method the user names (TDD, a spec, a plan, "

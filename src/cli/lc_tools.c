@@ -333,19 +333,72 @@ static int is_binary(const char *p, long n)
 #define T_WRITE "{\"type\": \"function\", \"function\": {\"name\": \"write_file\", \"description\": \"Create a file or replace all of its content. Prefer edit_file to change part of an existing file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\", \"description\": \"the whole new content\"}}, \"required\": [\"path\", \"content\"]}}}"
 #define T_EDIT  "{\"type\": \"function\", \"function\": {\"name\": \"edit_file\", \"description\": \"Replace an exact piece of text in a file. old_string must appear exactly once (copy it from read_file, without the line numbers, with enough surrounding lines to be unique), unless replace_all is true.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_string\": {\"type\": \"string\"}, \"new_string\": {\"type\": \"string\"}, \"replace_all\": {\"type\": \"boolean\"}}, \"required\": [\"path\", \"old_string\", \"new_string\"]}}}"
 #define T_RUN   "{\"type\": \"function\", \"function\": {\"name\": \"run\", \"description\": \"Run a PowerShell command in the working directory (builds, tests, git, scripts) and get its output and exit code. Not for interactive programs.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout_s\": {\"type\": \"integer\", \"description\": \"seconds before it is stopped, default 120, at most 1800\"}}, \"required\": [\"command\"]}}}"
+#define T_RUN_SH "{\"type\": \"function\", \"function\": {\"name\": \"run\", \"description\": \"Run a bash command (Git Bash) in the working directory (builds, tests, git, scripts) and get its output and exit code. Not for interactive programs.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout_s\": {\"type\": \"integer\", \"description\": \"seconds before it is stopped, default 120, at most 1800\"}}, \"required\": [\"command\"]}}}"
 
 #define T_PLAN  "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"PowerShell command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
+#define T_PLAN_SH "{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Record the plan of a task that changes code, before changing files: the steps, and the command that proves the task works (the project's tests, a build, or running the program with a check; exit code 0 = works). Call it again to revise the plan.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"steps\": {\"type\": \"string\", \"description\": \"one step per line\"}, \"test_command\": {\"type\": \"string\", \"description\": \"bash command run by test\"}}, \"required\": [\"steps\", \"test_command\"]}}}"
 #define T_TEST  "{\"type\": \"function\", \"function\": {\"name\": \"test\", \"description\": \"Run the plan's test command (or command, when given) and tell whether it passes (exit code 0), with its output. Call it after every change.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"another test command; default the plan's\"}}, \"required\": []}}}"
 #define T_SKILL "{\"type\": \"function\", \"function\": {\"name\": \"skill\", \"description\": \"Load a skill listed in the instructions (or found by skill_search): its steps for a kind of task, to follow. name as listed (plugin:name when given so). file reads another file of the skill's folder.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, \"file\": {\"type\": \"string\"}}, \"required\": [\"name\"]}}}"
 #define T_SEARCH "{\"type\": \"function\", \"function\": {\"name\": \"skill_search\", \"description\": \"Find skills that are not in the list of the instructions: give a few English words of the task (for example: security audit, slides, react performance), even when the user writes in another language; it returns matching skills to load with skill.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}}"
 
+/* ------------------------------------------------------------------- the shell ---- */
+/* run's shell: bash (Git Bash on Windows, as Claude Code and opencode use it, so the plugins' skills,
+ * hooks and mods read their commands as written) by default where it is found, else PowerShell.
+ * LOCALCODE_SHELL=bash|powershell at start, /shell during a session. */
+static int g_shell = -1;                         /* 0 bash, 1 PowerShell */
+
+#ifdef _WIN32
+static const char *git_bash(void)
+{
+    static char found[600];
+    static int looked = 0;
+    if (looked) return found[0] ? found : NULL;
+    looked = 1;
+    const char *bases[] = { getenv("ProgramW6432"), getenv("ProgramFiles"), getenv("LOCALAPPDATA") };
+    const char *subs[] = { "\\Git\\bin\\bash.exe", "\\Programs\\Git\\bin\\bash.exe" };
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 2 && bases[i]; j++) {
+            char p[600];
+            snprintf(p, sizeof p, "%s%s", bases[i], subs[j]);
+            FILE *f = fopen(p, "rb");
+            if (f) { fclose(f); snprintf(found, sizeof found, "%s", p); return found; }
+        }
+    return NULL;
+}
+#endif
+
+int lc_tools_shell(void)
+{
+    if (g_shell < 0) {
+        const char *e = getenv("LOCALCODE_SHELL");
+#ifdef _WIN32
+        g_shell = e && !_stricmp(e, "powershell") ? 1 : git_bash() ? 0 : 1;
+#else
+        g_shell = 0;
+        (void)e;
+#endif
+    }
+    return g_shell;
+}
+
+int lc_tools_set_shell(int ps)
+{
+#ifdef _WIN32
+    if (!ps && !git_bash()) return -1;
+#endif
+    g_shell = ps ? 1 : 0;
+    return 0;
+}
+
 const char *lc_tools_json(int level)
 {
-    static Str l1 = { 0 }, l2 = { 0 };
-    Str *s = level <= 1 ? &l1 : &l2;
+    static Str l1[2] = { { 0 } }, l2[2] = { { 0 } };
+    const int sh = lc_tools_shell();
+    Str *s = level <= 1 ? &l1[sh] : &l2[sh];
     if (s->p) return s->p;
     s_str(s, T_READ "\n" T_LIST "\n" T_GLOB "\n" T_GREP);
-    if (level >= 2) s_str(s, "\n" T_WRITE "\n" T_EDIT "\n" T_RUN "\n" T_PLAN "\n" T_TEST);
+    if (level >= 2) s_str(s, sh ? "\n" T_WRITE "\n" T_EDIT "\n" T_RUN "\n" T_PLAN "\n" T_TEST
+                                : "\n" T_WRITE "\n" T_EDIT "\n" T_RUN_SH "\n" T_PLAN_SH "\n" T_TEST);
     if (*lc_skills_block()) s_str(s, "\n" T_SKILL "\n" T_SEARCH);   /* only where there are skills */
     return s->p;
 }
@@ -825,7 +878,21 @@ static char *t_run(const LcCall *c, volatile int *stop, char *sum, size_t sc, in
     /* the output as UTF-8, no profile, no prompt for input; the script goes base64-encoded
      * (UTF-16LE), so no quote or backslash in it is reinterpreted on the way */
     Str line = { 0 };
-    {
+    const int bash = !lc_tools_shell();
+    if (bash) {                                  /* Git Bash: the command as one quoted argument */
+        s_str(&line, "\"");
+        s_str(&line, git_bash());
+        s_str(&line, "\" --noprofile --norc -c \"");
+        for (const char *p = cmd;; p++) {        /* quoted as CommandLineToArgvW reads it back */
+            int bs = 0;
+            while (*p == '\\') { bs++; p++; }
+            if (!*p) { for (int i = 0; i < bs * 2; i++) s_str(&line, "\\"); break; }
+            if (*p == '"') { for (int i = 0; i < bs * 2 + 1; i++) s_str(&line, "\\"); s_str(&line, "\""); continue; }
+            for (int i = 0; i < bs; i++) s_str(&line, "\\");
+            s_add(&line, p, 1);
+        }
+        s_str(&line, "\"");
+    } else {
         Str script = { 0 };
         s_str(&script, "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; ");
         s_str(&script, cmd);
@@ -858,7 +925,7 @@ static char *t_run(const LcCall *c, volatile int *stop, char *sum, size_t sc, in
     memset(&pi, 0, sizeof pi);
     wchar_t *wl = wide(line.p), *wd = wide(g_root);
     BOOL started = wl && wd && CreateProcessW(NULL, wl, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, wd, &si, &pi);
-    if (!started && wl) {                       /* no pwsh: Windows PowerShell */
+    if (!started && wl && !bash) {              /* no pwsh: Windows PowerShell */
         free(wl);
         Str l2 = { 0 };
         s_str(&l2, "powershell");
@@ -872,7 +939,11 @@ static char *t_run(const LcCall *c, volatile int *stop, char *sum, size_t sc, in
     free(line.p);
     CloseHandle(wr);
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
-    if (!started) { CloseHandle(rd); snprintf(sum, sc, "run: cannot start PowerShell"); return dup_str("could not start PowerShell"); }
+    if (!started) {
+        CloseHandle(rd);
+        snprintf(sum, sc, "run: cannot start %s", bash ? "bash" : "PowerShell");
+        return dup_str(bash ? "could not start Git Bash" : "could not start PowerShell");
+    }
     char buf[8192];
     for (;;) {
         DWORD avail = 0;

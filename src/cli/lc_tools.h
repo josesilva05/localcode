@@ -27,6 +27,11 @@ const char *lc_call_arg(const LcCall *c, const char *key);
 int  lc_tools_init(const char *root);
 const char *lc_tools_root(void);
 
+/* run's shell: 0 bash (Git Bash on Windows), 1 PowerShell; lc_tools_set_shell returns -1 when bash is
+ * not found. */
+int  lc_tools_shell(void);
+int  lc_tools_set_shell(int powershell);
+
 /* The tools of an agent level, one JSON object per line, for the <tools> block:
  * level 1 the reading tools, level 2 and up every tool. */
 const char *lc_tools_json(int level);
