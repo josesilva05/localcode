@@ -905,11 +905,21 @@ static void render_ask(Lines *L, const char *text, size_t len, int W)
             snprintf(line, sizeof line, "%.*s", (int)(n < 1000 ? n : 1000), p);
             for (char *c = line; *c; c++) if (*c == '\t' || *c == '\r') *c = ' ';
             const char *st = line[0] == '-' && line[1] == ' ' ? C_RED : line[0] == '+' && line[1] == ' ' ? C_ADD : C_CODE;
-            buf_str(&b, " " C_YELLOW "│ " C_RESET "  ");
-            buf_str(&b, st);
-            put_cols(&b, line, inner - 3);
-            buf_str(&b, C_RESET " " C_YELLOW "│" C_RESET);
-            lines_push(L, &b);
+            /* a long line (a command) goes on in the rows below, up to 6; the last one cut with … */
+            const char *rest = line;
+            for (int part = 0; *rest; part++) {
+                char chunk[1024];
+                int i = 0, c = 0;
+                while (rest[i] && c < inner - 3) { i++; while (rest[i] && is_cont(rest[i])) i++; c++; }
+                snprintf(chunk, sizeof chunk, "%.*s", part == 5 ? (int)strlen(rest) : i, rest);
+                buf_str(&b, " " C_YELLOW "│ " C_RESET "  ");
+                buf_str(&b, st);
+                put_cols(&b, chunk, inner - 3);
+                buf_str(&b, C_RESET " " C_YELLOW "│" C_RESET);
+                lines_push(L, &b);
+                if (part == 5) break;
+                rest += i;
+            }
             p = q ? q + 1 : end;
             if (shown == 13 && p < end) {
                 buf_str(&b, " " C_YELLOW "│ " C_DIM "  ");
@@ -924,8 +934,8 @@ static void render_ask(Lines *L, const char *text, size_t len, int W)
     buf_str(&b, C_YELLOW "│" C_RESET);
     lines_push(L, &b);
     {
-        const char *keys = C_BRIGHT "❯ s" C_TEXT " sim   " C_BRIGHT "a" C_TEXT " sim, sempre para esta ferramenta   "
-                           C_BRIGHT "n" C_TEXT " não, faça de outro jeito";
+        const char *keys = C_BRIGHT "❯ S" C_TEXT " = Sim   " C_BRIGHT "A" C_TEXT " = Sim, sempre para esta ferramenta   "
+                           C_BRIGHT "N" C_TEXT " = Não, faça de outro jeito";
         const int kc = vis_cols(keys);
         buf_str(&b, " " C_YELLOW "│ " C_RESET);
         buf_str(&b, keys);
@@ -1488,6 +1498,7 @@ static void sink_done(Glm53fTurnSink *k, const char *stats, int state)
 static pthread_cond_t g_ask_cv;
 static volatile int   g_ask_state, g_ask_answer;    /* state 1: a question is open */
 static int            g_ask_block;                  /* its block */
+static char           g_ask_title[600];             /* "permitir <title>": the note it leaves */
 
 static void sink_tool(Glm53fTurnSink *k, const char *title, const char *summary, int ok)
 {
@@ -1504,8 +1515,17 @@ static int sink_approve(Glm53fTurnSink *k, const char *title, const char *detail
     pthread_mutex_lock(&g_mu);
     Block *b = block_new(B_ASK);
     if (b) {
+        /* when the detail repeats the title after the tool's name ("test cd ..." over "cd ..."),
+         * the box's title is the name alone and the command shows once, in full, below; the
+         * note left after the answer keeps the whole title */
+        const char *sp = strchr(title, ' ');
+        const size_t dl = detail ? strcspn(detail, "\n") : 0;
+        const size_t cmp = dl < 24 ? dl : 24;
+        const int dup = sp && dl && strlen(sp + 1) >= cmp && !strncmp(sp + 1, detail, cmp);
+        snprintf(g_ask_title, sizeof g_ask_title, "permitir %s", title);
         buf_str(&b->text, "permitir ");
-        buf_str(&b->text, title);
+        if (dup) buf_add(&b->text, title, (size_t)(sp - title));
+        else buf_str(&b->text, title);
         if (detail && *detail) { buf_str(&b->text, "\n"); buf_str(&b->text, detail); }
     }
     g_ask_block = g_nblocks - 1;
@@ -1527,8 +1547,9 @@ static void ask_answer(int a)
     g_ask_state = 0;
     if (g_ask_block < g_nblocks && g_blocks[g_ask_block].kind == B_ASK) {
         Block *b = &g_blocks[g_ask_block];
-        char *nl = b->text.p ? strchr(b->text.p, '\n') : NULL;   /* keep the title line */
-        if (nl) { b->text.n = (size_t)(nl - b->text.p); *nl = 0; }
+        b->text.n = 0;                                          /* the whole title, then the answer */
+        if (b->text.p) b->text.p[0] = 0;
+        buf_str(&b->text, g_ask_title);
         buf_str(&b->text, a == 2 ? " — sempre" : a == 1 ? " — sim" : " — não");
         b->kind = B_NOTE;
     }
@@ -1708,7 +1729,7 @@ static void draw(Glm53fChat *s)
         snprintf(left, sizeof left, C_BOLD C_BRIGHT "%s" C_NOBOLD C_DIM " · " C_TEXT "%s" C_DIM " · " C_YELLOW "%s",
                  mode[lvl], s->e->name,
                  lvl ? (lvl == 1 ? "low" : "medium") : s->reasoning);
-        if (g_ask_state == 1)  snprintf(right, sizeof right, C_YELLOW "s sim · a sempre · n não");
+        if (g_ask_state == 1)  snprintf(right, sizeof right, C_YELLOW "S sim · A sempre · N não");
         else if (g_busy)       snprintf(right, sizeof right, C_DIM "esc interrompe%s", g_nqueue ? " · na fila" : "");
         else if (lvl == 2)     snprintf(right, sizeof right, s->auto_approve ? C_YELLOW "⏵⏵ aprovação automática"
                                                                            : C_DIM "pede antes de editar ou rodar");
