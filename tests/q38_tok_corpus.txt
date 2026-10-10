@@ -1,0 +1,46 @@
+Qual a capital do Brasil?
+Ação, coração, pão, maçã, açúcar, avó, avô, você, à toa, pôr-do-sol.
+Não sei se é verdade, mas o João disse: "Está tudo bem!"
+The quick brown fox jumps over the lazy dog. It's, I'm, you're, we've, they'll, he'd, IT'S, YOU'RE.
+Numbers: 0 1 12 123 1234 12345 3.14159 1,000,000 2026-10-03 +55 (11) 98765-4321
+   leading spaces, trailing spaces
+tabs	between	words		and  double  spaces
+Line with CRLF ending
+int main(void) { printf("hello, world\n"); return 0; }
+for (size_t i = 0; i < n; ++i) { sum += a[i] * b[i]; } // comment /* block */
+def f(x: int) -> list[str]:
+    return [str(i) for i in range(x) if i % 2 == 0]
+<html><body class="main">&nbsp;&lt;tag&gt;</body></html>
+SELECT id, name FROM users WHERE age >= 18 ORDER BY name DESC;
+https://huggingface.co/Qwen/Qwen3.8-Flash-Next?tab=files#readme
+josé@example.com, C:\Users\JoseS\models\file.gguf
+中文测试：你好，世界！今天天气很好。
+日本語のテキスト：こんにちは、世界。カタカナとひらがな。
+한국어 문장입니다. 안녕하세요!
+Русский текст: Привет, мир! Ёжик.
+العربية: مرحبا بالعالم
+हिन्दी: नमस्ते दुनिया, क्षत्रिय, द्वितीय
+ไทย: สวัสดีชาวโลก
+Emoji: 😀 👍🏽 👨‍👩‍👧‍👦 🇧🇷 ❤️ ✅
+Combining marks: e\u0301 é é ñ n̈ a̐ x̧̃
+Math: ∑ᵢ xᵢ² ≤ √(a² + b²), α β γ δ ∞ ≠ ≈ ∂f/∂x
+<|im_start|>user
+Olá<|im_end|>
+<|im_start|>assistant
+<think>
+pensando...
+</think>
+
+Resposta final.<|im_end|>
+<tool_call>{"name": "read_file", "arguments": {"path": "a.txt"}}</tool_call>
+'''quoted''' ''' '' ' 's 'S 'll 'LL 're
+!!!??? ... --- *** ### @@@ $$$ %%% ^^^ &&& ((( ))) [[[ ]]] {{{ }}}
+
+
+
+end with blank lines above
+CRLF line
+and a lone CRthen text
+decomposed: é ão ñ café
+devanagari marks: कि क्ष
+zero width: a​b‍c﻿d

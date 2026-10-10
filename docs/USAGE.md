@@ -143,6 +143,14 @@ runs on its own thread, so the screen stays responsive while it works. Answers m
 | `/thinking` | show the reasoning as it is written, or fold it again |
 | `/reasoning max\|high\|low` | Reasoning Effort for the following turns |
 | `/gen N` | tokens to generate per answer |
+| `/temp T` | sampling temperature (default 0.6 with top_p 0.95 and top_k 20, Qwen's advice with thinking; `0` always takes the most likely token). `LOCALCODE_TEMP` sets it at start and `LOCALCODE_SEED` fixes the draws |
+| `/plugin` | the plugins (Claude Code's format) with their skills, commands, agents, hooks and mods; `/plugin on|off NAME` or `plugin:skill` switches one, `/plugin hooks on|off NAME` allows a plugin's hooks or mod to run (none run before that). See docs/localcode-plugins-plan.md |
+| `/init [FOCUS]` | have the agent write AGENTS.md for this project (its build, tests, layout and rules); AGENTS.md, or CLAUDE.md, and ~/.localcode/AGENTS.md go into every agent turn |
+| `/undo`, `/redo` | put the files back as they were before the agent's last turn (what its commands changed too), or as it left them; a git repository of its own under %LOCALAPPDATA%\localcode\snapshots, off above 30000 files or 1 GB |
+| `/mode plan`, `/mode build` | plan: the agent investigates and answers with a plan, it changes no file and asks before any command; build: it carries out. In the full-screen view Tab (on an empty box) switches |
+| `@path` in a message | attaches that file's text to the message (up to 256 KB each); in the full-screen view `@` opens a fuzzy search over the project's files |
+| `/permissions` | the allow / ask / deny rules in force: opencode's `permission` (opencode.json, .localcode/settings.json) and Claude Code's `permissions` (.claude/settings.json, settings.local.json); reading .env, a path outside the folder and the same call three times in a row ask by default |
+| `/NAME args` | a plugin's command (`/paul:plan`, `/gsd:help`), a skill the user calls (`/grill-me ...`), or a mod's command (`/replay`) |
 | `/stats` | what this session measured: tokens written and s/token (with a bar per answer), prompt reading speed, experts per token split into from RAM / read ahead from the SSD / read on demand, GB read per token, the share of a token spent waiting on the disk, and which of disk or compute is the limit |
 | `/copy` | put the last answer, without its reasoning, on the clipboard (Windows clipboard; OSC 52 elsewhere) |
 | `/params` | the settings in force and the context used |

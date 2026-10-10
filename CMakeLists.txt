@@ -1,4 +1,4 @@
-# GLM-5.3-Flash inference engine.
+# localcode: the coding agent and its engines (q38 for Qwen3.8, glm53f for GLM-5.3-Flash).
 #
 #   cmake -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build --config Release -j
@@ -6,9 +6,9 @@
 
 cmake_minimum_required(VERSION 3.16)
 
-project(glm-5.3-flash-in-c
+project(localcode
         VERSION 2.0.0
-        DESCRIPTION "GLM-5.3-Flash inference engine in portable C"
+        DESCRIPTION "localcode: a local coding agent and its inference engines in C"
         LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
@@ -47,7 +47,8 @@ else()
       target_compile_options(glm53f_flags INTERFACE $<$<COMPILE_LANGUAGE:C>:-march=native>)
     endif()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-    target_compile_options(glm53f_flags INTERFACE "$<$<COMPILE_LANGUAGE:C>:-mavx2;-mfma>")
+    # F16C (every AVX2 CPU has it): q38's fp16 conversions
+    target_compile_options(glm53f_flags INTERFACE "$<$<COMPILE_LANGUAGE:C>:-mavx2;-mfma;-mf16c>")
   endif()
 endif()
 
@@ -89,21 +90,97 @@ if(OpenMP_C_FOUND)
   target_link_libraries(glm53f PUBLIC OpenMP::OpenMP_C)
 endif()
 
+# ---------------------------------------------------------- Qwen3.8-Flash-Next (q38) --
+add_library(q38 STATIC
+  src/q38/q38_gguf.c
+  src/q38/q38_quant.c
+  src/q38/q38_model.c
+  src/q38/q38_kernels.c
+  src/q38/q38_tok.c)
+target_include_directories(q38 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/q38 ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+# position-independent: the library also goes into libq38api, a shared one
+set_target_properties(q38 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(q38 PUBLIC glm53f_flags Threads::Threads)
+if(NOT MSVC)
+  target_link_libraries(q38 PUBLIC m)
+endif()
+if(OpenMP_C_FOUND)
+  target_link_libraries(q38 PUBLIC OpenMP::OpenMP_C)
+endif()
+if(GLM53F_CUDA)
+  target_sources(q38 PRIVATE src/q38/q38_gpu.cu)
+  target_compile_definitions(q38 PUBLIC Q38_CUDA=1)
+  target_link_libraries(q38 PUBLIC CUDA::cudart CUDA::cublas)
+  if(MSVC)
+    target_compile_options(q38 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/openmp>)
+  endif()
+endif()
+
+add_executable(q38_gguf_info tools/q38_gguf_info.c)
+target_link_libraries(q38_gguf_info PRIVATE q38)
+add_executable(lc_plugins_check tools/lc_plugins_check.c src/cli/lc_plugins.c src/cli/lc_hooks.c src/cli/lc_tools.c src/cli/lc_regex.c src/cli/lc_web.c)
+target_include_directories(lc_plugins_check PRIVATE src/cli third_party src/io)
+if(WIN32)
+  target_link_libraries(lc_plugins_check PRIVATE winhttp)
+endif()
+add_executable(lc_regex_check tools/lc_regex_check.c src/cli/lc_regex.c)
+target_include_directories(lc_regex_check PRIVATE src/cli)
+add_executable(lc_sample_check tools/lc_sample_check.c src/cli/lc_sample.c)
+target_include_directories(lc_sample_check PRIVATE src/cli)
+if(NOT MSVC)
+  target_link_libraries(lc_plugins_check PRIVATE m Threads::Threads)
+  target_link_libraries(lc_sample_check PRIVATE m)
+endif()
+add_executable(q38_run tools/q38_run.c src/cli/lc_sample.c)
+target_include_directories(q38_run PRIVATE src/cli)
+target_link_libraries(q38_run PRIVATE q38)
+
+# Routing trace through libllama (reference/diagnostic only; the engine does not use it).
+set(Q38_LLAMA_CPP_DIR "" CACHE PATH "llama.cpp checkout with a build/ directory, for q38_route_trace")
+if(Q38_LLAMA_CPP_DIR)
+  find_library(Q38_LIB_LLAMA llama PATHS ${Q38_LLAMA_CPP_DIR}/build/src NO_DEFAULT_PATH REQUIRED)
+  find_library(Q38_LIB_GGML ggml PATHS ${Q38_LLAMA_CPP_DIR}/build/ggml/src NO_DEFAULT_PATH REQUIRED)
+  find_library(Q38_LIB_GGML_BASE ggml-base PATHS ${Q38_LLAMA_CPP_DIR}/build/ggml/src NO_DEFAULT_PATH REQUIRED)
+  add_executable(q38_route_trace tools/q38_route_trace.c)
+  target_include_directories(q38_route_trace PRIVATE ${Q38_LLAMA_CPP_DIR}/include ${Q38_LLAMA_CPP_DIR}/ggml/include)
+  target_link_libraries(q38_route_trace PRIVATE ${Q38_LIB_LLAMA} ${Q38_LIB_GGML} ${Q38_LIB_GGML_BASE})
+  add_executable(q38_ref_dump tools/q38_ref_dump.c)
+  target_include_directories(q38_ref_dump PRIVATE ${Q38_LLAMA_CPP_DIR}/include ${Q38_LLAMA_CPP_DIR}/ggml/include)
+  target_link_libraries(q38_ref_dump PRIVATE ${Q38_LIB_LLAMA} ${Q38_LIB_GGML} ${Q38_LIB_GGML_BASE})
+  add_executable(q38_tok_check tools/q38_tok_check.c)
+  target_include_directories(q38_tok_check PRIVATE ${Q38_LLAMA_CPP_DIR}/include ${Q38_LLAMA_CPP_DIR}/ggml/include)
+  target_link_libraries(q38_tok_check PRIVATE q38 ${Q38_LIB_LLAMA} ${Q38_LIB_GGML} ${Q38_LIB_GGML_BASE})
+endif()
+
 # ------------------------------------------------------------------------------ cli --
-add_executable(glm53f_cli src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
+add_executable(glm53f_cli src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/lc_sample.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c src/cli/lc_regex.c src/cli/lc_plugins.c src/cli/lc_hooks.c src/cli/lc_mods.c src/cli/lc_snap.c src/cli/lc_perm.c src/cli/lc_web.c src/cli/lc_session.c)
 set_target_properties(glm53f_cli PROPERTIES OUTPUT_NAME glm53f)
 target_link_libraries(glm53f_cli PRIVATE glm53f)
 if(WIN32)
-  target_link_libraries(glm53f_cli PRIVATE psapi)
+  target_link_libraries(glm53f_cli PRIVATE psapi winhttp)
 endif()
 
-# localcode: the same program opening straight into the interactive session.
-add_executable(localcode src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
-target_compile_definitions(localcode PRIVATE GLM53F_LOCALCODE=1)
-target_link_libraries(localcode PRIVATE glm53f)
+# localcode_glm: the GLM program opening straight into the interactive session.
+add_executable(localcode_glm src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/lc_sample.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c src/cli/lc_regex.c src/cli/lc_plugins.c src/cli/lc_hooks.c src/cli/lc_mods.c src/cli/lc_snap.c src/cli/lc_perm.c src/cli/lc_web.c src/cli/lc_session.c)
+target_compile_definitions(localcode_glm PRIVATE GLM53F_LOCALCODE=1)
+target_link_libraries(localcode_glm PRIVATE glm53f)
 if(WIN32)
-  target_link_libraries(localcode PRIVATE psapi)
+  target_link_libraries(localcode_glm PRIVATE psapi winhttp)
 endif()
+
+# localcode: the interactive session on Qwen3.8-Flash-Next (this repository's model).
+# the engine behind a C ABI, for tools/q38_server.py (an OpenAI / llama-server compatible API)
+add_library(q38api SHARED src/q38/q38_api.c)
+target_link_libraries(q38api PRIVATE q38)
+
+add_executable(localcode src/cli/q38_localcode.c src/cli/glm53f_chat.c src/cli/lc_sample.c src/cli/glm53f_tui.c src/cli/lc_agent.c src/cli/lc_tools.c src/cli/lc_regex.c src/cli/lc_plugins.c src/cli/lc_hooks.c src/cli/lc_mods.c src/cli/lc_snap.c src/cli/lc_perm.c src/cli/lc_web.c src/cli/lc_session.c)
+target_link_libraries(localcode PRIVATE q38 glm53f)
+if(WIN32)
+  target_link_libraries(localcode PRIVATE winhttp)
+endif()
+# the mods' host (src/cli/modhost.mjs, run by node) beside the program
+add_custom_command(TARGET localcode POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/cli/modhost.mjs $<TARGET_FILE_DIR:localcode>/modhost.mjs)
 
 # ---------------------------------------------------------------------------- tests --
 enable_testing()

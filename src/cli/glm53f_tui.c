@@ -1,8 +1,9 @@
 /* glm53f_tui.c - localcode's full-screen front end.
  *
- * The layout of the terminal coding tools it follows, in a Matrix palette: the conversation
- * fills the screen and scrolls above an input box that never leaves the bottom, with a
- * footer under it. The whole screen is redrawn from a model of the conversation (blocks of
+ * The layout of the terminal coding tools it follows: a welcome box (who, which model on
+ * this machine, the folder, tips, this folder's recent conversations), then the conversation,
+ * which fills the screen and scrolls above an input line between two rules that never
+ * leaves the bottom, with the model, the folder and the agent's mode under it. The whole screen is redrawn from a model of the conversation (blocks of
  * text) whenever something changes, inside the terminal's alternate screen.
  *
  * The model runs on a worker thread, so the screen stays alive while it reads or writes:
@@ -34,18 +35,29 @@
 #endif
 
 #include "glm53f_chat.h"
+#include "lc_plugins.h"
+#include "lc_mods.h"
+#include "lc_tools.h"
 
-/* Matrix palette, 24-bit colour */
+static Glm53fChat *g_s;   /* the session (set by glm53f_tui_run) */
+
+/* Palette, 24-bit colour: localcode's green for what belongs to it (the welcome box, the
+ * prompt, the marks of its answers and tools), neutral greys for the text */
 #define C_RESET  "\033[0m"
 #define C_BOLD   "\033[1m"
 #define C_NOBOLD "\033[22m"
-#define C_BRIGHT "\033[38;2;0;255;65m"      /* accents, "code", bold text  */
-#define C_GREEN  "\033[38;2;0;190;60m"      /* secondary accents           */
-#define C_DIM    "\033[38;2;50;135;70m"     /* "local", hints, numbers     */
-#define C_FAINT  "\033[38;2;40;100;55m"     /* reasoning text              */
-#define C_TEXT   "\033[38;2;205;255;210m"   /* answer and input text       */
-#define C_CODE   "\033[38;2;140;255;170m"   /* inline code and code blocks */
-#define C_PANEL  "\033[48;2;14;28;18m"      /* input box background        */
+#define C_BRIGHT "\033[38;2;72;222;128m"    /* localcode green: accents, marks, bold text */
+#define C_GREEN  "\033[38;2;46;160;94m"     /* its darker shade: borders, rules           */
+#define C_DIM    "\033[38;2;138;145;140m"   /* hints, numbers, notes                      */
+#define C_FAINT  "\033[38;2;98;104;100m"    /* reasoning text, rules                      */
+#define C_TEXT   "\033[38;2;232;235;232m"   /* answer and input text                      */
+#define C_CODE   "\033[38;2;136;206;230m"   /* inline code and code blocks                */
+#define C_PANEL  "\033[48;2;40;43;41m"      /* the user's messages, the menu's choice     */
+#define C_YELLOW "\033[38;2;232;196;90m"    /* the agent's mode, questions                */
+#define C_RED    "\033[38;2;238;108;98m"    /* failures, removed lines                    */
+#define C_ADD    "\033[38;2;110;214;140m"   /* added lines                                */
+
+#define LOCALCODE_VERSION "0.4"
 
 #define EDITOR_ROWS 8                        /* input rows shown before the box scrolls */
 
@@ -271,7 +283,7 @@ static int in_read(char *buf, int cap, int timeout_ms)
 /* The conversation as the screen shows it. The worker thread appends, the UI thread draws;
  * both under g_mu. */
 
-enum { B_SPLASH, B_USER, B_STATUS, B_REASON, B_THOUGHT, B_ANSWER, B_STATS, B_NOTE, B_ERROR };
+enum { B_SPLASH, B_USER, B_STATUS, B_REASON, B_THOUGHT, B_ANSWER, B_STATS, B_NOTE, B_ERROR, B_TOOL, B_ASK };
 
 typedef struct {
     int    kind;
@@ -282,7 +294,7 @@ typedef struct {
 static pthread_mutex_t g_mu;
 static Block *g_blocks;
 static int    g_nblocks, g_capblocks;
-static int    g_dirty = 1;
+static volatile int g_dirty = 1;
 
 static Block *block_new(int kind)
 {
@@ -549,73 +561,395 @@ static void render_markdown(Lines *L, const char *text, size_t len, int W)
 
 /* ------------------------------------------------------------------- render ---- */
 
-typedef struct { int w; const char *px[6]; } Glyph;
-static const Glyph G_L = { 2, { "#.", "#.", "#.", "#.", "#.", "##" } };
-static const Glyph G_O = { 4, { "....", "....", "####", "#..#", "#..#", "####" } };
-static const Glyph G_C = { 4, { "....", "....", "####", "#...", "#...", "####" } };
-static const Glyph G_A = { 4, { "....", "....", "####", "...#", "#..#", "####" } };
-static const Glyph G_D = { 4, { "...#", "...#", "####", "#..#", "#..#", "####" } };
-static const Glyph G_E = { 4, { "....", "....", "####", "####", "#...", "####" } };
-
-static void centred(Lines *L, int W, const char *colour, const char *text)
+/* s cut to cols columns with "…", or padded with spaces to them */
+static void put_cols(Buf *b, const char *s, int cols)
 {
-    Buf b = { 0 };
-    const int pad = (W - cols_of(text, (int)strlen(text))) / 2;
-    spaces(&b, pad > 0 ? pad : 0);
-    buf_str(&b, colour);
-    buf_str(&b, text);
-    buf_str(&b, C_RESET);
-    lines_push(L, &b);
+    if (cols <= 0) return;
+    const int have = cols_of(s, (int)strlen(s));
+    if (have <= cols) { buf_str(b, s); spaces(b, cols - have); return; }
+    int i = 0, c = 0;
+    while (s[i] && c < cols - 1) { i++; while (s[i] && is_cont(s[i])) i++; c++; }
+    buf_add(b, s, (size_t)i);
+    buf_str(b, "…");
 }
 
+static void rule(Buf *b, int n) { for (int i = 0; i < n; i++) buf_str(b, "─"); }
+
+/* The user's first name: LOCALCODE_USER, else the account's full name, else its login. */
+static const char *who(void)
+{
+    static char name[128];
+    if (name[0]) return name;
+    const char *e = getenv("LOCALCODE_USER");
+    if (e && *e) snprintf(name, sizeof name, "%s", e);
+#ifdef _WIN32
+    if (!name[0]) {                              /* NetUserGetInfo, loaded when needed */
+        typedef DWORD (WINAPI *GetInfo)(LPCWSTR, LPCWSTR, DWORD, LPBYTE *);
+        typedef DWORD (WINAPI *FreeBuf)(LPVOID);
+        HMODULE h = LoadLibraryA("netapi32.dll");
+        wchar_t user[257];
+        DWORD un = 257;
+        if (h && GetUserNameW(user, &un)) {
+            GetInfo gi = (GetInfo)(void (*)(void))GetProcAddress(h, "NetUserGetInfo");
+            FreeBuf fb = (FreeBuf)(void (*)(void))GetProcAddress(h, "NetApiBufferFree");
+            LPBYTE buf = NULL;
+            /* USER_INFO_2: usri2_full_name follows the name, password, password age,
+             * privilege, home dir, comment, flags and script path (lm.h) */
+            if (gi && fb && gi(NULL, user, 2, &buf) == 0 && buf) {
+                typedef struct { LPWSTR name, password; DWORD age, priv; LPWSTR home, comment; DWORD flags;
+                                 LPWSTR script; DWORD auth; LPWSTR full; } Info2;
+                const wchar_t *full = ((Info2 *)buf)->full;
+                if (full && *full) WideCharToMultiByte(CP_UTF8, 0, full, -1, name, (int)sizeof name, NULL, NULL);
+                fb(buf);
+            }
+        }
+    }
+#endif
+    if (!name[0]) {
+        e = getenv("USERNAME");
+        if (!e) e = getenv("USER");
+        snprintf(name, sizeof name, "%s", e && *e ? e : "");
+    }
+    char *sp = strchr(name, ' ');
+    if (sp) *sp = 0;
+    return name;
+}
+
+/* The working folder, with the home folder as ~ */
+static void short_cwd(char *out, size_t cap)
+{
+    char cwd[1024] = "";
+#ifdef _WIN32
+    if (!_getcwd(cwd, (int)sizeof cwd)) cwd[0] = 0;
+    const char *home = getenv("USERPROFILE");
+#else
+    if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+    const char *home = getenv("HOME");
+#endif
+    const size_t hl = home ? strlen(home) : 0;
+    if (hl && !strncmp(cwd, home, hl) && (cwd[hl] == 0 || cwd[hl] == '\\' || cwd[hl] == '/'))
+        snprintf(out, cap, "~%s", cwd + hl);
+    else
+        snprintf(out, cap, "%s", cwd);
+}
+
+/* The git branch of the working folder (its .git/HEAD, or a parent's), "" outside a
+ * repository; read again every 2 seconds. */
+static void git_branch(char *out, size_t cap)
+{
+    static char cached[96];
+    static double when = -10.0;
+    const double t = now_s();
+    if (t - when > 2.0) {
+        when = t;
+        cached[0] = 0;
+        char dir[1024] = "";
+#ifdef _WIN32
+        if (!_getcwd(dir, (int)sizeof dir)) dir[0] = 0;
+#else
+        if (!getcwd(dir, sizeof dir)) dir[0] = 0;
+#endif
+        for (int up = 0; up < 32 && dir[0]; up++) {
+            char p[1100], head[256];
+            snprintf(p, sizeof p, "%s/.git/HEAD", dir);
+            FILE *fh = fopen(p, "rb");
+            if (fh) {
+                const size_t n = fread(head, 1, sizeof head - 1, fh);
+                fclose(fh);
+                head[n] = 0;
+                char *nl = strpbrk(head, "\r\n");
+                if (nl) *nl = 0;
+                if (!strncmp(head, "ref: refs/heads/", 16)) snprintf(cached, sizeof cached, "%.*s", (int)sizeof cached - 1, head + 16);
+                else if (n >= 7) snprintf(cached, sizeof cached, "%.7s", head);   /* detached */
+                break;
+            }
+            char *cut = strrchr(dir, '\\');
+            char *cut2 = strrchr(dir, '/');
+            if (cut2 > cut) cut = cut2;
+            if (!cut || cut == dir || (cut == dir + 2 && dir[1] == ':')) break;
+            *cut = 0;
+        }
+    }
+    snprintf(out, cap, "%s", cached);
+}
+
+/* 1994 → "2.0k", 131072 → "131k" */
+static void fmt_k(char *out, size_t cap, int n)
+{
+    if (n < 1000)        snprintf(out, cap, "%d", n);
+    else if (n < 100000) snprintf(out, cap, "%.1fk", n / 1000.0);
+    else                 snprintf(out, cap, "%dk", (n + 500) / 1000);
+}
+
+/* The window's title: "localcode · folder", then the conversation's first message. */
+static void set_title(const char *what)
+{
+    char cwd[512], t[600];
+    short_cwd(cwd, sizeof cwd);
+    const char *base = cwd + strlen(cwd);
+    while (base > cwd && base[-1] != '\\' && base[-1] != '/') base--;
+    if (what && *what) {
+        char m[200];
+        snprintf(m, sizeof m, "%.48s%s", what, strlen(what) > 48 ? "…" : "");
+        for (char *c = m; *c; c++) if (*c == '\n' || *c == '\r' || *c == '\033' || *c == '\007') *c = ' ';
+        snprintf(t, sizeof t, "\033]0;localcode | %s\007", m);
+    } else {
+        snprintf(t, sizeof t, "\033]0;localcode · %s\007", *base ? base : cwd);
+    }
+    out_str(t, strlen(t));
+}
+
+static char *g_recent;                               /* this folder's latest conversations */
+
+/* localcode's mascot: the computer it runs on, 12 by 8 pixels in half blocks */
+static const char *MASCOT[8] = {
+    ".##########.",
+    ".##########.",
+    ".###.##.###.",
+    ".##########.",
+    ".###....###.",
+    ".##########.",
+    ".....##.....",
+    "...######...",
+};
+
+static void mascot_row(char *out, size_t cap, int row)
+{
+    size_t n = 0;
+    out[0] = 0;
+    for (int x = 0; x < 12 && n + 4 < cap; x++) {
+        const int top = MASCOT[2 * row][x] == '#', bot = MASCOT[2 * row + 1][x] == '#';
+        n += (size_t)snprintf(out + n, cap - n, "%s", top && bot ? "█" : top ? "▀" : bot ? "▄" : " ");
+    }
+}
+
+typedef struct { const char *style; char text[256]; int centre, divider, tail; } Cell;
+
+static void cell_put(Buf *b, const Cell *c, int width)
+{
+    if (c->divider) { buf_str(b, C_GREEN); rule(b, width); buf_str(b, C_RESET); return; }
+    const int have = cols_of(c->text, (int)strlen(c->text));
+    if (c->tail && have > width && width > 1) {      /* a path: its end matters, "…" before */
+        const char *p = c->text;
+        for (int skip = have - (width - 1); skip > 0 && *p; skip--) { p++; while (*p && is_cont(*p)) p++; }
+        buf_str(b, c->style ? c->style : "");
+        buf_str(b, "…");
+        buf_str(b, p);
+        buf_str(b, C_RESET);
+        return;
+    }
+    const int pad = c->centre && have < width ? (width - have) / 2 : 0;
+    spaces(b, pad);
+    buf_str(b, c->style ? c->style : "");
+    put_cols(b, c->text, width - pad);
+    buf_str(b, C_RESET);
+}
+
+/* The welcome box: who and where on the left, tips and recent conversations on the right
+ * (one column under the other in a narrow window), then the line about staying local. */
 static void render_splash(Lines *L, const Glm53fChat *s, int W)
 {
-    const Glyph *word[9] = { &G_L, &G_O, &G_C, &G_A, &G_L, &G_C, &G_O, &G_D, &G_E };
-    int total = -1;
-    for (int i = 0; i < 9; i++) total += word[i]->w + 1;
+    Cell left[16], right[16];
+    int nl = 0, nr = 0;
+    memset(left, 0, sizeof left);
+    memset(right, 0, sizeof right);
+#define ADD(arr, n, st, ctr, ...) do { arr[n].style = st; arr[n].centre = ctr; \
+                                       snprintf(arr[n].text, sizeof arr[n].text, __VA_ARGS__); n++; } while (0)
+    ADD(left, nl, "", 1, "%s", "");
+    if (*who()) ADD(left, nl, C_BOLD C_TEXT, 1, "Bem-vindo de volta, %s!", who());
+    else        ADD(left, nl, C_BOLD C_TEXT, 1, "Bem-vindo ao localcode!");
+    ADD(left, nl, "", 1, "%s", "");
+    for (int r = 0; r < 4; r++) { char m[64]; mascot_row(m, sizeof m, r); ADD(left, nl, C_BRIGHT, 1, "%s", m); }
+    ADD(left, nl, "", 1, "%s", "");
+    static const char *lv[] = { "chat", "nível 1 · rápido", "nível 2 · agente" };
+    ADD(left, nl, C_DIM, 1, "%s · %s", s->e->name, lv[s->agent_level > 0 && s->e->agent ? s->agent_level : 0]);
+    {
+        char cap[24];
+        fmt_k(cap, sizeof cap, s->e->cap);
+        ADD(left, nl, C_DIM, 1, "contexto de %s tokens · pronto em %.0f s", cap, s->load_s);
+    }
+    {
+        char cwd[512];
+        short_cwd(cwd, sizeof cwd);
+        ADD(left, nl, C_DIM, 1, "%.*s", (int)sizeof left[0].text - 1, cwd);
+        left[nl - 1].tail = 1;
+    }
+
+    ADD(right, nr, C_BOLD C_BRIGHT, 0, "Primeiros passos");
+    ADD(right, nr, C_TEXT, 0, "Peça uma mudança: o agente lê, edita e testa");
+    ADD(right, nr, C_TEXT, 0, "/level 0 chat · 1 rápido · 2 agente");
+    ADD(right, nr, C_TEXT, 0, "/resume volta a uma conversa · /compact resume");
+    if (s->e->n_variants > 1) ADD(right, nr, C_TEXT, 0, "/model troca o modelo (%d nesta máquina)", s->e->n_variants);
+    right[nr++].divider = 1;
+    ADD(right, nr, C_BOLD C_BRIGHT, 0, "Conversas recentes nesta pasta");
+    int nrec = 0;
+    for (const char *p = g_recent; p && *p && nrec < 3; nrec++) {
+        const char *nl2 = strchr(p, '\n');
+        const int len = nl2 ? (int)(nl2 - p) : (int)strlen(p);
+        ADD(right, nr, C_TEXT, 0, "%.*s", len, p);
+        p = nl2 ? nl2 + 1 : NULL;
+    }
+    if (!nrec) ADD(right, nr, C_DIM, 0, "nenhuma ainda; a primeira começa aqui");
+    else       ADD(right, nr, C_DIM, 0, "/resume N para voltar · /sessions lista todas");
+#undef ADD
+
+    /* the frame */
+    const int two = W >= 76;
+    const int inner = W - 5;                            /* " │ " ... " │" */
+    int lw = two ? (W - 8) * 44 / 100 : inner, rw = two ? W - 8 - lw : 0;
+    if (lw < 1) lw = 1;
     push_text(L, "");
-    for (int row = 0; row < 3; row++) {
+    {
         Buf b = { 0 };
-        spaces(&b, (W - total) / 2 > 0 ? (W - total) / 2 : 0);
-        for (int i = 0; i < 9; i++) {
-            buf_str(&b, i < 5 ? C_DIM : C_BRIGHT);
-            for (int x = 0; x < word[i]->w; x++) {
-                const int top = word[i]->px[2 * row][x] == '#', bot = word[i]->px[2 * row + 1][x] == '#';
-                buf_str(&b, top && bot ? "█" : top ? "▀" : bot ? "▄" : " ");
-            }
-            if (i < 8) buf_add(&b, " ", 1);
+        buf_str(&b, " " C_GREEN "╭─── " C_BOLD C_BRIGHT "localcode" C_NOBOLD C_DIM " v" LOCALCODE_VERSION " · local " C_GREEN);
+        const int used = 6 + 9 + (int)strlen(" v" LOCALCODE_VERSION " · local ") - 1;
+        rule(&b, W - 2 - used);
+        buf_str(&b, "╮" C_RESET);
+        lines_push(L, &b);
+    }
+    if (two) {
+        const int n = nl > nr ? nl : nr;
+        for (int i = 0; i < n; i++) {
+            Buf b = { 0 };
+            buf_str(&b, " " C_GREEN "│" C_RESET " ");
+            if (i < nl) cell_put(&b, &left[i], lw); else spaces(&b, lw);
+            buf_str(&b, " " C_GREEN "│" C_RESET " ");
+            if (i < nr) cell_put(&b, &right[i], rw - 1); else spaces(&b, rw - 1);
+            buf_str(&b, " " C_GREEN "│" C_RESET);
+            lines_push(L, &b);
         }
-        buf_str(&b, C_RESET);
+    } else {
+        for (int i = 0; i < nl + nr + 1; i++) {
+            Buf b = { 0 };
+            buf_str(&b, " " C_GREEN "│" C_RESET " ");
+            if (i < nl) cell_put(&b, &left[i], inner - 1);
+            else if (i == nl) spaces(&b, inner - 1);
+            else cell_put(&b, &right[i - nl - 1], inner - 1);
+            buf_str(&b, " " C_GREEN "│" C_RESET);
+            lines_push(L, &b);
+        }
+    }
+    {
+        Buf b = { 0 };
+        buf_str(&b, " " C_GREEN "╰");
+        rule(&b, W - 4);
+        buf_str(&b, "╯" C_RESET);
         lines_push(L, &b);
     }
     push_text(L, "");
-    const Glm53fCfg *c = &s->m->cfg;
-    char line[300];
-    snprintf(line, sizeof line, GLM53F_CHAT_MODEL_NAME " · %d layers · %d MLA + %d KDA · %d experts top-%d · ready in %.1f s",
-             c->n_layers, s->n_mla, s->n_kda, c->n_experts, c->topk, s->load_s);
-    centred(L, W, C_GREEN, line);
-    snprintf(line, sizeof line, "cache %.1f GB%s (%d experts) · prefetch %d · %s · kv %s · experts %s",
-             s->cache_gb, s->cache_auto ? " auto" : "", s->m->cache.nslot, s->prefetch,
-             s->on_gpu ? "gpu" : "cpu", s->m->ckv ? "compressed" : "expanded", s->m->cache.i4 ? "int4" : "fp8");
-    centred(L, W, C_DIM, line);
+    push_text(L, "  " C_GREEN "▎ " C_TEXT "Tudo roda nesta máquina: " C_BRIGHT "o modelo, o contexto e as conversas" C_TEXT
+                 " ficam aqui." C_DIM " Nada vai para a nuvem.");
 }
 
 static void render_bubble(Lines *L, const char *text, size_t len, int W)
 {
-    char prefix[96];
-    snprintf(prefix, sizeof prefix, "  %s%s▌%s ", C_PANEL, C_BRIGHT, C_TEXT);
+    char prefix[96], hang[64];
+    snprintf(prefix, sizeof prefix, "%s %s❯ %s", C_PANEL, C_DIM, C_TEXT);
+    snprintf(hang, sizeof hang, "%s   ", C_PANEL);
     Wrap w = { 0 };
     w.out = L;
-    w.prefix = prefix; w.prefix_cols = 4;
-    w.width = W - 4;
-    w.pad_to = W - 2;
+    w.prefix = prefix; w.prefix_cols = 3;
+    w.hang = hang; w.hang_cols = 3;
+    w.width = W - 2;
+    w.pad_to = W - 1;
     snprintf(w.style, sizeof w.style, "%s", C_TEXT);
     wr_begin(&w, 1);
-    wr_flush(&w);                                /* the top padding row */
     wr_text(&w, text, (int)len);
-    if (w.content) wr_flush(&w);
-    w.content = 1;                               /* the bottom padding row */
+    w.content = 1;
     wr_end(&w);
+}
+
+/* The first line of what was just rendered from index from on gets the mark (an answer's
+ * green dot) in place of its two leading spaces. */
+static void mark_first(Lines *L, int from, const char *mark)
+{
+    for (int i = from; i < L->n; i++) {
+        char *s = L->v[i].s;
+        if (strncmp(s, "  ", 2) || !s[2] || (s[2] == '\033' && !strncmp(s + 2, C_RESET, strlen(C_RESET)))) continue;
+        Buf b = { 0 };
+        buf_str(&b, mark);
+        buf_str(&b, C_RESET " ");
+        buf_str(&b, s + 2);
+        free(s);
+        L->v[i].s = b.p;
+        return;
+    }
+}
+
+/* The question before a write or a command: a frame with the change or the command, the
+ * removed lines red and the added green, and the keys under it. */
+static void render_ask(Lines *L, const char *text, size_t len, int W)
+{
+    const char *nl = memchr(text, '\n', len);
+    const size_t tl = nl ? (size_t)(nl - text) : len;
+    const int inner = W - 5;
+    Buf b = { 0 };
+    buf_str(&b, " " C_YELLOW "╭");
+    rule(&b, W - 4);
+    buf_str(&b, "╮" C_RESET);
+    lines_push(L, &b);
+    char title[600];
+    snprintf(title, sizeof title, "%.*s%s", (int)(tl < 500 ? tl : 500), text, tl && text[tl - 1] == '?' ? "" : "?");
+    if (title[0] >= 'a' && title[0] <= 'z') title[0] = (char)(title[0] - 32);
+    buf_str(&b, " " C_YELLOW "│ " C_BOLD C_TEXT);
+    put_cols(&b, title, inner - 1);
+    buf_str(&b, C_RESET " " C_YELLOW "│" C_RESET);
+    lines_push(L, &b);
+    if (nl) {
+        buf_str(&b, " " C_YELLOW "│" C_RESET);
+        spaces(&b, inner + 1);
+        buf_str(&b, C_YELLOW "│" C_RESET);
+        lines_push(L, &b);
+        int shown = 0;
+        for (const char *p = nl + 1, *end = text + len; p < end && shown < 14; shown++) {
+            const char *q = memchr(p, '\n', (size_t)(end - p));
+            const size_t n = q ? (size_t)(q - p) : (size_t)(end - p);
+            char line[1024];
+            snprintf(line, sizeof line, "%.*s", (int)(n < 1000 ? n : 1000), p);
+            for (char *c = line; *c; c++) if (*c == '\t' || *c == '\r') *c = ' ';
+            const char *st = line[0] == '-' && line[1] == ' ' ? C_RED : line[0] == '+' && line[1] == ' ' ? C_ADD : C_CODE;
+            /* a long line (a command) goes on in the rows below, up to 6; the last one cut with … */
+            const char *rest = line;
+            for (int part = 0; *rest; part++) {
+                char chunk[1024];
+                int i = 0, c = 0;
+                while (rest[i] && c < inner - 3) { i++; while (rest[i] && is_cont(rest[i])) i++; c++; }
+                snprintf(chunk, sizeof chunk, "%.*s", part == 5 ? (int)strlen(rest) : i, rest);
+                buf_str(&b, " " C_YELLOW "│ " C_RESET "  ");
+                buf_str(&b, st);
+                put_cols(&b, chunk, inner - 3);
+                buf_str(&b, C_RESET " " C_YELLOW "│" C_RESET);
+                lines_push(L, &b);
+                if (part == 5) break;
+                rest += i;
+            }
+            p = q ? q + 1 : end;
+            if (shown == 13 && p < end) {
+                buf_str(&b, " " C_YELLOW "│ " C_DIM "  ");
+                put_cols(&b, "…", inner - 3);
+                buf_str(&b, C_RESET " " C_YELLOW "│" C_RESET);
+                lines_push(L, &b);
+            }
+        }
+    }
+    buf_str(&b, " " C_YELLOW "│" C_RESET);
+    spaces(&b, inner + 1);
+    buf_str(&b, C_YELLOW "│" C_RESET);
+    lines_push(L, &b);
+    {
+        const char *keys = C_BRIGHT "❯ S" C_TEXT " = Sim   " C_BRIGHT "A" C_TEXT " = Sim, sempre para esta ferramenta   "
+                           C_BRIGHT "N" C_TEXT " = Não, faça de outro jeito";
+        const int kc = vis_cols(keys);
+        buf_str(&b, " " C_YELLOW "│ " C_RESET);
+        buf_str(&b, keys);
+        spaces(&b, inner - 1 - kc > 0 ? inner - 1 - kc : 0);
+        buf_str(&b, C_RESET " " C_YELLOW "│" C_RESET);
+        lines_push(L, &b);
+    }
+    buf_str(&b, " " C_YELLOW "╰");
+    rule(&b, W - 4);
+    buf_str(&b, "╯" C_RESET);
+    lines_push(L, &b);
 }
 
 static void render_plain(Lines *L, const char *text, size_t len, int W, const char *style, const char *prefix)
@@ -633,41 +967,66 @@ static void render_plain(Lines *L, const char *text, size_t len, int W, const ch
 
 static void render_blocks(Lines *L, const Glm53fChat *s, int W)
 {
-    static const char *spin[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+    static const char *spin[] = { "·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢" };
     for (int i = 0; i < g_nblocks; i++) {
         const Block *b = &g_blocks[i];
-        if (i > 0) push_text(L, "");
         const char *t = b->text.p ? b->text.p : "";
+        if (b->kind == B_ANSWER || b->kind == B_REASON) {   /* nothing to show: no gap either */
+            const char *q = t;
+            while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+            if (!*q) continue;
+        }
+        /* consecutive tools stay together; what a "thought for" line introduces follows it closely */
+        if (i > 0 && !(b->kind == B_TOOL && g_blocks[i - 1].kind == B_TOOL) && g_blocks[i - 1].kind != B_THOUGHT)
+            push_text(L, "");
         switch (b->kind) {
         case B_SPLASH: render_splash(L, s, W); break;
         case B_USER:   render_bubble(L, t, b->text.n, W); break;
         case B_STATUS: {
-            char d[32], line[256];
+            char d[32], line[512];
             duration(d, sizeof d, now_s() - b->t0);
-            snprintf(line, sizeof line, "  %s%s %s%s · %s", C_BRIGHT, spin[(int)(now_s() * 10.0) % 10], C_DIM, t, d);
+            snprintf(line, sizeof line, "  %s%s %s%s… %s(%s · esc para interromper)", C_BRIGHT,
+                     spin[(int)(now_s() * 8.0) % 10], C_BRIGHT, t, C_DIM, d);
             push_text(L, line);
             break;
         }
         case B_REASON:  render_plain(L, t, b->text.n, W, C_FAINT, "  "); break;
         case B_THOUGHT: {
             char line[256];
-            snprintf(line, sizeof line, "  %s+ %s%s", C_BRIGHT, C_GREEN, t);
+            snprintf(line, sizeof line, "  %s✻ %s%s", C_DIM, C_DIM, t);
             push_text(L, line);
             break;
         }
-        case B_ANSWER: render_markdown(L, t, b->text.n, W); break;
-        case B_STATS: {
-            char prefix[160];
-            snprintf(prefix, sizeof prefix, "  %s■ %s%slocalcode%s · %s" GLM53F_CHAT_MODEL_NAME "%s · ",
-                     C_BRIGHT, C_BOLD, C_GREEN, C_NOBOLD, C_TEXT, C_DIM);
-            render_plain(L, t, b->text.n, W, C_DIM, prefix);
+        case B_ANSWER: {
+            const int from = L->n;
+            size_t n = b->text.n;                /* the blank lines the model leaves around its text: none */
+            while (n > 0 && (t[n - 1] == '\n' || t[n - 1] == '\r' || t[n - 1] == ' ' || t[n - 1] == '\t')) n--;
+            while (n > 0 && (*t == '\n' || *t == '\r')) { t++; n--; }
+            render_markdown(L, t, n, W);
+            mark_first(L, from, C_BRIGHT "●");
             break;
         }
-        case B_NOTE:  render_plain(L, t, b->text.n, W, C_DIM, "  "); break;
+        case B_STATS:
+            render_plain(L, t, b->text.n, W, C_FAINT, "  " C_FAINT "└ ");
+            break;
+        case B_NOTE:  render_plain(L, t, b->text.n, W, C_DIM, "  " C_FAINT "⎿  " C_DIM); break;
+        case B_TOOL: {                           /* t0: 1 the call worked, 0 it failed; title \n summary */
+            const char *nl = strchr(t, '\n');
+            const int tl = nl ? (int)(nl - t) : (int)strlen(t);
+            char title[512];
+            snprintf(title, sizeof title, "%.*s", tl, t);
+            Buf h = { 0 };
+            buf_str(&h, b->t0 > 0.5 ? C_BRIGHT "●" : C_RED "●");
+            buf_str(&h, C_RESET " " C_BOLD C_TEXT);
+            put_cols(&h, title, W - 5);
+            buf_str(&h, C_RESET);
+            lines_push(L, &h);
+            if (nl && nl[1]) render_plain(L, nl + 1, strlen(nl + 1), W, b->t0 > 0.5 ? C_DIM : C_RED, "  " C_FAINT "⎿  ");
+            break;
+        }
+        case B_ASK: render_ask(L, t, b->text.n, W); break;
         case B_ERROR: {
-            char prefix[64];
-            snprintf(prefix, sizeof prefix, "  %s! ", C_BRIGHT);
-            render_plain(L, t, b->text.n, W, C_TEXT, prefix);
+            render_plain(L, t, b->text.n, W, C_TEXT, "  " C_RED "✗ ");
             break;
         }
         default: break;
@@ -723,8 +1082,6 @@ static int ed_next(int i) { if (i >= (int)E.b.n) return (int)E.b.n; i++; while (
  * Effort, answer lengths with the time they would take at the speed this session measured,
  * the files of a directory with the tokens they would take out of the context left. */
 
-static Glm53fChat *g_s;
-
 #define MENU_MAX  64
 #define MENU_ROWS 8
 
@@ -772,6 +1129,14 @@ static int subsequence(const char *name, const char *typed)
     return 1;
 }
 
+/* a label that did not fit: cut on a UTF-8 boundary, ending in "..." */
+static void label_cut(char *label, size_t cap)
+{
+    size_t cut = cap - 4;
+    while (cut > 0 && ((unsigned char)label[cut] & 0xC0) == 0x80) cut--;
+    memcpy(label + cut, "...", 4);
+}
+
 static void menu_commands(const char *typed)
 {
     snprintf(M.title, sizeof M.title, "commands");
@@ -788,23 +1153,92 @@ static void menu_commands(const char *typed)
             glm53f_chat_command_value(g_s, c, it->value, sizeof it->value);
             it->submits = c->arg != 2;
         }
+    /* the mods' commands (/replay) */
+    for (int i = 0; i < lc_mods_commands(); i++) {
+        char slash[80];
+        snprintf(slash, sizeof slash, "/%s", lc_mods_command_name(i));
+        if (!starts_with_ci(slash, typed)) continue;
+        MenuItem *it = menu_add();
+        if (!it) return;
+        snprintf(it->tab, sizeof it->tab, "%s", slash);
+        snprintf(it->label, sizeof it->label, "%s", slash);
+        snprintf(it->hint, sizeof it->hint, "%s", lc_mods_command_desc(i));
+        snprintf(it->value, sizeof it->value, "mod");
+        it->submits = 1;
+    }
+    /* the plugins' commands, then (after 3 letters) the skills the user can call by name */
+    lc_plugins_load(lc_tools_root());
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < lc_commands_n(); i++) {
+            char lab[600], slash[608];
+            if (!lc_command_label(i, lab, sizeof lab)) continue;
+            snprintf(slash, sizeof slash, "/%s", lab);
+            const int pre = starts_with_ci(slash, typed);
+            if (pass == 0 ? !pre : (pre || !subsequence(slash + 1, typed + 1))) continue;
+            const LcCommand *c = lc_command_at(i);
+            MenuItem *it = menu_add();
+            if (!it) return;
+            snprintf(it->tab, sizeof it->tab, "%s ", slash);
+            if (snprintf(it->label, sizeof it->label, "%s%s%s", slash, c->hint[0] ? " " : "", c->hint) >= (int)sizeof it->label)
+                label_cut(it->label, sizeof it->label);
+            snprintf(it->hint, sizeof it->hint, "%s", c->desc);
+            snprintf(it->value, sizeof it->value, "%s", c->plugin);
+            it->submits = 0;
+        }
+    if (strlen(typed) >= 4)
+        for (int i = 0; i < lc_skills_n(); i++) {
+            const LcSkill *k = lc_skill_at(i);
+            char slash[200];
+            snprintf(slash, sizeof slash, "/%s", k->name);
+            if (!k->on || !lc_plugin_at(k->plugin)->on || !starts_with_ci(slash, typed)) continue;
+            MenuItem *it = menu_add();
+            if (!it) return;
+            snprintf(it->tab, sizeof it->tab, "%s ", slash);
+            if (snprintf(it->label, sizeof it->label, "%s", slash) >= (int)sizeof it->label) label_cut(it->label, sizeof it->label);
+            snprintf(it->hint, sizeof it->hint, "skill: %s", k->desc);
+            snprintf(it->value, sizeof it->value, "%s", lc_plugin_at(k->plugin)->name);
+            it->submits = 0;
+        }
 }
 
 static void menu_reasoning(const char *typed)
 {
-    static const char *v[3][2] = {
-        { "max",  "reasons the longest before answering (the default)" },
-        { "high", "reasons less" },
-        { "low",  "the shortest reasoning: the answer starts soonest" },
-    };
-    snprintf(M.title, sizeof M.title, "Reasoning Effort");
-    for (int i = 0; i < 3; i++) {
-        if (!starts_with_ci(v[i][0], typed)) continue;
+    const Glm53fEngine *e = g_s->e;
+    snprintf(M.title, sizeof M.title, "Reasoning effort (applies when a conversation opens)");
+    for (int i = 0; i < e->n_levels; i++) {
+        const char *name = e->levels[i].name;
+        if (!starts_with_ci(name, typed)) continue;
         MenuItem *it = menu_add();
-        snprintf(it->tab, sizeof it->tab, "/reasoning %s", v[i][0]);
-        snprintf(it->label, sizeof it->label, "%s", v[i][0]);
-        snprintf(it->hint, sizeof it->hint, "%s", v[i][1]);
-        if (lower((unsigned char)g_s->reasoning[0]) == v[i][0][0]) snprintf(it->value, sizeof it->value, "now");
+        snprintf(it->tab, sizeof it->tab, "/reasoning %s", name);
+        snprintf(it->label, sizeof it->label, "%s", name);
+        snprintf(it->hint, sizeof it->hint, "%s", e->levels[i].help);
+        if (g_s->reasoning == name) snprintf(it->value, sizeof it->value, "now");
+        it->submits = 1;
+    }
+}
+
+/* /model: the models on this machine; enter opens the chosen one */
+static void menu_models(const char *typed)
+{
+    const Glm53fEngine *e = g_s->e;
+    snprintf(M.title, sizeof M.title, "Models on this machine (enter switches; the conversation goes on in it)");
+    for (int i = 0; i < e->n_variants; i++) {
+        const char *name = e->variant_name[i];
+        int hit = !*typed, digits = *typed != 0;     /* the typed text anywhere in the name, or its number */
+        for (const char *d = typed; *d; d++) if (*d < '0' || *d > '9') digits = 0;
+        if (digits) hit = atoi(typed) == i + 1;
+        for (const char *h = name; *h && !hit && !digits; h++) {
+            const char *a = typed, *b = h;
+            while (*a && *b && (*a | 32) == (*b | 32)) { a++; b++; }
+            if (!*a) hit = 1;
+        }
+        if (!hit) continue;
+        MenuItem *it = menu_add();
+        if (!it) return;
+        snprintf(it->tab, sizeof it->tab, "/model %d", i + 1);
+        snprintf(it->label, sizeof it->label, "%s", name);
+        snprintf(it->hint, sizeof it->hint, "%s", e->variant_info[i]);
+        if (e->variant && !strcmp(e->variant, name)) snprintf(it->value, sizeof it->value, "open");
         it->submits = 1;
     }
 }
@@ -812,13 +1246,13 @@ static void menu_reasoning(const char *typed)
 static void menu_gen(const char *typed)
 {
     static const int v[] = { 256, 512, 1024, 2048, 4096 };
-    const int left = g_s->m->cap - g_s->m->cached;
+    const int left = g_s->e->cap - g_s->e->cached;
     snprintf(M.title, sizeof M.title, "tokens per answer");
     int numeric = *typed != 0;
     for (const char *p = typed; *p; p++) if (*p < '0' || *p > '9') numeric = 0;
     M.raw_enter = numeric;
     for (int i = 0; i < (int)(sizeof v / sizeof *v); i++) {
-        if (v[i] > GLM53F_MAX_GEN || v[i] > g_s->m->cap) break;
+        if (v[i] > GLM53F_CHAT_MAX_GEN || v[i] > g_s->e->cap) break;
         char num[16];
         snprintf(num, sizeof num, "%d", v[i]);
         if (!starts_with_ci(num, typed)) continue;
@@ -828,7 +1262,8 @@ static void menu_gen(const char *typed)
         if (g_s->last_spt > 0.0) {
             char d[32];
             duration(d, sizeof d, v[i] * g_s->last_spt);
-            snprintf(it->hint, sizeof it->hint, "up to %s at the last answer's %.2f s/token", d, g_s->last_spt);
+            snprintf(it->hint, sizeof it->hint, "up to %s at the last answer's %.1f tok/s (%.3f s/token)", d,
+                     1.0 / g_s->last_spt, g_s->last_spt);
         } else {
             snprintf(it->hint, sizeof it->hint, "its time shows once an answer has been measured");
         }
@@ -920,7 +1355,7 @@ static void menu_files(const char *typed)
     }
     static DirEnt ents[256];
     const int n = list_dir(dir, pre, ents, 256);
-    const int left = g_s->m->cap - g_s->m->cached;
+    const int left = g_s->e->cap - g_s->e->cached;
     snprintf(M.title, sizeof M.title, "files in %s", *dir ? dir : "the working directory");
     snprintf(M.right, sizeof M.right, "%d positions left", left);
     for (int i = 0; i < n; i++) {
@@ -956,6 +1391,103 @@ static void menu_files(const char *typed)
     }
 }
 
+/* ---- @mentions: the project's files, found by fuzzy search ---- */
+
+#define FX_MAX 20000
+
+static char  **g_fx;           /* the working directory's files, relative, with '/' */
+static int     g_nfx;
+static double  g_fx_t;
+
+static void fx_walk(const char *abs, const char *rel, int depth)
+{
+    if (depth > 12 || g_nfx >= FX_MAX) return;
+    int n = 0;
+    LcEnt *v = lc_read_dir(abs, &n);
+    for (int i = 0; v && i < n && g_nfx < FX_MAX; i++) {
+        const char *nm = v[i].name;
+        if (nm[0] == '.' || !strcmp(nm, "node_modules") || !strcmp(nm, "__pycache__") || !strcmp(nm, "venv")) continue;
+        char a[4400], r[2048];
+        snprintf(a, sizeof a, "%s/%s", abs, nm);
+        snprintf(r, sizeof r, "%s%s%s", rel, *rel ? "/" : "", nm);
+        if (v[i].dir) { fx_walk(a, r, depth + 1); continue; }
+        const size_t l = strlen(r) + 1;
+        char *c = (char *)malloc(l);
+        if (!c) break;
+        memcpy(c, r, l);
+        g_fx[g_nfx++] = c;
+    }
+    if (v) lc_ents_free(v, n);
+}
+
+static void fx_index(void)
+{
+    if (g_fx && now_s() - g_fx_t < 10.0) return;   /* new files show within 10 s */
+    for (int i = 0; i < g_nfx; i++) free(g_fx[i]);
+    if (!g_fx) g_fx = (char **)malloc(FX_MAX * sizeof *g_fx);
+    g_nfx = 0;
+    if (g_fx) fx_walk(lc_tools_root(), "", 0);
+    g_fx_t = now_s();
+}
+
+/* how well typed names path: by its file name's start, inside the name, inside the path, then the
+ * letters in order; 0 not at all */
+static int fx_score(const char *path, const char *typed)
+{
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const int len = (int)strlen(path);
+    if (!*typed) return 1000 - len;
+    if (starts_with_ci(base, typed)) return 4000 - len;
+    const size_t tl = strlen(typed);
+    for (const char *p = base; *p; p++) if (starts_with_ci(p, typed)) return 3000 - len;
+    for (const char *p = path; *p; p++) if (starts_with_ci(p, typed)) return 2500 - len;
+    (void)tl;
+    if (subsequence(path, typed)) return 1500 - len;
+    return 0;
+}
+
+/* where the @word being typed begins (at the end of the text), or NULL */
+static const char *mention_at(const char *t)
+{
+    const char *at = strrchr(t, '@');
+    if (!at || (at > t && at[-1] != ' ' && at[-1] != '\n' && at[-1] != '\t' && at[-1] != '(')) return NULL;
+    for (const char *p = at + 1; *p; p++) if (*p == ' ' || *p == '\n' || *p == '\t') return NULL;
+    return at;
+}
+
+static void menu_mentions(const char *t, const char *at)
+{
+    const char *typed = at + 1;
+    const size_t pre = (size_t)(at - t);
+    if (pre + 600 > sizeof ((MenuItem *)0)->tab) return;
+    fx_index();
+    static int idx[MENU_MAX], sc[MENU_MAX];
+    int k = 0, found = 0;
+    for (int i = 0; i < g_nfx; i++) {
+        const int s = fx_score(g_fx[i], typed);
+        if (s <= 0) continue;
+        found++;
+        int j;                                         /* keep the best MENU_MAX, sorted */
+        if (k < MENU_MAX) j = k++;
+        else if (s <= sc[MENU_MAX - 1]) continue;
+        else j = MENU_MAX - 1;
+        while (j > 0 && sc[j - 1] < s) { sc[j] = sc[j - 1]; idx[j] = idx[j - 1]; j--; }
+        sc[j] = s;
+        idx[j] = i;
+    }
+    snprintf(M.title, sizeof M.title, "files (@ attaches the file's text to the message)");
+    snprintf(M.right, sizeof M.right, "%d of %d%s", found, g_nfx, g_nfx >= FX_MAX ? "+" : "");
+    for (int i = 0; i < k; i++) {
+        MenuItem *it = menu_add();
+        if (!it) break;
+        const char *path = g_fx[idx[i]];
+        if (snprintf(it->tab, sizeof it->tab, "%.*s@%s ", (int)pre, t, path) >= (int)sizeof it->tab) { M.n--; continue; }
+        snprintf(it->label, sizeof it->label, "%s", path);
+        it->submits = 0;
+    }
+}
+
 /* Rebuild the items for the editor's text; no menu unless it is one line starting with "/". */
 static void menu_build(void)
 {
@@ -968,14 +1500,21 @@ static void menu_build(void)
     M.n = 0;
     M.raw_enter = 0;
     M.title[0] = M.right[0] = 0;
+    const char *at = t[0] != '/' ? mention_at(t) : NULL;
+    if (at) {
+        menu_mentions(t, at);
+        if (M.sel >= M.n) M.sel = M.n ? M.n - 1 : 0;
+        return;
+    }
     if (t[0] != '/' || strchr(t, '\n')) return;
     if (g_s->last_spt > 0.0)
-        snprintf(M.right, sizeof M.right, "last answer %.2f s/token · %.2f tokens/s", g_s->last_spt, 1.0 / g_s->last_spt);
+        snprintf(M.right, sizeof M.right, "last answer %.1f tok/s · %.3f s/token", 1.0 / g_s->last_spt, g_s->last_spt);
     else
-        snprintf(M.right, sizeof M.right, "local · %s", g_s->on_gpu ? "gpu" : "cpu");
+        snprintf(M.right, sizeof M.right, "local · %s", g_s->e->name);
     const char *sp = strchr(t, ' ');
     if (!sp)                              menu_commands(t);
     else if (!strncmp(t, "/reasoning ", 11)) menu_reasoning(t + 11);
+    else if (!strncmp(t, "/model ", 7))     menu_models(t + 7);
     else if (!strncmp(t, "/gen ", 5))       menu_gen(t + 5);
     else if (!strncmp(t, "/file ", 6))      menu_files(t + 6);
     if (M.sel >= M.n) M.sel = M.n ? M.n - 1 : 0;
@@ -984,19 +1523,6 @@ static void menu_build(void)
 static int menu_open(void) { menu_build(); return M.n > 0 && !M.closed; }
 
 /* Exactly cols columns of s: cut with an ellipsis, or padded with spaces. */
-static void put_cols(Buf *b, const char *s, int cols)
-{
-    if (cols <= 0) return;
-    const int have = cols_of(s, (int)strlen(s));
-    if (have <= cols) { buf_str(b, s); spaces(b, cols - have); return; }
-    int i = 0, c = 0;
-    while (s[i] && c < cols - 1) { i++; while (s[i] && is_cont(s[i])) i++; c++; }
-    buf_add(b, s, (size_t)i);
-    buf_str(b, "…");
-}
-
-static void rule(Buf *b, int n) { for (int i = 0; i < n; i++) buf_str(b, "─"); }
-
 /* The menu's rows (0 when closed), drawn from screen row `top`. */
 static int menu_rows(void) { return M.n && !M.closed ? (M.n < MENU_ROWS ? M.n : MENU_ROWS) + 2 : 0; }
 
@@ -1103,7 +1629,7 @@ static void sink_thought(Glm53fTurnSink *k, double sec, int tokens)
     (void)k;
     char d[32], line[96];
     duration(d, sizeof d, sec);
-    snprintf(line, sizeof line, "Thought: %s · %d tokens", d, tokens);
+    snprintf(line, sizeof line, "Pensou por %s · %d tokens", d, tokens);
     pthread_mutex_lock(&g_mu);
     block_add(B_THOUGHT, line);
     pthread_mutex_unlock(&g_mu);
@@ -1131,10 +1657,132 @@ static void sink_done(Glm53fTurnSink *k, const char *stats, int state)
     pthread_mutex_unlock(&g_mu);
 }
 
+/* the agent's tool calls, and its question before one that writes or runs: the worker
+ * waits on g_ask_cv until the UI thread reads s, a or n (or esc) */
+static pthread_cond_t g_ask_cv;
+static volatile int   g_ask_state, g_ask_answer;    /* state 1: a question is open */
+static int            g_ask_block;                  /* its block */
+static char           g_ask_title[600];             /* "permitir <title>": the note it leaves */
+
+static void sink_tool(Glm53fTurnSink *k, const char *title, const char *summary, int ok)
+{
+    (void)k;
+    pthread_mutex_lock(&g_mu);
+    Block *b = block_new(B_TOOL);
+    if (b) { buf_str(&b->text, title); buf_str(&b->text, "\n"); buf_str(&b->text, summary); b->t0 = ok ? 1.0 : 0.0; }
+    pthread_mutex_unlock(&g_mu);
+}
+
+static int sink_approve(Glm53fTurnSink *k, const char *title, const char *detail)
+{
+    (void)k;
+    pthread_mutex_lock(&g_mu);
+    Block *b = block_new(B_ASK);
+    if (b) {
+        /* when the detail repeats the title after the tool's name ("test cd ..." over "cd ..."),
+         * the box's title is the name alone and the command shows once, in full, below; the
+         * note left after the answer keeps the whole title */
+        const char *sp = strchr(title, ' ');
+        const size_t dl = detail ? strcspn(detail, "\n") : 0;
+        const size_t cmp = dl < 24 ? dl : 24;
+        const int dup = sp && dl && strlen(sp + 1) >= cmp && !strncmp(sp + 1, detail, cmp);
+        snprintf(g_ask_title, sizeof g_ask_title, "permitir %s", title);
+        buf_str(&b->text, "permitir ");
+        if (dup) buf_add(&b->text, title, (size_t)(sp - title));
+        else buf_str(&b->text, title);
+        if (detail && *detail) { buf_str(&b->text, "\n"); buf_str(&b->text, detail); }
+    }
+    g_ask_block = g_nblocks - 1;
+    g_ask_answer = 0;
+    g_ask_state = 1;
+    g_offset = 0;
+    g_dirty = 1;
+    while (g_ask_state == 1) pthread_cond_wait(&g_ask_cv, &g_mu);
+    const int a = g_ask_answer;
+    pthread_mutex_unlock(&g_mu);
+    return a;
+}
+
+/* The UI thread's answer to the open question (under g_mu). */
+static void ask_answer(int a)
+{
+    if (g_ask_state != 1) return;
+    g_ask_answer = a;
+    g_ask_state = 0;
+    if (g_ask_block < g_nblocks && g_blocks[g_ask_block].kind == B_ASK) {
+        Block *b = &g_blocks[g_ask_block];
+        b->text.n = 0;                                          /* the whole title, then the answer */
+        if (b->text.p) b->text.p[0] = 0;
+        buf_str(&b->text, g_ask_title);
+        buf_str(&b->text, a == 2 ? " — sempre" : a == 1 ? " — sim" : " — não");
+        b->kind = B_NOTE;
+    }
+    g_dirty = 1;
+    pthread_cond_broadcast(&g_ask_cv);
+}
+
+/* the agent's question tool: state 2 while open; a digit picks an option, Enter sends what was typed,
+ * esc leaves it unanswered (the turn goes on) */
+static char  *g_q_answer;
+static char   g_q_opts[9][300];
+static int    g_q_n;
+
+static char *sink_question(Glm53fTurnSink *k, const char *question, const char *options)
+{
+    (void)k;
+    pthread_mutex_lock(&g_mu);
+    Block *b = block_new(B_ASK);
+    g_q_n = 0;
+    if (b) {
+        buf_str(&b->text, question);
+        for (const char *p = options ? options : ""; *p && g_q_n < 9;) {
+            const size_t l = strcspn(p, "\n");
+            if (l) {
+                snprintf(g_q_opts[g_q_n], sizeof g_q_opts[0], "%.*s", (int)l, p);
+                g_q_n++;
+                buf_fmt(&b->text, "\n%d. %s", g_q_n, g_q_opts[g_q_n - 1]);
+            }
+            p += l;
+            if (*p) p++;
+        }
+        snprintf(g_ask_title, sizeof g_ask_title, "%s", question);
+    }
+    g_ask_block = g_nblocks - 1;
+    g_q_answer = NULL;
+    g_ask_state = 2;
+    g_offset = 0;
+    g_dirty = 1;
+    while (g_ask_state == 2) pthread_cond_wait(&g_ask_cv, &g_mu);
+    char *a = g_q_answer;
+    g_q_answer = NULL;
+    pthread_mutex_unlock(&g_mu);
+    return a;
+}
+
+/* The UI thread's answer to the open question tool (under g_mu); a: malloc'd or NULL, taken. */
+static void q_answer(char *a)
+{
+    if (g_ask_state != 2) { free(a); return; }
+    g_q_answer = a;
+    g_ask_state = 0;
+    if (g_ask_block < g_nblocks && g_blocks[g_ask_block].kind == B_ASK) {
+        Block *b = &g_blocks[g_ask_block];
+        b->text.n = 0;
+        if (b->text.p) b->text.p[0] = 0;
+        buf_str(&b->text, g_ask_title);
+        buf_str(&b->text, " — ");
+        buf_str(&b->text, a ? a : "sem resposta");
+        b->kind = B_NOTE;
+    }
+    g_dirty = 1;
+    pthread_cond_broadcast(&g_ask_cv);
+}
+
 static void *worker_main(void *arg)
 {
     (void)arg;
-    Glm53fTurnSink k = { sink_status, sink_reasoning, sink_thought, sink_answer, sink_done, NULL };
+    Glm53fTurnSink k = { sink_status, sink_reasoning, sink_thought, sink_answer, sink_done, NULL, sink_tool, sink_approve,
+                         NULL, sink_question };
     if (glm53f_chat_turn(g_s, &g_job, &k) != 0) g_fatal = 1;
     pthread_mutex_lock(&g_mu);
     g_worker_done = 1;
@@ -1154,13 +1802,21 @@ static int handle_line(const char *line)
     case GLM53F_IN_QUIT:  quit = 1; break;
     case GLM53F_IN_NOTE:  block_add(B_NOTE, in.note); break;
     case GLM53F_IN_RESET:
+        free(g_recent);
+        g_recent = lc_session_recent(g_s, 3);
         blocks_clear();
         block_add(B_SPLASH, NULL);
         block_add(B_NOTE, in.note);
         g_offset = 0;
+        set_title(NULL);
         break;
     case GLM53F_IN_MESSAGE:
         if (g_fatal) { block_add(B_ERROR, "the engine failed earlier in this session; restart localcode"); break; }
+        {
+            int users = 0;
+            for (int i = 0; i < g_nblocks; i++) users += g_blocks[i].kind == B_USER;
+            if (!users && !in.compact) set_title(in.shown);
+        }
         block_add(B_USER, in.shown);
         if (in.note) block_add(B_NOTE, in.note);
         g_job = in;
@@ -1188,6 +1844,13 @@ static void submit(void)
     char *line = (char *)malloc(E.b.n + 1);
     if (!line) return;
     memcpy(line, E.b.p, E.b.n + 1);
+    if (g_ask_state == 2) {                       /* the answer to the agent's question */
+        ed_set("");
+        pthread_mutex_lock(&g_mu);
+        q_answer(line);
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
     if (g_nhist == 64) { free(g_hist[0]); memmove(g_hist, g_hist + 1, 63 * sizeof *g_hist); g_nhist--; }
     g_hist[g_nhist] = (char *)malloc(E.b.n + 1);
     if (g_hist[g_nhist]) memcpy(g_hist[g_nhist++], line, E.b.n + 1);
@@ -1198,12 +1861,45 @@ static void submit(void)
     g_dirty = 1;
 }
 
+/* ------------------------------------------------------------------- mods ---- */
+
+/* What the mods draw (lc_mods.c): the band above the prompt, or their open pane in its place */
+static LcModView g_mband, g_mpane;
+static volatile int g_mods_dirty = 1;
+static int g_mods_w, g_mods_pane;
+
+/* from the mods' reader thread: no lock (the UI thread may be waiting on that thread) */
+static void tui_mods_changed(void) { g_mods_dirty = 1; g_dirty = 1; }
+
+static void mods_refresh(int W, int H)
+{
+    if (!lc_mods_running()) { g_mods_pane = 0; return; }
+    char *t = lc_mods_toast();
+    if (t) {
+        pthread_mutex_lock(&g_mu);
+        block_add(B_NOTE, t);
+        pthread_mutex_unlock(&g_mu);
+        free(t);
+    }
+    if (!g_mods_dirty && W == g_mods_w) return;
+    g_mods_dirty = 0;
+    g_mods_w = W;
+    lc_mods_view_free(&g_mpane);
+    lc_mods_view_free(&g_mband);
+    g_mods_pane = lc_mods_pane(NULL, 0, NULL) && lc_mods_view("Pane", W - 4, H / 2, &g_mpane) > 0;
+    if (!g_mods_pane) lc_mods_view("AbovePrompt", W - 4, 6, &g_mband);
+}
+
 /* ------------------------------------------------------------------- frame ---- */
 
 static void draw(Glm53fChat *s)
 {
     term_size();
     const int W = T.w, H = T.h;
+    mods_refresh(W, H);
+    const LcModView *band = g_mods_pane ? &g_mpane : &g_mband;
+    int nband = band->n;
+    if (nband > H / 2) nband = H / 2;
     Lines L = { 0 };
     pthread_mutex_lock(&g_mu);
     render_blocks(&L, s, W);
@@ -1211,7 +1907,7 @@ static void draw(Glm53fChat *s)
     pthread_mutex_unlock(&g_mu);
 
     /* the input box: its text wrapped at EW columns, the cursor's row and column */
-    const int EW = W - 6;
+    const int EW = W - 7;
     int *rows_start = (int *)malloc((E.b.n + 2) * sizeof(int));
     int nrows = 0, cur_row = 0, cur_col = 0;
     if (!rows_start) { lines_free(&L); return; }
@@ -1241,7 +1937,7 @@ static void draw(Glm53fChat *s)
     menu_build();
     int mr = menu_rows();
     if (H - box - footer - 1 - mr < 3) mr = 0;          /* too short a window for it */
-    int view = H - box - footer - 1 - mr;
+    int view = H - box - footer - 1 - mr - nband;
     if (view < 1) view = 1;
     int maxoff = L.n - view;
     if (maxoff < 0) maxoff = 0;
@@ -1250,18 +1946,22 @@ static void draw(Glm53fChat *s)
 
     Buf f = { 0 };
     buf_str(&f, "\033[?2026h\033[?25l");
+    /* a conversation shorter than the screen starts at the top; a longer one ends at the bottom */
+    const int top_pad = L.n < view ? 0 : -1;
     for (int r = 0; r < view; r++) {
-        const int idx = L.n - view - g_offset + r;
+        const int idx = top_pad == 0 ? r : L.n - view - g_offset + r;
         buf_fmt(&f, "\033[%d;1H\033[2K", r + 1);
         if (idx >= 0 && idx < L.n) buf_str(&f, L.v[idx].s);
     }
     if (mr) menu_draw(&f, view + 1, W);
-    buf_fmt(&f, "\033[%d;1H\033[2K", view + mr + 1);
+    for (int b = 0; b < nband; b++)                     /* the mods' band or pane */
+        buf_fmt(&f, "\033[%d;1H\033[2K  %s\033[0m", view + mr + 1 + b, band->lines[b]);
+    buf_fmt(&f, "\033[%d;1H\033[2K", view + mr + nband + 1);
 
-    int row = view + mr + 2;
-    const char *bar = C_PANEL C_BRIGHT "▌" C_TEXT " ";
+    int row = view + mr + nband + 2;
+    const char *bar = C_PANEL C_BRIGHT "▌" C_TEXT "  ";
     buf_fmt(&f, "\033[%d;1H\033[2K  %s", row++, bar);
-    spaces(&f, W - 6);
+    spaces(&f, W - 7);
     buf_str(&f, C_RESET);
     const int editor_top = row;
     for (int r = first_row; r < first_row + shown_rows; r++) {
@@ -1270,8 +1970,8 @@ static void draw(Glm53fChat *s)
         if (z > a && E.b.p[z - 1] == '\n') z--;
         int used = 0;
         if (E.b.n == 0 && r == 0) {
-            const char *ph = g_busy ? "type the next message; it goes when this answer ends"
-                                    : "Ask anything...  / for commands, /file for a document";
+            const char *ph = g_busy ? "digite a próxima mensagem; ela vai quando esta resposta terminar"
+                                    : "Peça algo…  \"O que este projeto faz?\"  ·  / comandos";
             buf_str(&f, C_DIM);
             buf_str(&f, ph);
             used = cols_of(ph, (int)strlen(ph));
@@ -1280,50 +1980,66 @@ static void draw(Glm53fChat *s)
             buf_add(&f, E.b.p + a, (size_t)(z - a));
             used = cols_of(E.b.p + a, z - a);
         }
-        spaces(&f, W - 6 - used);
+        spaces(&f, W - 7 - used);
         buf_str(&f, C_RESET);
     }
-    {   /* settings row, with the state on the right */
-        char left[200], plain[160], right[120];
-        snprintf(plain, sizeof plain, GLM53F_CHAT_MODEL_NAME " · %s · reasoning %s",
-                 s->on_gpu ? "gpu" : "cpu", s->reasoning);
-        snprintf(left, sizeof left, C_BRIGHT GLM53F_CHAT_MODEL_NAME C_DIM " · %s · reasoning %s",
-                 s->on_gpu ? "gpu" : "cpu", s->reasoning);
-        const int lc = cols_of(plain, (int)strlen(plain));
-        if (g_busy) snprintf(right, sizeof right, "esc interrupt%s", g_nqueue ? " · queued" : "");
-        else        snprintf(right, sizeof right, "%s", g_nqueue ? "queued" : "");
-        const int rc = cols_of(right, (int)strlen(right));
+    buf_fmt(&f, "\033[%d;1H\033[2K  %s", row++, bar);    /* a breath under the text */
+    spaces(&f, W - 7);
+    buf_str(&f, C_RESET);
+    {   /* the mode row: what answers, with which model, here; the state on the right */
+        char left[400], right[160];
+        static const char *mode[] = { "Chat", "Rápido", "Agente" };
+        const int lvl = s->agent_level > 0 && s->e->agent ? s->agent_level : 0;
+        snprintf(left, sizeof left, C_BOLD C_BRIGHT "%s" C_NOBOLD C_DIM " · " C_TEXT "%s" C_DIM " · " C_YELLOW "%s",
+                 lvl == 2 && s->plan_mode ? "Plano" : mode[lvl], s->e->name,
+                 lvl ? (lvl == 1 ? "low" : "medium") : s->reasoning);
+        if (g_ask_state == 1)  snprintf(right, sizeof right, C_YELLOW "S sim · A sempre · N não");
+        else if (g_ask_state == 2) snprintf(right, sizeof right, C_YELLOW "%s escreva e Enter · esc pula",
+                                            g_q_n ? "1-9 escolhe ·" : "");
+        else if (g_busy)       snprintf(right, sizeof right, C_DIM "esc interrompe%s", g_nqueue ? " · na fila" : "");
+        else if (lvl == 2 && s->autonomous) snprintf(right, sizeof right, C_YELLOW "⏵⏵ autônomo nesta pasta");
+        else if (lvl == 2)     snprintf(right, sizeof right, s->auto_approve ? C_YELLOW "⏵⏵ aprovação automática"
+                                                                           : C_DIM "pede antes de editar ou rodar");
+        else                   snprintf(right, sizeof right, C_DIM "%s", g_nqueue ? "na fila" : "");
+        const int lc = vis_cols(left), rc = vis_cols(right);
         buf_fmt(&f, "\033[%d;1H\033[2K  %s%s", row++, bar, left);
-        spaces(&f, W - 6 - lc - rc - 1 > 0 ? W - 6 - lc - rc - 1 : 1);
-        buf_str(&f, C_DIM);
+        spaces(&f, W - 7 - lc - rc - 1 > 0 ? W - 7 - lc - rc - 1 : 1);
+        buf_str(&f, C_PANEL);
         buf_str(&f, right);
         buf_str(&f, " " C_RESET);
     }
-    buf_fmt(&f, "\033[%d;1H\033[2K  %s", row++, bar);
-    spaces(&f, W - 6);
-    buf_str(&f, C_RESET);
-    {   /* footer: where, how much context, how to scroll back */
-        char cwd[512] = "", right[160], gauge[64];
-#ifdef _WIN32
-        if (!_getcwd(cwd, (int)sizeof cwd)) cwd[0] = 0;
-#else
-        if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
-#endif
-        glm53f_chat_gauge(s, gauge, sizeof gauge);
-        if (g_offset) snprintf(right, sizeof right, "↑ %d lines · end to follow · %s · / commands", g_offset, gauge);
-        else          snprintf(right, sizeof right, "%s · / commands", gauge);
-        const int rc = cols_of(right, (int)strlen(right));
+    {   /* footer: the folder and its git branch; the context, local, the commands */
+        char cwd[512], br[96], where[640], right[320];
+        short_cwd(cwd, sizeof cwd);
+        git_branch(br, sizeof br);
+        snprintf(where, sizeof where, "%s%s%s", cwd, br[0] ? ":" : "", br);
+        const int pct = s->e->cap ? (int)(100.0 * s->e->cached / s->e->cap + 0.5) : 0;
+        char used[24], cap[24];
+        fmt_k(used, sizeof used, s->e->cached);
+        fmt_k(cap, sizeof cap, s->e->cap);
+        if (g_offset)
+            snprintf(right, sizeof right, C_DIM "↑ %d linhas · end volta · " C_TEXT "%s/%s" C_DIM " (%d%%)%s · " C_BRIGHT "local",
+                     g_offset, used, cap, pct, s->compactions ? " · compactado" : "");
+        else
+            snprintf(right, sizeof right, C_TEXT "%s/%s" C_DIM " (%d%%)%s · " C_BRIGHT "local" C_DIM " · " C_TEXT "/" C_DIM " comandos",
+                     used, cap, pct, s->compactions ? " · compactado" : "");
+        const int rc = vis_cols(right);
         int room = W - 4 - rc - 2;
-        int cl = (int)strlen(cwd);
-        const char *cp = cwd;
         if (room < 1) room = 1;
-        if (cols_of(cwd, cl) > room) { cp = cwd + cl - room + 1; while (*cp && is_cont(*cp)) cp++; }
-        buf_fmt(&f, "\033[%d;1H\033[2K  %s%s", row, C_DIM, cp);
-        spaces(&f, W - 4 - cols_of(cp, (int)strlen(cp)) - rc > 0 ? W - 4 - cols_of(cp, (int)strlen(cp)) - rc : 1);
+        const int wl = (int)strlen(where);
+        const char *cp = where;
+        int cut = 0;
+        if (cols_of(where, wl) > room) {
+            cut = 1;
+            for (int skip = cols_of(where, wl) - (room - 1); skip > 0 && *cp; skip--) { cp++; while (*cp && is_cont(*cp)) cp++; }
+        }
+        buf_fmt(&f, "\033[%d;1H\033[2K  %s%s%s", row, C_DIM, cut ? "…" : "", cp);
+        const int pc = cols_of(cp, (int)strlen(cp)) + cut;
+        spaces(&f, W - 4 - pc - rc > 0 ? W - 4 - pc - rc : 1);
         buf_str(&f, right);
         buf_str(&f, C_RESET);
     }
-    buf_fmt(&f, "\033[%d;%dH\033[?25h\033[?2026l", editor_top + (cur_row - first_row), 5 + cur_col);
+    buf_fmt(&f, "\033[%d;%dH\033[?25h\033[?2026l", editor_top + (cur_row - first_row), 6 + cur_col);
     out_str(f.p, f.n);
     free(f.p);
     free(rows_start);
@@ -1338,6 +2054,81 @@ static int on_input(const char *p, int n, int view_rows)
     int i = 0;
     while (i < n) {
         const unsigned char c = (unsigned char)p[i];
+        if (g_mods_pane && g_mpane.nb) {                 /* a mod's pane takes the keys */
+            const int seq = c == 0x1b && i + 1 < n && (p[i + 1] == '[' || p[i + 1] == 'O');
+            if (seq) {                                   /* arrows: left/right move the focus */
+                int j = i + 2;
+                while (j < n && !((unsigned char)p[j] >= 0x40 && (unsigned char)p[j] <= 0x7e)) j++;
+                if (j < n && (p[j] == 'C' || p[j] == 'D')) {
+                    const int nb = g_mpane.nb, f0 = g_mpane.focus < 0 ? 0 : g_mpane.focus;
+                    lc_mods_focus(p[j] == 'C' ? (f0 + 1) % nb : (f0 + nb - 1) % nb);
+                    g_mods_dirty = 1;
+                }
+                i = j + 1;
+                g_dirty = 1;
+                continue;
+            }
+            if (c == 0x1b || c == 0x03) {                /* escape: close it, or stop what waits on it */
+                int esc = 0;
+                lc_mods_pane(NULL, 0, &esc);
+                if (esc) lc_mods_pane_close(); else lc_mods_abort();
+            } else if (c == '\t') {
+                const int nb = g_mpane.nb, f0 = g_mpane.focus < 0 ? 0 : g_mpane.focus;
+                lc_mods_focus((f0 + 1) % nb);
+            } else if (c == '\r' || c == '\n') {
+                const int f0 = g_mpane.focus < 0 ? 0 : g_mpane.focus;
+                lc_mods_press(g_mpane.button[f0].id);
+            } else {
+                for (int b = 0; b < g_mpane.nb; b++)
+                    if (g_mpane.button[b].hotkey[0] && ((unsigned char)g_mpane.button[b].hotkey[0] | 32) == (c | 32)) {
+                        lc_mods_press(g_mpane.button[b].id);
+                        break;
+                    }
+            }
+            i++;
+            g_mods_dirty = 1;
+            g_dirty = 1;
+            continue;
+        }
+        if (c == 0x1b && i + 1 < n && p[i + 1] != '[' && p[i + 1] != 'O' && g_mband.nb) {   /* alt+key: a band button */
+            int hit = 0;
+            for (int b = 0; b < g_mband.nb && !hit; b++)
+                if (g_mband.button[b].hotkey[0] && ((unsigned char)g_mband.button[b].hotkey[0] | 32) == ((unsigned char)p[i + 1] | 32)) {
+                    lc_mods_press(g_mband.button[b].id);
+                    hit = 1;
+                }
+            if (hit) { i += 2; g_mods_dirty = 1; g_dirty = 1; continue; }
+        }
+        if (g_ask_state == 2 && !E.b.n && ((c >= '1' && c <= '0' + g_q_n) || c == 0x1b || c == 0x03) &&
+            !(c == 0x1b && i + 1 < n && (p[i + 1] == '[' || p[i + 1] == 'O'))) {   /* the question tool: pick or skip */
+            char *a = NULL;
+            if (c >= '1' && c <= '9') {
+                const size_t l = strlen(g_q_opts[c - '1']);
+                a = (char *)malloc(l + 1);
+                if (a) memcpy(a, g_q_opts[c - '1'], l + 1);
+            }
+            pthread_mutex_lock(&g_mu);
+            q_answer(a);
+            pthread_mutex_unlock(&g_mu);
+            i++;
+            continue;
+        }
+        if (g_ask_state == 1) {                          /* an open question takes the keys */
+            if (c == 0x1b && i + 1 < n && (p[i + 1] == '[' || p[i + 1] == 'O')) {   /* arrows, mouse: not an answer */
+                int j = i + 2;
+                while (j < n && !((unsigned char)p[j] >= 0x40 && (unsigned char)p[j] <= 0x7e)) j++;
+                i = j + 1;
+                continue;
+            }
+            int a = -1;
+            if (c == 's' || c == 'S' || c == 'y' || c == 'Y') a = 1;
+            else if (c == 'a' || c == 'A') a = 2;
+            else if (c == 'n' || c == 'N' || c == 0x1b || c == 0x03) a = 0;
+            if (c == 0x1b || c == 0x03) glm53f_chat_stop();
+            if (a >= 0) { pthread_mutex_lock(&g_mu); ask_answer(a); pthread_mutex_unlock(&g_mu); }
+            i++;
+            continue;
+        }
         if (g_paste) {
             if (c == 0x1b && i + 5 < n && !memcmp(p + i, "\033[201~", 6)) { g_paste = 0; i += 6; continue; }
             if (c == '\r') { ed_insert("\n", 1); if (i + 1 < n && p[i + 1] == '\n') i++; }
@@ -1449,6 +2240,7 @@ static int on_input(const char *p, int n, int view_rows)
         }
         if (c == '\t') {
             if (menu_open()) ed_set(M.it[M.sel].tab);   /* tab: complete the choice */
+            else if (!E.b.n && g_s->agent_level == 2) g_s->plan_mode = !g_s->plan_mode;   /* build <-> plan */
             else ed_insert("    ", 4);
             i++;
             g_dirty = 1;
@@ -1470,8 +2262,13 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
 {
     if (term_open(forced) != 0) return -1;
     g_s = s;
+    glm53f_mods_changed = tui_mods_changed;
     pthread_mutex_init(&g_mu, NULL);
+    pthread_cond_init(&g_ask_cv, NULL);
+    g_recent = lc_session_recent(s, 3);
+    set_title(NULL);
     block_add(B_SPLASH, NULL);
+    if (s->start_note) block_add(B_NOTE, s->start_note);
 
     char in[4096];
     int quit = 0, eof = 0;
@@ -1512,6 +2309,10 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
     }
     if (g_busy) {                                        /* leaving mid-answer: stop it first */
         glm53f_chat_stop();
+        pthread_mutex_lock(&g_mu);
+        ask_answer(0);
+        q_answer(NULL);
+        pthread_mutex_unlock(&g_mu);
         pthread_join(g_worker, NULL);
         glm53f_chat_input_free(&g_job);
         g_busy = 0;
@@ -1522,6 +2323,8 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
     pthread_mutex_unlock(&g_mu);
     free(g_blocks);
     g_blocks = NULL;
+    free(g_recent);
+    g_recent = NULL;
     g_capblocks = 0;
     for (int i = 0; i < g_nhist; i++) free(g_hist[i]);
     for (int i = 0; i < g_nqueue; i++) free(g_queue[i]);

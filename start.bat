@@ -1,13 +1,12 @@
 @echo off
-rem start.bat - open localcode, the interactive session, from a double-click or a prompt.
+rem start.bat - open localcode (Qwen3.8-Flash-Next on this engine) from a double-click or a prompt.
 rem
-rem   start.bat                         the model from LOCALCODE_MODEL, or %USERPROFILE%\model\GLM-5.3-Flash
-rem   start.bat D:\models\GLM-5.3-Flash  that model directory
-rem   start.bat --reasoning low         any localcode option (localcode --help lists them)
-rem
-rem Set LOCALCODE_INT4 to an int4 container (--write-int4) to read the experts from it:
-rem faster, and an approximation of the checkpoint (docs/USAGE.md).
-setlocal
+rem   start.bat                          the model from LOCALCODE_MODEL, or the UD-Q4_K_XL GGUF in
+rem                                      %USERPROFILE%\models\Qwen3.8-Flash-Next\UD-Q4_K_XL
+rem   start.bat D:\models\some.gguf      that GGUF (any shard of a split one)
+rem   start.bat D:\models\UD-Q4_K_XL     the first shard found in that directory
+rem   start.bat --reasoning low          any localcode option (localcode --help lists them)
+setlocal EnableDelayedExpansion
 set "ROOT=%~dp0"
 set "EXE=%ROOT%build\Release\localcode.exe"
 
@@ -18,31 +17,41 @@ if not exist "%EXE%" (
     goto :fail
 )
 
-rem A model directory given as the first argument wins; otherwise LOCALCODE_MODEL.
-if not "%~1"=="" if exist "%~1\config.json" set "LOCALCODE_MODEL=%~1"
-if not defined LOCALCODE_MODEL if exist "%USERPROFILE%\model\GLM-5.3-Flash\config.json" (
-    set "LOCALCODE_MODEL=%USERPROFILE%\model\GLM-5.3-Flash"
+rem A .gguf file or a directory holding one, given as the first argument, wins; then
+rem LOCALCODE_MODEL; then the default location.
+set "FIRST="
+if not "%~1"=="" (
+    if /i "%~x1"==".gguf" if exist "%~1" set "FIRST=%~1"
+    if not defined FIRST if exist "%~1\" call :first_shard "%~1"
+)
+if defined FIRST set "LOCALCODE_MODEL=%FIRST%"
+if not defined LOCALCODE_MODEL (
+    set "DEF=%USERPROFILE%\models\Qwen3.8-Flash-Next\UD-Q4_K_XL"
+    if exist "!DEF!\" call :first_shard "!DEF!"
+    if defined FIRST set "LOCALCODE_MODEL=!FIRST!"
 )
 if not defined LOCALCODE_MODEL (
-    set /p "LOCALCODE_MODEL=Model directory (the one with config.json): "
+    set /p "LOCALCODE_MODEL=Model GGUF (any shard): "
 )
-if not exist "%LOCALCODE_MODEL%\config.json" (
-    echo No config.json in "%LOCALCODE_MODEL%".
-    echo Give the model directory as an argument, or set LOCALCODE_MODEL.
+if not exist "%LOCALCODE_MODEL%" (
+    echo No GGUF at "%LOCALCODE_MODEL%".
+    echo Give a .gguf file or its directory as an argument, or set LOCALCODE_MODEL.
     goto :fail
 )
 
-set "EXTRA="
-if defined LOCALCODE_INT4 set "EXTRA=--int4-dir "%LOCALCODE_INT4%""
-
-rem The model directory travels in LOCALCODE_MODEL, so a directory given as the first
-rem argument is dropped from what localcode receives.
+rem The model travels in LOCALCODE_MODEL, so a path given as the first argument is dropped
+rem from what localcode receives.
 set "ARGS=%*"
-if not "%~1"=="" if exist "%~1\config.json" call :drop_first %*
+if not "%~1"=="" (
+    set "DROP="
+    if /i "%~x1"==".gguf" set "DROP=1"
+    if exist "%~1\" set "DROP=1"
+    if defined DROP call :drop_first %*
+)
 
 rem Files named in /file are relative to the working directory: start where the script is.
 pushd "%ROOT%"
-"%EXE%" %EXTRA% %ARGS%
+"%EXE%" %ARGS%
 set "RC=%ERRORLEVEL%"
 popd
 if not "%RC%"=="0" (
@@ -50,6 +59,12 @@ if not "%RC%"=="0" (
     echo localcode ended with code %RC%.
     goto :fail
 )
+exit /b 0
+
+rem the first shard (*-00001-of-*.gguf), else the first .gguf, of a directory
+:first_shard
+for %%F in ("%~1\*-00001-of-*.gguf") do if not defined FIRST set "FIRST=%%~fF"
+if not defined FIRST for %%F in ("%~1\*.gguf") do if not defined FIRST set "FIRST=%%~fF"
 exit /b 0
 
 :drop_first
