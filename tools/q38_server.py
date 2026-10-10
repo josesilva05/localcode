@@ -588,7 +588,7 @@ class Server:
                            "min_p": self.args.min_p, "n_predict": -1},
             },
             "chat_template": self.engine.chat_template if self.engine else "",
-            "build_info": "qwen3.8-flash-next-in-c (q38 engine)",
+            "build_info": "localcode (q38 engine)",
             "is_sleeping": False,
         }
 

@@ -1,4 +1,4 @@
-# GLM-5.3-Flash inference engine.
+# localcode: the coding agent and its engines (q38 for Qwen3.8, glm53f for GLM-5.3-Flash).
 #
 #   cmake -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build --config Release -j
@@ -6,9 +6,9 @@
 
 cmake_minimum_required(VERSION 3.16)
 
-project(glm-5.3-flash-in-c
+project(localcode
         VERSION 2.0.0
-        DESCRIPTION "GLM-5.3-Flash inference engine in portable C"
+        DESCRIPTION "localcode: a local coding agent and its inference engines in C"
         LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)

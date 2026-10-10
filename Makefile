@@ -1,4 +1,4 @@
-# GLM-5.3-Flash inference engine.
+# localcode: the coding agent and the GLM-5.3-Flash engine (the q38 engine builds with CMake).
 #
 #   make                build the engine (bin/glm53f)
 #   make test           run every test that needs no model weights

@@ -1,7 +1,7 @@
 [project]
-name = "glm-5.3-flash-in-c"
+name = "localcode"
 version = "2.0.0"
-description = "Python tooling for the GLM-5.3-Flash C engine: reference forward, tiny oracle fixture, tokenizer parity"
+description = "Python tooling for localcode's engines: reference forwards, tiny oracle fixture, tokenizer parity, the API server"
 requires-python = ">=3.10"
 # Pinned exact so the reference the C engine is graded against does not drift.
 dependencies = [

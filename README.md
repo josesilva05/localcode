@@ -1,8 +1,8 @@
 <div align="center">
 
-<h1>glm-5.3-flash-in-c</h1>
+<h1>localcode</h1>
 
-<h3>GLM-5.3-Flash (~314B total, ~18B active) in portable C. One CPU, no framework.</h3>
+<h3>A coding agent and its own inference engines, in C, running entirely on your machine.</h3>
 
 <img src="docs/media/demo.gif" width="760" alt="localcode answering in the terminal: GLM-5.3-Flash running locally">
 
@@ -11,7 +11,19 @@ two RTX 3060, at 1.10 s/token with the int4 container.</sub>
 
 </div>
 
-## Status
+localcode is one program and the engines under it, with no framework and no cloud:
+
+| part | what it is |
+|---|---|
+| **localcode** (`src/cli`) | the terminal session and its agent: plan, edit, test and fix loop; grep with regular expressions, `apply_patch`, `/undo` and `/redo`, allow/ask/deny permissions, `AGENTS.md` rules; Claude Code's plugins, skills, commands, hooks and mods. See [docs/localcode-agent-plan.md](docs/localcode-agent-plan.md) and [docs/localcode-vs-opencode.md](docs/localcode-vs-opencode.md) |
+| **q38** (`src/q38`) | the engine for the Qwen3.8 family from GGUF files: Flash-Next (35B-A3B, MoE) and the dense 27B, on the CPU and on one or two NVIDIA GPUs (MTP speculative decoding, tensor parallelism, 128k contexts) |
+| **glm53f** (`src/core`, `src/model`, ...) | the engine for GLM-5.3-Flash (~314B total, ~18B active), validated against transformers; described below |
+| **the API** (`tools/q38_server.py`, [docs/API.md](docs/API.md)) | an OpenAI / llama-server compatible server over the engine, for other tools and other machines |
+
+The repository was called glm-5.3-flash-in-c, then qwen3.8-flash-next-in-c; the old GitHub
+links redirect here.
+
+## The GLM-5.3-Flash engine
 
 This engine runs the **released GLM-5.3-Flash checkpoint** (FP8, 62 shards, ~306 GB) and is
 validated against the official transformers implementation (`modeling_glm5_next.py`):
@@ -116,6 +128,10 @@ build/Release/glm53f <model_dir> --prompt-file prompt.txt --gen 400 --gpu --quie
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the model (mHC, KDA, MLA/DSA, MoE, storage formats) and the engine (files, data layout, forward pass, expert streaming, failure policy) |
 | [docs/VALIDATION.md](docs/VALIDATION.md) | tests, reference tools, how to compare with transformers, recorded results |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | measured speed, disk/compute split, per-component cost, hardware limits |
+| [docs/API.md](docs/API.md) | the OpenAI / llama-server compatible API over the q38 engine |
+| [docs/localcode-agent-plan.md](docs/localcode-agent-plan.md) | localcode's agent: levels, the engineering loop, sampling |
+| [docs/localcode-plugins-plan.md](docs/localcode-plugins-plan.md) | Claude Code's plugins, skills, hooks and mods in localcode |
+| [docs/localcode-vs-opencode.md](docs/localcode-vs-opencode.md) | the comparison with opencode v2, the roadmap and the benchmark (`tools/bench`) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | development rules and verification checklist |
 | [CHANGELOG.md](CHANGELOG.md) | release history |
 
