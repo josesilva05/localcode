@@ -98,6 +98,8 @@ add_library(q38 STATIC
   src/q38/q38_kernels.c
   src/q38/q38_tok.c)
 target_include_directories(q38 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/q38 ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+# position-independent: the library also goes into libq38api, a shared one
+set_target_properties(q38 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(q38 PUBLIC glm53f_flags Threads::Threads)
 if(NOT MSVC)
   target_link_libraries(q38 PUBLIC m)
