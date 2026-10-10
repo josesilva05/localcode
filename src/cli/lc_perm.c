@@ -252,7 +252,7 @@ static int cc_match(const char *pat, const char *tool, const char *subj)
     }
     if (!is_path_tool(tool)) return wm(pat, subj, 0, 0);
     /* gitignore's way: //abs, ~/home, /project-relative, ./relative; a bare name at any depth */
-    char p[2400], s[4400];
+    char p[8500], s[8500];
     const char *home = getenv("USERPROFILE");
     if (!home) home = getenv("HOME");
     const int abs_subj = subj[0] == '/' || (subj[0] && subj[1] == ':');

@@ -9,9 +9,10 @@
  *   in a pattern * is any text; the last rule that matches wins.
  * Claude Code ("permissions" in .claude/settings.json, .claude/settings.local.json or
  * .localcode/settings.json):
- *     "permissions": { "allow": ["Bash(npm run test:*)", "Edit(src/**)"], "ask": [...],
+ *     "permissions": { "allow": ["Bash(npm run test:*)", "Edit(src/)"], "ask": [...],
  *                      "deny": ["Read(./.env)", "WebFetch(domain:example.com)"] }
- *   deny wins over ask, ask over allow; Edit rules cover every tool that changes files.
+ *   deny wins over ask, ask over allow; Edit rules cover every tool that changes files; a path
+ *   ending in / is everything inside that folder (** works too).
  * Read from ~/.localcode/settings.json, then the project's .claude/settings.json,
  * .claude/settings.local.json, .localcode/settings.json and opencode.json(c) (never ~/.claude: those
  * rules were given to Claude Code). Built in, below everything: reading .env files asks (but

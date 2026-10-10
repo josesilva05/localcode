@@ -412,7 +412,7 @@ static char *flow_plan(Flow *fl, const LcCall *c, char *sum, size_t sc, int *ok)
             n -= 3;
             while (n && *q == ' ') { q++; n--; }
         }
-        if (n) { s_fmt(&sm, "%s%d. %s", k ? "\n" : "", ++k, mark); s_add(&sm, q, n); }
+        if (n) { k++; s_fmt(&sm, "%s%d. %s", k > 1 ? "\n" : "", k, mark); s_add(&sm, q, n); }
         p = nl ? nl + 1 : p + strlen(p);
     }
     s_fmt(&sm, "%steste: %s", k ? "\n" : "", fl->test_cmd ? fl->test_cmd : "(nenhum)");
@@ -522,14 +522,14 @@ static int perm_call(const LcCall *c, const char *test_cmd, char *why, size_t wc
         snprintf(paths[np++], sizeof paths[0], "%s", p && *p ? p : ".");
     }
     int any_deny = 0, any_ask = 0, all_allow = np > 0;
-    char wd[300] = "", wa[300] = "", wl[300] = "";
+    char wd[700] = "", wa[700] = "", wl[300] = "";
     for (int i = 0; i < np; i++) {
         char rel[4400], one[300];
         if (lc_tools_where(paths[i], rel, sizeof rel) == 1) {
             *outside = 1;
             const int x = lc_perm_check("external_directory", rel, one, sizeof one);
-            if (x == LC_PERM_DENY && !any_deny) { any_deny = 1; snprintf(wd, sizeof wd, "%s (outside the working directory: %s)", one, rel); }
-            if (x == LC_PERM_ASK && !any_ask) { any_ask = 1; snprintf(wa, sizeof wa, "outside the working directory: %s", rel); }
+            if (x == LC_PERM_DENY && !any_deny) { any_deny = 1; snprintf(wd, sizeof wd, "%s (outside the working directory: %.300s)", one, rel); }
+            if (x == LC_PERM_ASK && !any_ask) { any_ask = 1; snprintf(wa, sizeof wa, "outside the working directory: %.300s", rel); }
         }
         const int a = lc_perm_check(c->name, rel, one, sizeof one);
         if (a == LC_PERM_DENY && !any_deny) { any_deny = 1; snprintf(wd, sizeof wd, "%s", one); }
@@ -860,8 +860,8 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
             } else if (s->plan_mode && level == 2 &&
                        (!strcmp(c->name, "write_file") || !strcmp(c->name, "edit_file") || !strcmp(c->name, "apply_patch"))) {
                 snprintf(sum, sizeof sum, "plan mode: no changes");
-                res = (char *)malloc(300);
-                if (res) snprintf(res, 300, "Plan mode: %s is refused, no file changes. Finish the plan and give it to the user; "
+                res = (char *)malloc(400);
+                if (res) snprintf(res, 400, "Plan mode: %.64s is refused, no file changes. Finish the plan and give it to the user; "
                                             "they switch to build mode to carry it out.", c->name);
             } else if (lc_tool_allowed(c->name, level) && !strcmp(c->name, "question")) {
                 const char *q = lc_call_arg(c, "question");
@@ -1087,7 +1087,7 @@ int lc_agent_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     free(actions.p);
     free(fl.test_cmd);
     if (why_stop && failed) { k->done(k, why_stop, 2); return 0; }
-    if (why_stop) { char m[600]; snprintf(m, sizeof m, "%s · %s", stats, why_stop); k->done(k, m, interrupted); return fatal ? -1 : 0; }
+    if (why_stop) { char m[1200]; snprintf(m, sizeof m, "%s · %s", stats, why_stop); k->done(k, m, interrupted); return fatal ? -1 : 0; }
     k->done(k, stats, interrupted);
     return fatal ? -1 : 0;
 }

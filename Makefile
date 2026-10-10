@@ -44,6 +44,11 @@ ENGINE_SRC := src/core/glm53f_ops.c src/core/glm53f_dsa.c src/io/glm53f_st.c \
               src/model/glm53f_model.c src/model/glm53f_mtp.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
 
+# the interactive session and localcode's agent (the same list as CMake's glm53f_cli)
+CLI_SRC := src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/lc_sample.c src/cli/glm53f_tui.c src/cli/lc_agent.c \
+           src/cli/lc_tools.c src/cli/lc_regex.c src/cli/lc_plugins.c src/cli/lc_hooks.c src/cli/lc_mods.c \
+           src/cli/lc_snap.c src/cli/lc_perm.c src/cli/lc_web.c src/cli/lc_session.c
+
 TESTS := test_glm_tiny test_cfg test_st test_tok
 FIX   ?= tests/fixtures
 
@@ -55,13 +60,13 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BIN)/glm53f: src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c $(ENGINE_OBJ)
+$(BIN)/glm53f: $(CLI_SRC) $(ENGINE_OBJ)
 	@mkdir -p $(BIN)
-	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(INCLUDES) -Isrc/cli $^ -o $@ $(LDFLAGS)
 
-$(BIN)/localcode: src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c $(ENGINE_OBJ)
+$(BIN)/localcode: $(CLI_SRC) $(ENGINE_OBJ)
 	@mkdir -p $(BIN)
-	$(CC) $(CFLAGS) -DGLM53F_LOCALCODE=1 $(INCLUDES) $^ -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) -DGLM53F_LOCALCODE=1 $(INCLUDES) -Isrc/cli $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_%: tests/unit/test_%.c $(ENGINE_OBJ)
 	@mkdir -p $(BIN)

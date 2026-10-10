@@ -235,10 +235,10 @@ static int resolve(const char *rel, char *out, size_t cap, char *why, size_t wca
     snprintf(whole, sizeof whole, "%s%s", full, rest);
     const size_t rl = strlen(g_root);
     if ((strncmp(whole, g_root, rl) || (whole[rl] && whole[rl] != '/')) && !g_outside) {
-        snprintf(why, wcap, "%s is outside the working directory %s", rel, g_root);
+        snprintf(why, wcap, "%.300s is outside the working directory %.250s", rel, g_root);
         return -1;
     }
-    snprintf(out, cap, "%s", whole);
+    if (snprintf(out, cap, "%s", whole) >= (int)cap) { snprintf(why, wcap, "path too long: %.300s", rel); return -1; }
 #endif
     return 0;
 }
@@ -756,7 +756,7 @@ static char *t_glob(const LcCall *c, char *sum, size_t sc, int *ok)
     if (!strchr(start, '/') && !strstr(start, "**")) {   /* a bare name pattern matches in any folder */
         char any[2100];
         snprintf(any, sizeof any, "**/%s", start);
-        snprintf(p, sizeof p, "%s", any);
+        snprintf(p, sizeof p, "%.*s", (int)sizeof p - 1, any);
         start = p;
     }
     char dir[4096], why[600];
@@ -1242,7 +1242,11 @@ static char *t_patch(const LcCall *c, char *sum, size_t sc, int *ok)
 static double now_s(void)
 {
     struct timespec t;
+#ifdef _WIN32
     timespec_get(&t, TIME_UTC);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t);          /* C11's timespec_get is not in gnu99's glibc headers */
+#endif
     return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
 }
 

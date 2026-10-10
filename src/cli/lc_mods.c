@@ -27,6 +27,12 @@
 #define SEP "\\"
 #else
 #define SEP "/"
+
+static void nap_ms(int ms)                     /* usleep is not in POSIX 2008 */
+{
+    const struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&t, NULL);
+}
 #endif
 
 typedef struct { char *p; size_t n, cap; } Buf;
@@ -440,14 +446,14 @@ int lc_mods_start(const char *root, void (*on_change)(void))
 #endif
     free(args.p);
     /* ready, then session.start */
-    const clock_t t0 = clock();
+    int naps = 0;                                  /* 10 s at most (clock() is CPU time on POSIX) */
     LOCK();
-    while (!g_ready && !g_dead && (double)(clock() - t0) / CLOCKS_PER_SEC < 10.0) {
+    while (!g_ready && !g_dead && naps++ < 500) {
         UNLOCK();
 #ifdef _WIN32
         Sleep(20);
 #else
-        usleep(20000);
+        nap_ms(20);
 #endif
         LOCK();
     }
@@ -514,7 +520,7 @@ char *lc_mods_event(const char *event, const char *data, int timeout_ms, void (*
 #ifdef _WIN32
         Sleep(20);
 #else
-        usleep(20000);
+        nap_ms(20);
 #endif
         waited += 20;
     }

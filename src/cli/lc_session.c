@@ -95,7 +95,7 @@ static int sess_dir(char *dir, size_t cap)
     if (!base) return -1;
     char top[1024];
     snprintf(top, sizeof top, "%s/localcode", base);
-    snprintf(dir, cap, "%s/sessions", top);
+    if (snprintf(dir, cap, "%s/sessions", top) >= (int)cap) return -1;
 #ifdef _WIN32
     CreateDirectoryA(top, NULL);
     CreateDirectoryA(dir, NULL);
@@ -223,10 +223,10 @@ static LcSess *sess_open(Glm53fChat *s)
     char stamp[32];
     strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
     snprintf(x->stamp, sizeof x->stamp, "%s", stamp);
-    snprintf(x->path, sizeof x->path, "%s/%s.jsonl", dir, x->stamp);
+    if (snprintf(x->path, sizeof x->path, "%s/%s.jsonl", dir, x->stamp) >= (int)sizeof x->path) { free(x); return NULL; }
     for (int i = 2; file_exists(x->path) && i < 100; i++) {
         snprintf(x->stamp, sizeof x->stamp, "%s-%d", stamp, i);
-        snprintf(x->path, sizeof x->path, "%s/%s.jsonl", dir, x->stamp);
+        if (snprintf(x->path, sizeof x->path, "%s/%s.jsonl", dir, x->stamp) >= (int)sizeof x->path) { free(x); return NULL; }
     }
     x->f = fopen(x->path, "ab");
     if (!x->f) { free(x); return NULL; }

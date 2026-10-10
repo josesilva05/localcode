@@ -22,7 +22,11 @@
 static double now_s(void)
 {
     struct timespec ts;
+#ifdef _WIN32
     timespec_get(&ts, TIME_UTC);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);          /* C11's timespec_get is not in gnu99's glibc headers */
+#endif
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
@@ -493,7 +497,6 @@ static int ple(q38_model *m, int il, float *res, int tok)
         cut = cut || t < 0 || t == c->ple_eos;
         ctx[s] = cut ? c->ple_eos : t;
     }
-    const int pin = c->ple_heads * c->ple_dim;
     float *emb = m->tmp2;
     uint8_t raw[1024];
     if (m->ple_table.row_bytes > (int64_t)sizeof raw) return -1;
@@ -615,10 +618,10 @@ static void gdn(q38_model *m, int il, const float *x, float *y)
         m->tap(m->tap_ctx, nm, o, (int64_t)Hv * S);
     }
     /* build_norm_gated: rmsnorm(o) * ssm_norm * sigmoid(z) (qwen4exp), * silu(z) (Qwen3.5/3.6) */
-    for (int h = 0; h < Hv; h++) {
-        rmsnorm(o + h * S, o + h * S, vecf(&l->ssm_norm), S, c->eps);
-        if (c->gdn_silu) for (int j = 0; j < S; j++) o[h * S + j] *= siluf_(z[h * S + j]);
-        else             for (int j = 0; j < S; j++) o[h * S + j] *= sigmoidf_(z[h * S + j]);
+    for (int hv = 0; hv < Hv; hv++) {
+        rmsnorm(o + hv * S, o + hv * S, vecf(&l->ssm_norm), S, c->eps);
+        if (c->gdn_silu) for (int j = 0; j < S; j++) o[hv * S + j] *= siluf_(z[hv * S + j]);
+        else             for (int j = 0; j < S; j++) o[hv * S + j] *= sigmoidf_(z[hv * S + j]);
     }
     matvec(&l->ssm_out, o, y);
 }
@@ -1185,7 +1188,6 @@ static int experts_compute(q38_model *m, int il, const float *x, const int *ids,
         q38_xvec vx;
         q38_xprep(&vx, x, E, bsx);
         static q38_q8K xk[MAX_NE0 / 256];
-        static q38_q8b xb[MAX_NE0 / 32];
         q38_xq vq;
         q38_xquant(&vq, x, E, act8 ? xk : NULL, NULL);
         int r, nr = NX * 2 * F;

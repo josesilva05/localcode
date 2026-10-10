@@ -659,7 +659,7 @@ static void git_branch(char *out, size_t cap)
                 head[n] = 0;
                 char *nl = strpbrk(head, "\r\n");
                 if (nl) *nl = 0;
-                if (!strncmp(head, "ref: refs/heads/", 16)) snprintf(cached, sizeof cached, "%s", head + 16);
+                if (!strncmp(head, "ref: refs/heads/", 16)) snprintf(cached, sizeof cached, "%.*s", (int)sizeof cached - 1, head + 16);
                 else if (n >= 7) snprintf(cached, sizeof cached, "%.7s", head);   /* detached */
                 break;
             }
@@ -771,7 +771,7 @@ static void render_splash(Lines *L, const Glm53fChat *s, int W)
     {
         char cwd[512];
         short_cwd(cwd, sizeof cwd);
-        ADD(left, nl, C_DIM, 1, "%s", cwd);
+        ADD(left, nl, C_DIM, 1, "%.*s", (int)sizeof left[0].text - 1, cwd);
         left[nl - 1].tail = 1;
     }
 
@@ -865,7 +865,7 @@ static void mark_first(Lines *L, int from, const char *mark)
 {
     for (int i = from; i < L->n; i++) {
         char *s = L->v[i].s;
-        if (strncmp(s, "  ", 2) || !s[2] || s[2] == '\033' && !strncmp(s + 2, C_RESET, strlen(C_RESET))) continue;
+        if (strncmp(s, "  ", 2) || !s[2] || (s[2] == '\033' && !strncmp(s + 2, C_RESET, strlen(C_RESET)))) continue;
         Buf b = { 0 };
         buf_str(&b, mark);
         buf_str(&b, C_RESET " ");
@@ -1129,6 +1129,14 @@ static int subsequence(const char *name, const char *typed)
     return 1;
 }
 
+/* a label that did not fit: cut on a UTF-8 boundary, ending in "..." */
+static void label_cut(char *label, size_t cap)
+{
+    size_t cut = cap - 4;
+    while (cut > 0 && ((unsigned char)label[cut] & 0xC0) == 0x80) cut--;
+    memcpy(label + cut, "...", 4);
+}
+
 static void menu_commands(const char *typed)
 {
     snprintf(M.title, sizeof M.title, "commands");
@@ -1171,7 +1179,8 @@ static void menu_commands(const char *typed)
             MenuItem *it = menu_add();
             if (!it) return;
             snprintf(it->tab, sizeof it->tab, "%s ", slash);
-            snprintf(it->label, sizeof it->label, "%s%s%s", slash, c->hint[0] ? " " : "", c->hint);
+            if (snprintf(it->label, sizeof it->label, "%s%s%s", slash, c->hint[0] ? " " : "", c->hint) >= (int)sizeof it->label)
+                label_cut(it->label, sizeof it->label);
             snprintf(it->hint, sizeof it->hint, "%s", c->desc);
             snprintf(it->value, sizeof it->value, "%s", c->plugin);
             it->submits = 0;
@@ -1185,7 +1194,7 @@ static void menu_commands(const char *typed)
             MenuItem *it = menu_add();
             if (!it) return;
             snprintf(it->tab, sizeof it->tab, "%s ", slash);
-            snprintf(it->label, sizeof it->label, "%s", slash);
+            if (snprintf(it->label, sizeof it->label, "%s", slash) >= (int)sizeof it->label) label_cut(it->label, sizeof it->label);
             snprintf(it->hint, sizeof it->hint, "skill: %s", k->desc);
             snprintf(it->value, sizeof it->value, "%s", lc_plugin_at(k->plugin)->name);
             it->submits = 0;
@@ -2000,7 +2009,7 @@ static void draw(Glm53fChat *s)
         buf_str(&f, " " C_RESET);
     }
     {   /* footer: the folder and its git branch; the context, local, the commands */
-        char cwd[512], br[96], where[640], right[200];
+        char cwd[512], br[96], where[640], right[320];
         short_cwd(cwd, sizeof cwd);
         git_branch(br, sizeof br);
         snprintf(where, sizeof where, "%s%s%s", cwd, br[0] ? ":" : "", br);
