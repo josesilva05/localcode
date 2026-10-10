@@ -1,5 +1,6 @@
 /* lc_tools.c - see lc_tools.h. */
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE           /* realpath: XSI, not declared under POSIX alone by older glibc */
 
 #include "lc_tools.h"
 #include "lc_plugins.h"

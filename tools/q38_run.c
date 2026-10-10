@@ -55,7 +55,11 @@ static void tap(void *ctx, const char *name, const float *x, int64_t n)
 static double now_s(void)
 {
     struct timespec ts;
+#ifdef _WIN32
     timespec_get(&ts, TIME_UTC);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);          /* C11's timespec_get is not in gnu99's glibc headers */
+#endif
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
